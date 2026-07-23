@@ -17,7 +17,7 @@ Both surfaces target `Microsoft.Chaos` `2026-05-01-preview` and use the local `a
 
 ## How It Works
 
-All execution and status-streaming logic lives in `scripts/Invoke-RunScenario.ps1`. The script handles confirmation gating, the execute POST, ScenarioRun ID resolution (Location LRO + ListAll fallback), per-poll status rendering, terminal-state detection, and the final summary.
+All execution and status-streaming logic lives in `scripts/Invoke-RunScenario.ps1`. The script handles confirmation gating, starting the run via `az chaos scenario run start --skip-validation --no-wait`, ScenarioRun ID resolution (start result + `run list` fallback), per-poll status rendering via `az chaos scenario run show`, terminal-state detection, and the final summary.
 
 The AI orchestrator's **only** job is:
 
@@ -55,9 +55,9 @@ On `Ctrl+C`, the script invokes `ScenarioRuns_Cancel` (POST `.../runs/{runId}/ca
 ## What the Script Handles (no AI logic needed)
 
 - Confirmation card with scenario, parameters, and scope summary (suppressed when `STARTCHAOS_NONINTERACTIVE=1`)
-- POST `.../execute` with Location-style LRO polling
-- ScenarioRun ID resolution from the LRO terminal body, with `ScenarioRuns_ListAll` fallback for older service builds
-- Per-poll status card: top status, elapsed time, per-action `scenarioRunSummary[]` table, resource count, error counts
+- Run start via `az chaos scenario run start --skip-validation --no-wait` (validation already gated upstream)
+- ScenarioRun ID resolution from the start result, with `az chaos scenario run list` fallback
+- Per-poll status via `az chaos scenario run show`: top status, elapsed time, per-action `scenarioRunSummary[]` table, resource count, error counts
 - Terminal-state detection (`Succeeded`, `Failed`, `Canceled`) and final summary card
 - Atomic state writes with error envelopes
 - Cancellation handling

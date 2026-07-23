@@ -17,8 +17,7 @@ param(
 $sharedDir = Join-Path (Split-Path (Split-Path (Split-Path $PSScriptRoot))) 'scripts'
 . (Join-Path $sharedDir 'State.ps1')
 . (Join-Path $sharedDir 'Render.ps1')
-. (Join-Path $sharedDir 'Invoke-AzRest.ps1')
-. (Join-Path $sharedDir 'Wait-AzureLro.ps1')
+. (Join-Path $sharedDir 'Invoke-AzChaos.ps1')
 . (Join-Path $sharedDir 'Validate-AndFix.ps1')
 
 $state = Read-State
@@ -40,75 +39,35 @@ if ($state.workspace.status -ne 'done') {
 $sub = $state.context.subscriptionId
 $rg = $state.context.resourceGroup
 $wsName = $state.workspace.name
-$wsBase = "/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.Chaos/workspaces/$wsName"
 
 Set-StateProperty -PropertyPath 'setup.status' -Value 'in_progress'
 
 try {
-    # ── Step 1: Check/Trigger evaluation ────────────────
-    Write-Card -Title 'Checking Recommendations' -Status '🔄'
-    
-    $evalUri = "$wsBase/evaluations/latest"
-    $evalResponse = $null
-    $needsRefresh = $false
-    try {
-        $evalResponse = Invoke-AzRest -Method GET -Uri $evalUri
-        # If the previous evaluation failed, trigger a fresh refresh
-        $prevStatus = $evalResponse.body.properties.status
-        if ($prevStatus -in @('Failed', 'Canceled')) {
-            [Console]::Error.WriteLine("[Setup] Previous evaluation status was '$prevStatus' — triggering fresh refresh")
-            $needsRefresh = $true
-        }
-    } catch {
-        if ($_.Exception.Message -match '(?i)(404|Not Found|NotFound)') {
-            # No evaluation yet — trigger refresh
-            $needsRefresh = $true
-        } else {
-            throw
-        }
-    }
+    # ── Step 1: Evaluate the workspace (discover + recommend) ──
+    # `az chaos workspace refresh-recommendation` triggers resource discovery
+    # and scenario evaluation and polls the LRO to completion — replacing the
+    # manual evaluations/latest check + refreshRecommendations POST + poll loop.
+    Write-Card -Title 'Refreshing Recommendations' -Status '🔄' `
+        -Body 'Discovering in-scope resources and evaluating which scenarios apply...'
 
-    if ($needsRefresh) {
-        Write-Card -Title 'Triggering Recommendation Refresh' -Status '🔄'
-        $refreshUri = "$wsBase/refreshRecommendations"
-        $refreshResp = Invoke-AzRest -Method POST -Uri $refreshUri
-    }
+    Invoke-AzChaos -ChaosArgs @('workspace', 'refresh-recommendation', '--resource-group', $rg, '--workspace-name', $wsName) | Out-Null
 
-    # ── Step 2: Poll evaluation ─────────────────────────
-    $terminalEvalStates = @('Succeeded', 'PartiallySucceeded', 'Failed', 'Canceled')
-    $maxEvalPolls = 60
-    $evalPoll = 0
-
-    while ($evalPoll -lt $maxEvalPolls) {
-        $evalResp = Invoke-AzRest -Method GET -Uri $evalUri
-        $evalStatus = $evalResp.body.properties.status
-
+    # ── Step 2: Report the evaluation summary (best-effort) ──
+    $eval = Invoke-AzChaos -ChaosArgs @('workspace', 'show-evaluation', '--resource-group', $rg, '--workspace-name', $wsName) -AllowFailure
+    if ($eval) {
+        $evalStatus = $eval.properties.status
         Set-StateProperty -PropertyPath 'setup.evaluation.status' -Value $evalStatus
         Set-StateProperty -PropertyPath 'setup.evaluation.lastPolledAt' -Value (Get-Date).ToUniversalTime().ToString('o')
-
-        if ($evalStatus -in $terminalEvalStates) {
-            Write-Card -Title 'Evaluation Complete' -Status "✅ $evalStatus" -Properties ([ordered]@{
-                'Scenarios Evaluated'  = $evalResp.body.properties.numScenariosToEvaluate
-                'Succeeded'            = $evalResp.body.properties.numScenariosEvaluatedSucceeded
-                'Failed'               = $evalResp.body.properties.numScenariosEvaluatedFailed
-            })
-            break
-        }
-
-        Write-Card -Title 'Evaluation In Progress' -Status "🔄 $evalStatus" -Body "Poll $evalPoll — waiting..."
-        
-        $delay = 10
-        if ($evalResp.headers -and $evalResp.headers['Retry-After']) {
-            [int]::TryParse($evalResp.headers['Retry-After'], [ref]$delay) | Out-Null
-        }
-        Start-Sleep -Seconds $delay
-        $evalPoll++
+        Write-Card -Title 'Evaluation Complete' -Status "✅ $evalStatus" -Properties ([ordered]@{
+            'Scenarios Evaluated' = $eval.properties.numScenariosToEvaluate
+            'Succeeded'           = $eval.properties.numScenariosEvaluatedSucceeded
+            'Failed'              = $eval.properties.numScenariosEvaluatedFailed
+        })
     }
 
     # ── Step 3: List & filter scenarios ─────────────────
-    $scenariosUri = "$wsBase/scenarios"
-    $scenariosResp = Invoke-AzRest -Method GET -Uri $scenariosUri
-    $allScenarios = @($scenariosResp.body.value)
+    # `az chaos scenario list` returns a bare JSON array of scenario resources.
+    $allScenarios = @(Invoke-AzChaos -ChaosArgs @('scenario', 'list', '--resource-group', $rg, '--workspace-name', $wsName))
 
     $recommended = @($allScenarios | Where-Object {
         $_.properties.recommendation.recommendationStatus -eq 'Recommended'
@@ -230,45 +189,43 @@ Please choose how to fill them and re-invoke this skill with ``-ParameterMode au
     # ── Step 5: Create ScenarioConfiguration ────────────
     $configName = "config-" + [System.Guid]::NewGuid().ToString().Substring(0, 8)
     $scenarioName = $selectedScenario.name
-    $configUri = "$wsBase/scenarios/$scenarioName/configurations/$configName"
 
-    $configBody = @{
-        properties = @{
-            scenarioId = $selectedScenario.id
-            parameters = $configParams
-        }
+    # `az chaos scenario config create` auto-derives --scenario-id from the
+    # workspace + scenario name and polls the create LRO to completion. The
+    # parameters array is passed as JSON via a temp file (Invoke-AzChaos
+    # -JsonArg) so Windows cmd.exe never mangles the braces/quotes.
+    $createCfgArgs = @(
+        'scenario', 'config', 'create'
+        '--resource-group', $rg
+        '--workspace-name', $wsName
+        '--scenario-name', $scenarioName
+        '--name', $configName
+    )
+
+    Write-Card -Title 'Creating Configuration' -Status '🔄' -JsonPreview (@{ scenarioId = $selectedScenario.id; parameters = $configParams })
+
+    if ($configParams.Count -gt 0) {
+        # Build the JSON array explicitly so a single parameter is still an array.
+        $paramsJson = '[' + (($configParams | ForEach-Object { $_ | ConvertTo-Json -Compress }) -join ',') + ']'
+        $configObj = Invoke-AzChaos -ChaosArgs $createCfgArgs -JsonArg @{ parameters = $paramsJson }
+    } else {
+        $configObj = Invoke-AzChaos -ChaosArgs $createCfgArgs
     }
 
-    Write-Card -Title 'Creating Configuration' -Status '🔄' -JsonPreview $configBody
-
-    $configResp = Invoke-AzRest -Method PUT -Uri $configUri -Body $configBody
-
-    # Poll if async
-    if ($configResp.headers -and $configResp.headers['Azure-AsyncOperation']) {
-        $asyncUrl = $configResp.headers['Azure-AsyncOperation']
-        $lroResult = Wait-AzureLro -PollUrl $asyncUrl -Style 'azure-async'
-        if ($lroResult.status -ne 'Succeeded') {
-            throw "Configuration provisioning $($lroResult.status)"
-        }
-    }
-
-    # GET to confirm
-    $configGetResp = Invoke-AzRest -Method GET -Uri $configUri
     Set-StateProperty -PropertyPath 'setup.configuration.name' -Value $configName
-    Set-StateProperty -PropertyPath 'setup.configuration.id' -Value $configGetResp.body.id
+    Set-StateProperty -PropertyPath 'setup.configuration.id' -Value $configObj.id
     Set-StateProperty -PropertyPath 'setup.configuration.parameters' -Value $configParams
 
     Write-Card -Title 'Configuration Created' -Status '✅' -Properties ([ordered]@{
         'Name' = $configName
-        'ID'   = $configGetResp.body.id
+        'ID'   = $configObj.id
     })
 
     # ── Step 6: Validate + auto-fix permissions ─────────
-    # Data-plane ops (validate / fixResourcePermissions / execute) require 2026-05-01-preview.
-    # Validation is ALWAYS run; fixResourcePermissions is invoked whenever
+    # Validation is ALWAYS run; fix-permissions is invoked whenever
     # validation returns anything other than 'Succeeded' or reports validationErrors.
     try {
-        Invoke-ValidateAndFix -ConfigUri $configUri -StateBasePath 'setup.configuration' -ApiVersion '2026-05-01-preview'
+        Invoke-ValidateAndFix -ResourceGroup $rg -WorkspaceName $wsName -ScenarioName $scenarioName -ConfigName $configName -StateBasePath 'setup.configuration'
     } catch {
         $vfErr = $_.Exception.Message
         Set-StateProperty -PropertyPath 'setup.lastError' -Value $vfErr

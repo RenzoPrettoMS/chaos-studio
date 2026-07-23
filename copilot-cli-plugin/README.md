@@ -9,7 +9,7 @@ scenarios, and execute chaos experiments — all from a single conversation.
 | Requirement | Minimum Version | Notes |
 |---|---|---|
 | **PowerShell** (`pwsh`) | 7.4+ | Cross-platform; `winget install Microsoft.PowerShell` |
-| **Azure CLI** (`az`) | 2.61+ | `winget install Microsoft.AzureCLI` |
+| **Azure CLI** (`az`) | 2.75+ | `winget install Microsoft.AzureCLI`. The `chaos` extension is auto-installed on first use. |
 | **GitHub Copilot CLI** | latest | Must support plugin marketplaces |
 | `jq` *(optional)* | any | Fallback to `ConvertFrom-Json` if absent |
 

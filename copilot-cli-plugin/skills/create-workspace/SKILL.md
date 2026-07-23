@@ -17,7 +17,7 @@ Both surfaces target `Microsoft.Chaos` `2026-05-01-preview` and use the local `a
 
 ## How It Works
 
-All provisioning logic lives in `scripts/Invoke-CreateWorkspace.ps1`. The script handles input validation, PUT body construction, LRO polling, identity resolution, RBAC test/grant, and state persistence.
+All provisioning logic lives in `scripts/Invoke-CreateWorkspace.ps1`. The script handles input validation, workspace creation via `az chaos workspace create` (the CLI awaits the provisioning LRO), identity resolution, RBAC test/grant, and state persistence.
 
 The AI orchestrator's **only** job is:
 
@@ -69,8 +69,8 @@ If a required parameter is missing, PowerShell's parameter binder fails before t
 ## What the Script Handles (no AI logic needed)
 
 - Input validation and ARM-ID well-formedness checks
-- PUT workspace body construction per the v2 spec
-- Azure-AsyncOperation LRO polling with terminal-state surfacing
+- Workspace creation via `az chaos workspace create` (identity + scopes)
+- Provisioning LRO awaited by the CLI, with terminal-state surfacing
 - Identity resolution (SystemAssigned principalId from response; UserAssigned via UAMI GET)
 - Per-scope `Test-CallerCanAssignRoles` + Reader role assignment with remediation card on denial
 - Atomic state writes with error envelopes

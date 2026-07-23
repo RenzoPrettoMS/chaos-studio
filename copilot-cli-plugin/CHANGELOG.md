@@ -7,6 +7,21 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Changed
+
+- The PowerShell skills (`create-workspace`, `setup-scenario`, `run-scenario`)
+  now drive all Chaos Studio v2 control-plane operations through the first-party
+  **`az chaos` CLI extension** instead of raw `az rest` calls, via a new shared
+  `scripts/Invoke-AzChaos.ps1` wrapper. This keeps the plugin consistent with the
+  supported CLI surface and gets LRO polling for free. Workspace creation now uses
+  `az chaos workspace create`; discovery/evaluation uses
+  `az chaos workspace refresh-recommendation`; scenario discovery/configuration/
+  validation/permission-fix use the `az chaos scenario ...` command groups; and
+  execution uses `az chaos scenario run start`. Non-Chaos ARM calls (managed-identity
+  reads, role assignments) still use `az rest`. **Requires Azure CLI 2.75+**; the
+  `chaos` extension is auto-installed on first use. The Python MCP server is
+  unchanged (it retains direct ARM/httpx calls to preserve managed-identity auth).
+
 ### Fixed
 
 - Restored the `chaos-mcp` server implementation (`chaos_mcp/server.py`,
