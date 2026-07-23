@@ -33,12 +33,10 @@ if ($state.setup.status -ne 'done') {
     exit 1
 }
 
-$sub = $state.context.subscriptionId
 $rg = $state.context.resourceGroup
 $wsName = $state.workspace.name
 $scenarioId = $state.setup.selectedScenarioId
 $configName = $state.setup.configuration.name
-$configId = $state.setup.configuration.id
 
 # Extract scenario name from the scenario ID
 $scenarioName = ($scenarioId -split '/')[-1]

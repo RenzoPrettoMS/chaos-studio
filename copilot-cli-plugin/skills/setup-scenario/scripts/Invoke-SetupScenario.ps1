@@ -36,7 +36,6 @@ if ($state.workspace.status -ne 'done') {
     exit 1
 }
 
-$sub = $state.context.subscriptionId
 $rg = $state.context.resourceGroup
 $wsName = $state.workspace.name
 

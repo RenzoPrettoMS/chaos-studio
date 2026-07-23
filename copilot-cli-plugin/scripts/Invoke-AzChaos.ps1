@@ -76,6 +76,7 @@ function Invoke-AzChaos {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
+        [AllowEmptyString()]
         [string[]]$ChaosArgs,
 
         [Parameter()]
