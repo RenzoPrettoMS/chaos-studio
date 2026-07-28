@@ -34,7 +34,7 @@ def _envelope(resp: httpx.Response, result: Any | None = None) -> dict[str, Any]
         return {"ok": True, "result": body}
     try:
         details = resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort parse; error body is optional
         details = {"raw": resp.text}
     if resp.status_code == 403:
         error_type = "PermissionDenied"
