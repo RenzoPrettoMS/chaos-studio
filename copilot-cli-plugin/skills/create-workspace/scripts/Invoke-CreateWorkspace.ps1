@@ -4,8 +4,10 @@
 .DESCRIPTION
     Provisions a Microsoft.Chaos/workspaces resource (v2), binds a managed identity,
     validates scopes, and grants Reader RBAC on each scope.
-    
-    All ARM calls use Invoke-AzRest with api-version 2026-05-01-preview.
+
+    Workspace lifecycle uses the `az chaos` CLI extension (via Invoke-AzChaos).
+    Non-Chaos ARM reads (the user-assigned identity resource) and role
+    assignments still use Invoke-AzRest / az CLI.
     State is persisted to the shared state file via State.ps1.
 .NOTES
     This script is invoked by the start-chaos orchestrator, not directly by users.
@@ -25,7 +27,7 @@ $sharedDir = Join-Path (Split-Path (Split-Path (Split-Path $PSScriptRoot))) 'scr
 . (Join-Path $sharedDir 'State.ps1')
 . (Join-Path $sharedDir 'Render.ps1')
 . (Join-Path $sharedDir 'Invoke-AzRest.ps1')
-. (Join-Path $sharedDir 'Wait-AzureLro.ps1')
+. (Join-Path $sharedDir 'Invoke-AzChaos.ps1')
 . (Join-Path $sharedDir 'Rbac.ps1')
 
 # ── Read state ──────────────────────────────────────────
@@ -62,75 +64,44 @@ try {
         }
     }
 
-    # ── Step 2: Build workspace body ────────────────────
-    $identity = @{ type = $IdentityType }
+    # ── Step 2: Build `az chaos workspace create` args ──
+    $createArgs = @(
+        'workspace', 'create'
+        '--resource-group', $ResourceGroup
+        '--workspace-name', $WorkspaceName
+        '--location', $Location
+    )
+    $createArgs += '--scopes'
+    $createArgs += $Scopes
     if ($IdentityType -eq 'UserAssigned') {
-        $identity['userAssignedIdentities'] = @{ $UserAssignedIdentityResourceId = @{} }
-    }
-
-    $body = @{
-        location   = $Location
-        identity   = $identity
-        properties = @{
-            scopes = @($Scopes)
-        }
+        $createArgs += @('--mi-user-assigned', $UserAssignedIdentityResourceId)
+    } else {
+        $createArgs += @('--mi-system-assigned', '')
     }
 
     Write-Card -Title 'Creating Workspace' -Status '🔄 In Progress' -Properties ([ordered]@{
-        'Subscription'  = $subscriptionId
+        'Subscription'   = $subscriptionId
         'Resource Group' = $ResourceGroup
-        'Name'          = $WorkspaceName
-        'Location'      = $Location
-        'Identity'      = $IdentityType
-        'Scopes'        = ($Scopes -join ', ')
-    }) -JsonPreview $body
+        'Name'           = $WorkspaceName
+        'Location'       = $Location
+        'Identity'       = $IdentityType
+        'Scopes'         = ($Scopes -join ', ')
+    })
 
-    # ── Step 3: PUT workspace ───────────────────────────
-    $wsUri = "/subscriptions/$subscriptionId/resourceGroups/$ResourceGroup/providers/Microsoft.Chaos/workspaces/$WorkspaceName"
-    
     Set-StateProperty -PropertyPath 'workspace.status' -Value 'in_progress'
     Set-StateProperty -PropertyPath 'workspace.name' -Value $WorkspaceName
     Set-StateProperty -PropertyPath 'context.resourceGroup' -Value $ResourceGroup
     Set-StateProperty -PropertyPath 'context.location' -Value $Location
 
-    $putResponse = Invoke-AzRest -Method PUT -Uri $wsUri -Body $body
+    # ── Step 3: Create workspace (LRO awaited by the CLI) ─
+    # `az chaos workspace create` polls the provisioning LRO to completion and
+    # returns the final workspace resource, so no manual async / resource-GET
+    # polling loop is required.
+    $workspace = Invoke-AzChaos -ChaosArgs $createArgs
 
-    # ── Step 4: Poll LRO ────────────────────────────────
-    $asyncUrl = $null
-    if ($putResponse.headers -and $putResponse.headers['Azure-AsyncOperation']) {
-        $asyncUrl = $putResponse.headers['Azure-AsyncOperation']
-    }
-
-    # If we got the async URL, poll it
-    if ($asyncUrl) {
-        Set-StateProperty -PropertyPath 'workspace.lroUrl' -Value $asyncUrl
-        $lroResult = Wait-AzureLro -PollUrl $asyncUrl -Style 'azure-async'
-
-        if ($lroResult.status -ne 'Succeeded') {
-            $errMsg = "Workspace provisioning $($lroResult.status)"
-            Set-StateProperty -PropertyPath 'workspace.lastError' -Value $errMsg
-            Write-Error-Card -Title 'Workspace Creation Failed' -ErrorMessage $errMsg
-            exit 1
-        }
-    }
-
-    # Fallback: poll the resource GET until provisioningState is terminal.
-    # (az rest does not surface response headers, so the Azure-AsyncOperation
-    # header may not be available. Resource-level polling is a reliable
-    # alternative for Microsoft.Chaos/workspaces.)
-    $maxAttempts = 60
-    $delaySeconds = 5
-    $workspace = $null
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        $wsResponse = Invoke-AzRest -Method GET -Uri $wsUri
-        $workspace = $wsResponse.body
-        $ps = $workspace.properties.provisioningState
-        if ($ps -in 'Succeeded','Failed','Canceled') { break }
-        Start-Sleep -Seconds $delaySeconds
-    }
-
-    if ($workspace.properties.provisioningState -ne 'Succeeded') {
-        $errMsg = "Workspace provisioning ended in state '$($workspace.properties.provisioningState)'"
+    if (-not $workspace -or $workspace.properties.provisioningState -ne 'Succeeded') {
+        $ps = if ($workspace) { $workspace.properties.provisioningState } else { 'Unknown' }
+        $errMsg = "Workspace provisioning ended in state '$ps'"
         Set-StateProperty -PropertyPath 'workspace.lastError' -Value $errMsg
         Write-Error-Card -Title 'Workspace Creation Failed' -ErrorMessage $errMsg
         exit 1

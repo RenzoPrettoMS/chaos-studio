@@ -17,7 +17,7 @@ Both surfaces target `Microsoft.Chaos` `2026-05-01-preview` and use the local `a
 
 ## How It Works
 
-All discovery, configuration, validation, and permission-fix logic lives in `scripts/Invoke-SetupScenario.ps1`. The script handles workspace evaluation, recommendation listing, scenario selection routing, parameter resolution, configuration creation, and the validate→fix→re-validate loop.
+All discovery, configuration, validation, and permission-fix logic lives in `scripts/Invoke-SetupScenario.ps1`. The script drives the Chaos Studio operations through the `az chaos` CLI extension — workspace evaluation, recommendation listing, scenario selection routing, parameter resolution, configuration creation, and the validate→fix→re-validate loop.
 
 The AI orchestrator's **only** job is:
 
@@ -70,11 +70,11 @@ When exit 2 is followed by exit 3 on re-run, combine both answers in the next in
 
 ## What the Script Handles (no AI logic needed)
 
-- Workspace evaluation refresh + LRO polling until terminal
-- Scenario list filtering to `recommendation.recommendationStatus == "Recommended"`
+- Workspace evaluation via `az chaos workspace refresh-recommendation` (CLI awaits the LRO) + `show-evaluation` summary
+- Scenario list (`az chaos scenario list`) filtered to `recommendation.recommendationStatus == "Recommended"`
 - Auto-select when exactly one scenario is recommended; pause-and-emit-exit-2 otherwise
-- ScenarioConfiguration PUT with parameter merge (defaults + overrides) and LRO polling
-- Validate → if not Succeeded → `fixResourcePermissions` (whatIf=false) → poll → re-validate
+- ScenarioConfiguration create (`az chaos scenario config create`, `--scenario-id` auto-derived) with parameter merge (defaults + overrides)
+- Validate (`az chaos scenario config validate`) → if not Succeeded → `az chaos scenario config fix-permissions` → re-validate
 - RBAC propagation retry loop (up to 5 minutes, 20s interval) gated to permission-related errors only
 - Atomic state writes with error envelopes
 - Idempotent re-runs

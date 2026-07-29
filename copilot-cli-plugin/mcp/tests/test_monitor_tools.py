@@ -10,7 +10,7 @@ error envelope for each tool.
 from __future__ import annotations
 
 import json
-from typing import Callable
+from collections.abc import Callable
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -18,7 +18,6 @@ import pytest
 
 from chaos_mcp import azure as az
 from chaos_mcp import monitor
-
 
 # ---------------------------------------------------------------------------
 # Test plumbing
@@ -333,6 +332,7 @@ def test_activity_log_403_structured_error(monkeypatch):
 def test_server_lists_all_tools():
     """Importing server.py should register all 15 tools on the FastMCP instance."""
     import asyncio
+
     from chaos_mcp import server as srv
 
     tools = asyncio.run(srv.mcp.list_tools())

@@ -18,7 +18,7 @@ and delegate to the four skill phases in strict order. You MUST NOT skip or reor
 
 - ⛔ Every step is fixed — no improvisation
 - ⛔ On ANY error, STOP and render the error card — do NOT work around it
-- ⛔ All ARM calls go through shared scripts — never call `az rest` directly
+- ⛔ All Azure calls go through shared scripts (`az chaos` for Chaos Studio operations) — never call `az chaos`/`az rest` ad hoc
 - Read and write the state file via `State.ps1` functions
 - Resume from the first non-done phase on re-invocation
 

@@ -12,7 +12,7 @@ $sharedDir = Join-Path (Split-Path (Split-Path (Split-Path $PSScriptRoot))) 'scr
 . (Join-Path $sharedDir 'State.ps1')
 . (Join-Path $sharedDir 'Render.ps1')
 . (Join-Path $sharedDir 'Invoke-AzRest.ps1')
-. (Join-Path $sharedDir 'Wait-AzureLro.ps1')
+. (Join-Path $sharedDir 'Invoke-AzChaos.ps1')
 . (Join-Path $sharedDir 'New-RunReport.ps1')
 . (Join-Path $sharedDir 'Rbac.ps1')
 . (Join-Path $sharedDir 'Validate-AndFix.ps1')
@@ -33,18 +33,13 @@ if ($state.setup.status -ne 'done') {
     exit 1
 }
 
-$sub = $state.context.subscriptionId
 $rg = $state.context.resourceGroup
 $wsName = $state.workspace.name
 $scenarioId = $state.setup.selectedScenarioId
 $configName = $state.setup.configuration.name
-$configId = $state.setup.configuration.id
 
 # Extract scenario name from the scenario ID
 $scenarioName = ($scenarioId -split '/')[-1]
-
-$wsBase = "/subscriptions/$sub/resourceGroups/$rg/providers/Microsoft.Chaos/workspaces/$wsName"
-$configBase = "$wsBase/scenarios/$scenarioName/configurations/$configName"
 
 Set-StateProperty -PropertyPath 'run.status' -Value 'in_progress'
 
@@ -68,9 +63,8 @@ try {
     # ALWAYS validate before execute. If validation returns anything other than
     # 'Succeeded', the shared helper invokes fixResourcePermissions and
     # re-validates. Execution is STRICTLY gated on the final status below.
-    $dataPlaneApi = '2026-05-01-preview'
     try {
-        Invoke-ValidateAndFix -ConfigUri $configBase -StateBasePath 'setup.configuration' -ApiVersion $dataPlaneApi
+        Invoke-ValidateAndFix -ResourceGroup $rg -WorkspaceName $wsName -ScenarioName $scenarioName -ConfigName $configName -StateBasePath 'setup.configuration'
     } catch {
         $vfErr = $_.Exception.Message
         Set-StateProperty -PropertyPath 'run.lastError' -Value $vfErr
@@ -97,30 +91,42 @@ try {
     # ── Step 3: Execute ─────────────────────────────────
     Write-Card -Title 'Executing' -Status '🔄 Starting...'
 
-    $executeUri = "$configBase/execute"
-    $execResp = Invoke-AzRest -Method POST -Uri $executeUri -ApiVersion $dataPlaneApi
+    # Validation already passed the strict gate above, so start the run with
+    # --skip-validation. --no-wait returns as soon as the run is created, so we
+    # can stream live status below via `az chaos scenario run show`.
+    $startArgs = @(
+        'scenario', 'run', 'start'
+        '--resource-group', $rg
+        '--workspace-name', $wsName
+        '--scenario-name', $scenarioName
+        '--config-name', $configName
+        '--skip-validation'
+        '--no-wait'
+    )
+    # Do NOT use -AllowFailure here: a failed start (deleted config, service
+    # error, concurrent-run conflict) must surface loudly. Swallowing it would
+    # drop into the run-list fallback below and stream a stale *previous* run's
+    # status, making a never-started run look like it succeeded. The fallback is
+    # only for the case where the start succeeded but did not surface a run ID.
+    $startResult = Invoke-AzChaos -ChaosArgs $startArgs
 
     # ── Step 4: Resolve ScenarioRun ID ──────────────────
     $runId = $null
-    $locationUrl = $null
-
-    if ($execResp.headers -and $execResp.headers['Location']) {
-        $locationUrl = $execResp.headers['Location']
-        # The Location header points to the run resource
-        # Extract run ID from the URL: .../runs/{runId}?api-version=...
-        if ($locationUrl -match '/runs/([^?/]+)') {
+    if ($startResult) {
+        if ($startResult.name) {
+            $runId = $startResult.name
+        } elseif ($startResult.id -and $startResult.id -match '/runs/([^/?]+)') {
             $runId = $Matches[1]
         }
     }
 
     if (-not $runId) {
-        # Fallback: list runs and find the newest
-        Write-Card -Title 'Resolving Run ID' -Status '🔄' -Body 'Location header did not contain run ID, listing runs...'
-        $runsUri = "$wsBase/scenarios/$scenarioName/runs"
-        $runsResp = Invoke-AzRest -Method GET -Uri $runsUri
-        $runs = @($runsResp.body.value | Where-Object {
-            $_.properties.scenarioConfigurationName -eq $configName
-        } | Sort-Object { $_.properties.startTime } -Descending)
+        # Fallback for the narrow case where start succeeded but did not surface
+        # a run ID: list runs and find the newest for this configuration.
+        Write-Card -Title 'Resolving Run ID' -Status '🔄' -Body 'Run start did not surface a run ID, listing runs...'
+        $runs = @(Invoke-AzChaos -ChaosArgs @('scenario', 'run', 'list', '--resource-group', $rg, '--workspace-name', $wsName, '--scenario-name', $scenarioName) |
+            Where-Object { $_.properties.scenarioConfigurationName -eq $configName } |
+            Sort-Object { $_.properties.startTime } -Descending)
 
         if ($runs.Count -gt 0) {
             $runId = $runs[0].name
@@ -130,7 +136,6 @@ try {
     }
 
     Set-StateProperty -PropertyPath 'run.scenarioRunId' -Value $runId
-    $runUri = "$wsBase/scenarios/$scenarioName/runs/$runId"
 
     Write-Card -Title 'Run Started' -Status '🔄' -Properties ([ordered]@{
         'Run ID' = $runId
@@ -145,8 +150,7 @@ try {
     $lastRenderedActions = $null
 
     while ((Get-Date) -lt $deadline) {
-        $runResp = Invoke-AzRest -Method GET -Uri $runUri
-        $runBody = $runResp.body
+        $runBody = Invoke-AzChaos -ChaosArgs @('scenario', 'run', 'show', '--resource-group', $rg, '--workspace-name', $wsName, '--scenario-name', $scenarioName, '--run-id', $runId)
         $runStatus = $runBody.properties.status
         $elapsed = ((Get-Date) - $startTime).ToString('hh\:mm\:ss')
 
@@ -280,18 +284,14 @@ try {
             exit $(if ($runStatus -eq 'Succeeded') { 0 } else { 1 })
         }
 
-        # Wait
-        $delay = 10
-        if ($runResp.headers -and $runResp.headers['Retry-After']) {
-            [int]::TryParse($runResp.headers['Retry-After'], [ref]$delay) | Out-Null
-        }
-        Start-Sleep -Seconds $delay
+        # Wait before the next status poll.
+        Start-Sleep -Seconds 10
     }
 
     # Timeout
     Set-StateProperty -PropertyPath 'run.lastError' -Value 'Polling timed out'
     Write-Error-Card -Title 'Run Timeout' -ErrorMessage "Scenario run polling exceeded $maxPollMinutes minutes. The run may still be in progress." `
-        -RemediationCommand "az rest --method GET --uri `"$runUri`" --headers Content-Type=application/json"
+        -RemediationCommand "az chaos scenario run show --resource-group $rg --workspace-name $wsName --scenario-name $scenarioName --run-id $runId"
     exit 1
 
 } catch {

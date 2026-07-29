@@ -17,8 +17,9 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any
 
 import httpx
 
@@ -178,6 +179,7 @@ def az_show_account() -> AzContext:
         [_az_path(), "account", "show", "-o", "json"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if proc.returncode != 0:
         raise AzureError(
@@ -214,6 +216,7 @@ def _get_token_via_cli(resource: str) -> str:
         [_az_path(), "account", "get-access-token", "--resource", resource, "-o", "json"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if proc.returncode != 0:
         raise AzureError(
@@ -269,7 +272,7 @@ def _get_token_via_managed_identity(resource: str) -> str:
 
     try:
         token = resp.json().get("access_token")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         raise AzureError(
             f"Malformed managed-identity token response for {resource}: {resp.text.strip()}"
         ) from e
@@ -298,7 +301,7 @@ def arm_request(
 
     `path` may be an absolute ARM URL or a path beginning with '/'.
     """
-    if path.startswith("http://") or path.startswith("https://"):
+    if path.startswith(("http://", "https://")):
         url = path
     else:
         if not path.startswith("/"):
@@ -329,7 +332,7 @@ def _raise_for_arm(resp: httpx.Response) -> None:
         return
     try:
         payload = resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001 - best-effort parse; error body is optional
         payload = {"raw": resp.text}
     raise AzureError(f"ARM {resp.status_code} {resp.request.method} {resp.request.url}: {json.dumps(payload)}")
 
@@ -365,7 +368,7 @@ def wait_for_lro(
     if response.status_code != 202 and response.is_success:
         try:
             return response.json() if response.content else {}
-        except Exception:
+        except Exception:  # noqa: BLE001 - best-effort parse; empty body is acceptable
             return {}
 
     poll_url = (
@@ -390,7 +393,7 @@ def wait_for_lro(
             _raise_for_arm(poll)
         try:
             last_body = poll.json() if poll.content else {}
-        except Exception:
+        except Exception:  # noqa: BLE001 - best-effort parse; empty body is acceptable
             last_body = {}
         status = (last_body.get("status") or last_body.get("properties", {}).get("provisioningState") or "").lower()
         if status in ("succeeded", "failed", "canceled", "cancelled"):
@@ -474,7 +477,7 @@ def arm_get_with_query(
     Returns the raw `httpx.Response` so callers can inspect status codes
     (e.g., 403) without an exception.
     """
-    if path.startswith("http://") or path.startswith("https://"):
+    if path.startswith(("http://", "https://")):
         url = path
         sep = "&" if "?" in url else "?"
     else:
