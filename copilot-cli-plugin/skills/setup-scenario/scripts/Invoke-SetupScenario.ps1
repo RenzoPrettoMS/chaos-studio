@@ -42,19 +42,29 @@ $wsName = $state.workspace.name
 Set-StateProperty -PropertyPath 'setup.status' -Value 'in_progress'
 
 try {
-    # ── Step 1: Evaluate the workspace (discover + recommend) ──
-    # `az chaos workspace refresh-recommendation` triggers resource discovery
-    # and scenario evaluation and polls the LRO to completion — replacing the
-    # manual evaluations/latest check + refreshRecommendations POST + poll loop.
-    Write-Card -Title 'Refreshing Recommendations' -Status '🔄' `
-        -Body 'Discovering in-scope resources and evaluating which scenarios apply...'
+    # ── Step 1: Ensure the workspace has a current scenario evaluation ──
+    # Probe the latest evaluation first and only trigger a (potentially
+    # minutes-long) discovery+evaluation refresh when there isn't already a
+    # successful one. This mirrors the original behavior and keeps the re-runs
+    # after an exit-2/exit-3 prompt fast instead of re-evaluating every round-trip.
+    # NOTE: `show-evaluation` / `show-discovery` only accept `--name`/`-n` for the
+    # workspace name (no `--workspace-name` alias, unlike the other workspace commands).
+    $eval = Invoke-AzChaos -ChaosArgs @('workspace', 'show-evaluation', '--name', $wsName, '--resource-group', $rg) -AllowFailure
+    $evalStatus = if ($eval) { $eval.properties.status } else { $null }
+    $needsRefresh = (-not $eval) -or ($evalStatus -notin @('Succeeded', 'PartiallySucceeded'))
 
-    Invoke-AzChaos -ChaosArgs @('workspace', 'refresh-recommendation', '--resource-group', $rg, '--workspace-name', $wsName) | Out-Null
+    if ($needsRefresh) {
+        Write-Card -Title 'Refreshing Recommendations' -Status '🔄' `
+            -Body 'Discovering in-scope resources and evaluating which scenarios apply...'
+        # `refresh-recommendation` triggers discovery + evaluation and polls the
+        # LRO to completion (it accepts the `--workspace-name` alias).
+        Invoke-AzChaos -ChaosArgs @('workspace', 'refresh-recommendation', '--workspace-name', $wsName, '--resource-group', $rg) | Out-Null
+        $eval = Invoke-AzChaos -ChaosArgs @('workspace', 'show-evaluation', '--name', $wsName, '--resource-group', $rg) -AllowFailure
+        $evalStatus = if ($eval) { $eval.properties.status } else { $null }
+    }
 
-    # ── Step 2: Report the evaluation summary (best-effort) ──
-    $eval = Invoke-AzChaos -ChaosArgs @('workspace', 'show-evaluation', '--resource-group', $rg, '--workspace-name', $wsName) -AllowFailure
+    # ── Step 2: Report the evaluation summary ──
     if ($eval) {
-        $evalStatus = $eval.properties.status
         Set-StateProperty -PropertyPath 'setup.evaluation.status' -Value $evalStatus
         Set-StateProperty -PropertyPath 'setup.evaluation.lastPolledAt' -Value (Get-Date).ToUniversalTime().ToString('o')
         Write-Card -Title 'Evaluation Complete' -Status "✅ $evalStatus" -Properties ([ordered]@{

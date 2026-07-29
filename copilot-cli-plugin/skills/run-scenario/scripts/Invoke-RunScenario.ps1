@@ -103,7 +103,12 @@ try {
         '--skip-validation'
         '--no-wait'
     )
-    $startResult = Invoke-AzChaos -ChaosArgs $startArgs -AllowFailure
+    # Do NOT use -AllowFailure here: a failed start (deleted config, service
+    # error, concurrent-run conflict) must surface loudly. Swallowing it would
+    # drop into the run-list fallback below and stream a stale *previous* run's
+    # status, making a never-started run look like it succeeded. The fallback is
+    # only for the case where the start succeeded but did not surface a run ID.
+    $startResult = Invoke-AzChaos -ChaosArgs $startArgs
 
     # ── Step 4: Resolve ScenarioRun ID ──────────────────
     $runId = $null
@@ -116,7 +121,8 @@ try {
     }
 
     if (-not $runId) {
-        # Fallback: list runs and find the newest for this configuration.
+        # Fallback for the narrow case where start succeeded but did not surface
+        # a run ID: list runs and find the newest for this configuration.
         Write-Card -Title 'Resolving Run ID' -Status '🔄' -Body 'Run start did not surface a run ID, listing runs...'
         $runs = @(Invoke-AzChaos -ChaosArgs @('scenario', 'run', 'list', '--resource-group', $rg, '--workspace-name', $wsName, '--scenario-name', $scenarioName) |
             Where-Object { $_.properties.scenarioConfigurationName -eq $configName } |

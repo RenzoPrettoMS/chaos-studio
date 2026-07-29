@@ -65,8 +65,15 @@ function Initialize-ChaosExtension {
         [Console]::Error.WriteLine("[Invoke-AzChaos] Installing the 'chaos' Azure CLI extension...")
         & az extension add --name chaos --only-show-errors 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) {
-            throw "Failed to install the 'chaos' Azure CLI extension. Install it manually with: az extension add --name chaos"
+            throw "Failed to install the 'chaos' Azure CLI extension. Ensure Azure CLI 2.75+ is installed, then run: az extension add --name chaos"
         }
+    } else {
+        # An out-of-date extension (or CLI < 2.75) surfaces later as an
+        # unrecognized-command / unknown-flag error with nothing pointing at the
+        # requirement. Refresh the already-installed extension once per session so
+        # the command surface matches this plugin's expectations.
+        [Console]::Error.WriteLine("[Invoke-AzChaos] Ensuring the 'chaos' extension is up to date...")
+        & az extension update --name chaos --only-show-errors 2>&1 | Out-Null
     }
 
     $script:ChaosExtensionEnsured = $true
@@ -136,7 +143,8 @@ function Invoke-AzChaos {
             if (-not $errorMsg) { $errorMsg = $stdoutText }
             if (-not $errorMsg) { $errorMsg = "az chaos exited with code $exitCode" }
             [Console]::Error.WriteLine("[Invoke-AzChaos] ERROR: $errorMsg")
-            throw "az chaos $($ChaosArgs -join ' ') failed: $errorMsg"
+            $hint = "If 'az chaos' is unrecognized or a flag is unknown, ensure Azure CLI 2.75+ and update the extension: az extension update --name chaos"
+            throw "az chaos $($ChaosArgs -join ' ') failed: $errorMsg`n$hint"
         }
 
         if (-not $stdoutText) { return $null }
