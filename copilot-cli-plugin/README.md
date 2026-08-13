@@ -59,6 +59,27 @@ session for auth.
 | `setup-scenario` | Discover, configure, validate scenarios |
 | `run-scenario` | Execute and stream experiment results |
 | `chaos-impact` | Analyze run impact — correlate Azure Monitor signals to targeted resources |
+| `chaos-loop` | Run or resume the evidence-gated remediation and identical-verification loop |
+
+### Chaos Loop
+
+`/chaos-loop` is a single public controller over five bounded internal phases:
+resilience analysis, one frozen fault execution, diagnostic, advisory, and
+approved coding. Deterministic Python owns state revisions, validation,
+calculations, routing, verdict eligibility, advisory ledgers, and the hard
+merge/build/artifact/deployment/live-revision gate. The controller auto-advances
+through decisive handoffs and pauses normally only for advisory approval and PR
+delivery awaiting deployment evidence.
+
+The phases reuse the bundled `chaos-studio` MCP server; no parallel Azure
+wrapper is shipped. Build the standalone Azure SRE Agent bundle with:
+
+```powershell
+pwsh -NoProfile -File .\scripts\Build-ChaosLoopPackage.ps1
+```
+
+See [`docs/chaos-loop.md`](docs/chaos-loop.md) and
+[`docs/sre-agent-chaos-loop-import.md`](docs/sre-agent-chaos-loop-import.md).
 
 ## MCP tools (for agents)
 

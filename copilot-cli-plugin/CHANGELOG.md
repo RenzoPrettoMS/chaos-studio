@@ -43,6 +43,18 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ### Added
 
+- `chaos-loop` controller and five bounded phase skills for an automatically
+  advancing resilience-analysis, single-fault execution, diagnostic, advisory,
+  coding, deployment-gate, and identical verification cycle. Deterministic
+  Python policy owns durable state, validation, calculations, routing, verdict
+  eligibility, advisory ledgers, and merge/build/artifact/deployment/live
+  revision gate checks. The only normal customer pauses are advisory approval
+  and PR delivery awaiting complete deployment evidence.
+- Versioned Chaos Loop state and external-gate schemas, Scenario catalog,
+  examples, package validation, and Azure SRE Agent setup guidance. The
+  standalone archive reuses the repository's `chaos-studio` MCP server rather
+  than shipping overlapping Azure wrappers.
+
 - New `chaos-impact` skill: pulls a `ScenarioRun`, queries Azure Monitor
   (metrics, logs via KQL, Activity Log, alerts, Service Health) across the
   run window plus a configurable buffer, and emits a Markdown report card +
