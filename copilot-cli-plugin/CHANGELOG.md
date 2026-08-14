@@ -33,7 +33,8 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
   `azure.arm_list` paging helper: read-only enumeration of
   `Microsoft.Chaos/workspaces` at subscription or resource-group scope,
   following `nextLink`, on the same `2026-05-01-preview` API version.
-  `chaos_create_workspace` remains the only write path.
+  `chaos_create_workspace` remains the only write path. The `chaos-mcp`
+  package version is now `0.4.0` for this public tool addition.
 - `schemas/chaos-loop/workspace-plan.v1.schema.json` and
   `examples/chaos-loop/workspace-plan.json`.
 
