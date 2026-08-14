@@ -6,7 +6,10 @@ description: Internal Chaos Loop phase that executes exactly one frozen Azure Ch
 # Chaos execution phase
 
 Read the complete state and shared contract. Validate the exact phase and
-revision. Do not mutate state or invoke agents/skills.
+revision. Require `state.workspace.status == "ready"` and use only
+`state.workspace.selected` for the subscription, resource group, and workspace
+name in every Chaos Studio call. Never list, create, or switch workspaces. Do
+not mutate state or invoke agents/skills.
 
 Your sole job is mechanical and decisive:
 

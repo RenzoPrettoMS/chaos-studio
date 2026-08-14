@@ -65,11 +65,14 @@ session for auth.
 
 `/chaos-loop` is a single public controller over five bounded internal phases:
 resilience analysis, one frozen fault execution, diagnostic, advisory, and
-approved coding. Deterministic Python owns state revisions, validation,
-calculations, routing, verdict eligibility, advisory ledgers, and the hard
-merge/build/artifact/deployment/live-revision gate. The controller auto-advances
-through decisive handoffs and pauses normally only for advisory approval and PR
-delivery awaiting deployment evidence.
+approved coding. Every run starts with a required, validated `workspaceRequest`
+and a deterministic workspace preflight that lists existing workspaces, reuses
+the best compatible one or creates exactly the planned one, and proves the
+result before analysis begins. Deterministic Python owns state revisions,
+validation, calculations, routing, verdict eligibility, advisory ledgers, and
+the hard merge/build/artifact/deployment/live-revision gate. The controller
+auto-advances through decisive handoffs and pauses normally only for advisory
+approval and PR delivery awaiting deployment evidence.
 
 The phases reuse the bundled `chaos-studio` MCP server; no parallel Azure
 wrapper is shipped. Build the standalone Azure SRE Agent bundle with:
@@ -107,6 +110,7 @@ Per-client config snippets (Claude Desktop, Cursor, Codex CLI) are in
 
 | Tool | Purpose |
 |---|---|
+| `chaos_list_workspaces` | List existing workspaces (subscription or resource group, paged) so one can be reused |
 | `chaos_create_workspace` | Provision workspace + identity + Reader RBAC |
 | `chaos_get_workspace` | Fetch workspace |
 | `chaos_refresh_recommendations` | Trigger workspace evaluation |

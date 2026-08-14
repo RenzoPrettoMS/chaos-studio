@@ -54,7 +54,11 @@ connector, identity, and skills; those authenticated UI steps remain manual.
 - Python 3.10 or later.
 - Azure authentication through the bundled `chaos-studio` MCP server using
   managed identity or `az login`.
-- A Chaos Studio v2 workspace with discovered recommendations.
+- Permission to list `Microsoft.Chaos/workspaces` in the requested
+  subscription, plus permission to create one (and assign Reader on the
+  requested managed scopes) when no compatible workspace exists.
+- A Chaos Studio v2 workspace with discovered recommendations — reused when one
+  already fits the request, otherwise created by preflight.
 - One existing, permission-ready, validated Scenario configuration.
 - Read access to deployment/revision identity and telemetry sources.
 - Write permission for the selected Scenario only.
@@ -70,14 +74,74 @@ rely on source files outside the installed plugin.
 
 ```text
 /chaos-loop start repo=contoso/orders commit=abc123 \
-  target_resources=["/subscriptions/.../providers/Microsoft.Web/sites/orders"] \
+  target_resources=["/subscriptions/<sub>/resourceGroups/rg-orders/providers/Microsoft.Web/sites/orders"] \
+  workspace_request={"subscriptionId":"<sub>","resourceGroup":"rg-orders","location":"eastus","managedScopes":["/subscriptions/<sub>/resourceGroups/rg-orders"]} \
   guardrails={"environmentScope":"staging","blastRadiusCap":"one replica","safetyHalts":["availability below 95% for 2m"]} \
   max_iterations=3
 ```
 
+`workspace_request` is required. It is normalized and validated at start:
+subscription UUID, Azure-safe resource group, region, non-empty managed scopes
+(subscription, resource-group, or resource ARM IDs, all in the requested
+subscription), optional `preferredName`, and optional `identity`
+(`SystemAssigned` by default; `UserAssigned` requires the exact
+`userAssignedIdentityResourceId`). Every target resource must be a valid ARM ID
+in the same subscription and covered by a requested managed scope. Anything
+ambiguous or unsupported fails closed before any phase runs.
+
 Run state is created at:
 
 `tmp/chaos-loop/runs/<runId>/state.json`
+
+### Workspace preflight
+
+The controller resolves exactly one Chaos Studio workspace before analysis,
+without asking a mid-loop question:
+
+1. `chaos_list_workspaces` enumerates existing workspaces (subscription or
+   resource-group scope, ARM paging included).
+2. `workspace-plan` deterministically decides reuse versus create and writes a
+   stamped plan without mutating state.
+3. The controller reads back the reused workspace with `chaos_get_workspace`,
+   or creates the planned workspace with `chaos_create_workspace` (a write, so
+   tool approval stays on).
+4. `workspace-finalize` proves the result and persists the ready workspace.
+
+```powershell
+python <plugin-root>\scripts\chaos_loop_state.py workspace-plan `
+  --state <state.json> --expected-revision 0 `
+  --discovery <chaos_list_workspaces result.json> `
+  --observed-at 2026-08-14T10:00:00Z `
+  --output <workspace-plan.json>
+
+python <plugin-root>\scripts\chaos_loop_state.py workspace-finalize `
+  --state <state.json> --expected-revision 0 `
+  --plan <workspace-plan.json> `
+  --result <chaos_get_workspace or chaos_create_workspace result.json>
+```
+
+Compatibility requires the requested region, the requested identity when one is
+pinned, `provisioningState = Succeeded`, and managed scopes that cover both the
+requested scopes and every target resource. Selection precedence is exact
+preferred name, then exact managed-scope set, then stable case-insensitive ARM
+ID; the remaining compatible workspaces are recorded as alternatives with a
+caveat. With no compatible candidate the create request uses `preferredName` or
+a deterministic `chaos-loop-<hash>` name plus exactly the requested scopes,
+region, and identity.
+
+A failed list/get/create call is recorded with:
+
+```powershell
+python <plugin-root>\scripts\chaos_loop_state.py workspace-fail `
+  --state <state.json> --expected-revision 0 `
+  --stage list --result <raw tool result.json>
+```
+
+Any tool failure, failed RBAC grant, non-`Succeeded` provisioning, or readback
+mismatch persists `workspace.status = failed` with a concrete
+`remediationBrief` and terminates the run `escalated`. Only a ready workspace
+lets `resilience-analysis` start, and the selected workspace is immutable for
+the rest of the run — later phases reuse it and never rediscover.
 
 The controller automatically advances every decisive phase handoff until
 `advisory-approval`, `awaiting-external-gate`, or a terminal state.
@@ -186,7 +250,15 @@ execution.
 
 ```mermaid
 flowchart TD
-  A[resilience-analysis initial] --> E[chaos-execution initial]
+  W0[start: validated workspaceRequest] --> W1[chaos_list_workspaces]
+  W1 --> W2[workspace-plan: reuse or create]
+  W2 -->|reuse| W3[chaos_get_workspace]
+  W2 -->|create| W4[chaos_create_workspace]
+  W3 --> W5[workspace-finalize]
+  W4 --> W5
+  W5 -->|mismatch or failure| WF[terminated: escalated]
+  W5 -->|ready| A[resilience-analysis initial]
+  A --> E[chaos-execution initial]
   E --> D[diagnostic initial]
   D -->|fixable CONFIRMED| V[advisory]
   D -->|REFUTED| N[next hypothesis or no-impact]
@@ -206,9 +278,12 @@ flowchart TD
 ## State and transitions
 
 - Schema: `schemas/chaos-loop/run-state.v1.schema.json`.
+- Workspace plan schema: `schemas/chaos-loop/workspace-plan.v1.schema.json`.
 - Contract: `chaos-loop-contract/v1`.
-- Policy: `chaos-loop-policy/v1`; legacy policy state is migrated atomically
-  and idempotently by the controller.
+- Policy: `chaos-loop-policy/v2`; earlier policy state is migrated atomically
+  and idempotently by the controller. A migrated run has no proven workspace,
+  so it is migrated to `workspace.status = pending` and must complete preflight
+  (supply the request with `migrate --workspace-request`) before any phase runs.
 - Optimistic revision: every mutation requires the exact current revision.
 - Persistence: exclusive lock plus atomic same-directory replacement.
 - Event log: one UTC event per successful revision.
@@ -218,6 +293,7 @@ flowchart TD
   `ready` or `terminated` decision.
 - Only `advisory-approval` and `awaiting-external-gate` are valid blocked states.
 - `frozenValidation` is canonical and immutable for reassess/verify.
+- `workspace.selected` is canonical and immutable after preflight.
 
 Allowed phase transitions are enforced by `scripts/chaos_loop_state.py`, not by
 phase prose. `NOT EXERCISED` never reaches Advisory.
@@ -228,6 +304,9 @@ phase prose. `NOT EXERCISED` never reaches Advisory.
 
 - run allocation, schema/policy migration, atomic writes, optimistic revisions,
   idempotency, events, phase ownership, and all routes/terminal states;
+- workspace request normalization/validation, candidate compatibility, stable
+  reuse-or-create selection, create-request construction, readback/RBAC/
+  provisioning verification, and workspace immutability;
 - Scenario catalog eligibility, predicate/fault completeness, one-fault
   enforcement, score/ID sorting, and highest-ranked selection;
 - canonical frozen-fault equality, build identity equality, steady-state
@@ -258,6 +337,7 @@ closed with machine-readable JSON and a stable nonzero exit code.
 
 | Skill | Does | Never does |
 |---|---|---|
+| controller preflight | resolve exactly one workspace (reuse or create) with proof | ask a mid-loop workspace question, rediscover after ready |
 | resilience-analysis | highest-ranked eligible hypothesis and one executable test handoff | inject, diagnose, advise, edit |
 | chaos-execution | decide Diagnostic eligibility or hand concrete repair to Analysis | SLI math, verdict, advice, success claim |
 | diagnostic | exact verdict and automatic evidence-based route | recommend or edit |
@@ -310,7 +390,8 @@ assumed.
 - `scripts/chaos_loop_state.py`: atomic state and transition controller.
 - `mcp/`: the existing Chaos Studio/Monitor MCP package used by every phase.
 - `scripts/Build-ChaosLoopPackage.ps1`: reproducible validated archive builder.
-- `schemas/chaos-loop/*.json`: run-state and external-gate schemas.
+- `schemas/chaos-loop/*.json`: run-state, workspace-plan, and external-gate
+  schemas.
 - `docs/sre-agent-chaos-loop-import.md`: Agent Builder import, RBAC, connector,
   and state setup.
 

@@ -31,15 +31,47 @@ Describe "Chaos Loop native plugin integration" {
             "references/chaos-loop/scenario-catalog.md",
             "references/chaos-loop/scenario-catalog.v1.json",
             "schemas/chaos-loop/run-state.v1.schema.json",
+            "schemas/chaos-loop/workspace-plan.v1.schema.json",
             "schemas/chaos-loop/external-gate.v1.schema.json",
             "scripts/chaos_loop_state.py",
             "scripts/Build-ChaosLoopPackage.ps1",
             "examples/chaos-loop/initial-state.json",
+            "examples/chaos-loop/workspace-plan.json",
             "examples/chaos-loop/external-gate.json",
             "mcp/chaos_mcp/server.py"
         )
         foreach ($relative in $required) {
             Join-Path $script:pluginRoot $relative | Should -Exist
+        }
+    }
+
+    It "binds the controller workspace preflight to the read-only MCP discovery tool" {
+        $controller = Get-Content (
+            Join-Path $script:pluginRoot "skills" "chaos-loop" "SKILL.md"
+        ) -Raw
+        $server = Get-Content (
+            Join-Path $script:pluginRoot "mcp" "chaos_mcp" "server.py"
+        ) -Raw
+        $state = Get-Content (
+            Join-Path $script:pluginRoot "scripts" "chaos_loop_state.py"
+        ) -Raw
+
+        $server | Should -Match "def chaos_list_workspaces"
+        $server | Should -Match "def chaos_get_workspace"
+        $server | Should -Match "def chaos_create_workspace"
+        $controller | Should -Match "chaos_list_workspaces"
+        $controller | Should -Match "workspace-plan"
+        $controller | Should -Match "workspace-finalize"
+        $controller | Should -Match "workspace-fail"
+        $state | Should -Match "def cmd_workspace_plan"
+        $state | Should -Match "def cmd_workspace_finalize"
+        $state | Should -Match "def cmd_workspace_fail"
+
+        foreach ($skill in @("resilience-analysis", "chaos-execution", "diagnostic", "advisory", "coding")) {
+            $content = Get-Content (Join-Path $script:pluginRoot "skills" $skill "SKILL.md") -Raw
+            $content | Should -Match "workspace"
+            $content | Should -Not -Match "chaos_list_workspaces"
+            $content | Should -Not -Match "chaos_create_workspace"
         }
     }
 

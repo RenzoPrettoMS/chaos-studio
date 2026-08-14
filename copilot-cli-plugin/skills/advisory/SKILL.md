@@ -5,7 +5,9 @@ description: Internal Chaos Loop phase that ranks evidence-supported remediation
 
 # Advisory phase
 
-Read state and the shared contract. Validate phase/revision. Do not re-diagnose,
+Read state and the shared contract. Validate phase/revision. Require
+`state.workspace.status == "ready"` and leave `state.workspace.selected`
+untouched; it is the run's immutable workspace. Do not re-diagnose,
 query impact telemetry, approve advice, edit code/IaC, apply resources, invoke
 agents, invoke another phase, or mutate state.
 

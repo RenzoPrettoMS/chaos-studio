@@ -30,6 +30,7 @@ $requiredSources = @(
     "references/chaos-loop/scenario-catalog.md",
     "references/chaos-loop/scenario-catalog.v1.json",
     "schemas/chaos-loop/run-state.v1.schema.json",
+    "schemas/chaos-loop/workspace-plan.v1.schema.json",
     "schemas/chaos-loop/external-gate.v1.schema.json",
     "scripts/chaos_loop_state.py",
     "skills/chaos-loop/SKILL.md",
@@ -39,6 +40,7 @@ $requiredSources = @(
     "skills/advisory/SKILL.md",
     "skills/coding/SKILL.md",
     "examples/chaos-loop/initial-state.json",
+    "examples/chaos-loop/workspace-plan.json",
     "examples/chaos-loop/external-gate.json",
     "mcp/pyproject.toml",
     "mcp/chaos_mcp/server.py"
@@ -175,6 +177,8 @@ try {
         "chaos-loop/scripts/chaos_loop_state.py",
         "chaos-loop/references/chaos-loop/shared-contract.md",
         "chaos-loop/schemas/chaos-loop/run-state.v1.schema.json",
+        "chaos-loop/schemas/chaos-loop/workspace-plan.v1.schema.json",
+        "chaos-loop/examples/chaos-loop/workspace-plan.json",
         "chaos-loop/skills/chaos-loop/SKILL.md",
         "chaos-loop/mcp/pyproject.toml",
         "chaos-loop/mcp/chaos_mcp/server.py"

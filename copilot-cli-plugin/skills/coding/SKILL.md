@@ -5,7 +5,9 @@ description: Internal Chaos Loop phase that implements only explicitly approved 
 
 # Coding phase
 
-Read state and the shared contract. Validate phase/revision. Reject any advisory
+Read state and the shared contract. Validate phase/revision. Require
+`state.workspace.status == "ready"` and leave `state.workspace.selected`
+untouched; it is the run's immutable workspace. Reject any advisory
 not present in both the current set and `approvedAdvisoryIds`.
 
 Implement only explicit approved IDs. Do not diagnose, broaden advice, perform

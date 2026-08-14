@@ -5,7 +5,10 @@ description: Internal Chaos Loop phase that performs read-only telemetry analysi
 
 # Diagnostic phase
 
-Read state and the shared contract. Validate phase/revision. This phase is
+Read state and the shared contract. Validate phase/revision. Require
+`state.workspace.status == "ready"` and treat `state.workspace.selected` as the
+run's immutable workspace: reuse those coordinates and never discover, create,
+or change a workspace. This phase is
 read-only against source, infrastructure, and telemetry. Do not recommend or
 implement changes, invoke agents, invoke another skill, or mutate state.
 

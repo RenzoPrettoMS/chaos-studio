@@ -51,7 +51,7 @@ Describe "Chaos Loop schemas and state controller" {
         function New-EvaluationStamp {
             return @{
                 engine = "chaos_loop_state.py"
-                policyVersion = "chaos-loop-policy/v1"
+                policyVersion = "chaos-loop-policy/v2"
             }
         }
 
@@ -127,6 +127,45 @@ Describe "Chaos Loop schemas and state controller" {
             }
         }
 
+        function Set-ReadyWorkspace {
+            param([Parameter(Mandatory)][hashtable]$State)
+
+            $request = $State.workspace.request
+            $State.workspace.status = "ready"
+            $State.workspace.decision = "reused"
+            $State.workspace.selected = @{
+                id = "/subscriptions/$($request.subscriptionId)/resourceGroups/$($request.resourceGroup)/providers/Microsoft.Chaos/workspaces/orders-resilience"
+                name = "orders-resilience"
+                subscriptionId = $request.subscriptionId
+                resourceGroup = $request.resourceGroup
+                location = $request.location
+                identity = @{
+                    type = "SystemAssigned"
+                    userAssignedIdentityResourceIds = @()
+                    principalId = "3d2f8c11-9b74-4a1e-8c55-0a9f7b6e4d21"
+                }
+                managedScopes = @($request.managedScopes)
+                provisioningState = "Succeeded"
+            }
+            $State.workspace.discoveryEvidence = @{
+                source = "chaos_list_workspaces"
+                observedAt = "2026-08-13T19:00:05Z"
+                candidateCount = 1
+                candidateIds = @($State.workspace.selected.id)
+            }
+            $State.workspace.provisioningEvidence = @{
+                source = "chaos_get_workspace"
+                decision = "reuse"
+                observedAt = "2026-08-13T19:00:06Z"
+                workspaceId = $State.workspace.selected.id
+                provisioningState = "Succeeded"
+                roleAssignments = @()
+            }
+            $State.workspace.observedAt = "2026-08-13T19:00:06Z"
+            $State.workspace.remediationBrief = $null
+            return $State
+        }
+
         function New-TestState {
             param(
                 [string]$Phase,
@@ -140,6 +179,7 @@ Describe "Chaos Loop schemas and state controller" {
             $state.faultId = "CPU-Pressure-1.0-20260813T190000Z"
             $state.stateRevision = $Revision
             $state.phase = $Phase
+            $state = Set-ReadyWorkspace -State $state
             $state.analysis.mode = "initial"
             $state.analysis.hypotheses = @($hypothesis)
             $state.analysis.selectedHypothesisId = "H1"
@@ -166,14 +206,16 @@ Describe "Chaos Loop schemas and state controller" {
         $json | Test-Json -SchemaFile $script:gateSchema | Should -BeTrue
     }
 
-    It "creates one durable state document with revision zero" {
+    It "creates one durable state document with revision zero and a pending workspace" {
         $root = Join-Path $TestDrive "runs"
+        $subscription = "8f4a2b1c-6d3e-4f57-9a80-1b2c3d4e5f60"
         $result = Invoke-StateTool -Arguments @(
             "start",
             "--repo", "contoso/orders",
             "--commit", "abc123",
-            "--target-resources", '["/subscriptions/000/resourceGroups/rg/providers/Microsoft.Web/sites/orders"]',
+            "--target-resources", ("[""/subscriptions/$subscription/resourceGroups/rg-orders/providers/Microsoft.Web/sites/orders""]"),
             "--guardrails", '{"environmentScope":"staging","blastRadiusCap":"one replica","safetyHalts":["availability below 95%"]}',
+            "--workspace-request", ("{""subscriptionId"":""$subscription"",""resourceGroup"":""rg-orders"",""location"":""East US"",""managedScopes"":[""/subscriptions/$subscription/resourceGroups/rg-orders""]}"),
             "--state-root", $root
         )
 
@@ -183,13 +225,36 @@ Describe "Chaos Loop schemas and state controller" {
         $state = Get-Content $statePath -Raw | ConvertFrom-Json -AsHashtable
         $state.stateRevision | Should -Be 0
         $state.phase | Should -Be "resilience-analysis"
+        $state.policyVersion | Should -Be "chaos-loop-policy/v2"
+        $state.workspace.status | Should -Be "pending"
+        $state.workspace.request.location | Should -Be "eastus"
+        $state.workspace.request.identity.type | Should -Be "SystemAssigned"
+        $state.workspace.request.identitySpecified | Should -BeFalse
+        $state.workspace.selected | Should -BeNullOrEmpty
         $state.events.Count | Should -Be 1
         (Get-ChildItem $root -Recurse -Filter "*.lock").Count | Should -Be 0
+    }
+
+    It "refuses to start a run without a workspace request" {
+        $root = Join-Path $TestDrive "runs-no-workspace"
+        $result = Invoke-StateTool -Arguments @(
+            "start",
+            "--repo", "contoso/orders",
+            "--commit", "abc123",
+            "--target-resources", '["/subscriptions/8f4a2b1c-6d3e-4f57-9a80-1b2c3d4e5f60/resourceGroups/rg/providers/Microsoft.Web/sites/orders"]',
+            "--guardrails", '{"environmentScope":"staging","blastRadiusCap":"one replica","safetyHalts":["availability below 95%"]}',
+            "--state-root", $root
+        )
+
+        $result.ExitCode | Should -Not -Be 0
+        $result.Text | Should -Match "workspace-request"
+        Test-Path $root | Should -BeFalse
     }
 
     It "migrates legacy policy state once and is idempotent" {
         $state = New-TestState -Phase "advisory" -Revision 4
         $state.Remove("policyVersion")
+        $state.Remove("workspace")
         $state.handoff.Remove("analysisDecision")
         $state.handoff.Remove("executionDecision")
         $state.handoff.Remove("diagnosticDecision")
@@ -213,8 +278,10 @@ Describe "Chaos Loop schemas and state controller" {
         $first.Json.result.migrated | Should -BeTrue
         $migrated = Get-Content $statePath -Raw | ConvertFrom-Json -AsHashtable
         $migrated.phase | Should -Be "advisory-approval"
-        $migrated.policyVersion | Should -Be "chaos-loop-policy/v1"
+        $migrated.policyVersion | Should -Be "chaos-loop-policy/v2"
         $migrated.stateRevision | Should -Be 5
+        $migrated.workspace.status | Should -Be "pending"
+        $migrated.workspace.request | Should -BeNullOrEmpty
 
         $second = Invoke-StateTool -Arguments @(
             "migrate",
@@ -224,6 +291,49 @@ Describe "Chaos Loop schemas and state controller" {
         $second.ExitCode | Should -Be 0 -Because $second.Text
         $second.Json.result.migrated | Should -BeFalse
         $second.Json.result.stateRevision | Should -Be 5
+    }
+
+    It "never lets a migrated initial run bypass workspace preflight" {
+        $state = New-TestState -Phase "resilience-analysis" -Revision 0
+        $state.Remove("policyVersion")
+        $state.Remove("workspace")
+        $state.analysis.hypotheses = @()
+        $state.analysis.selectedHypothesisId = $null
+        $state.analysis.originalHypothesisId = $null
+        $state.analysis.routingIntent = "select-initial"
+        $state.frozenValidation = $null
+        $state.faultId = $null
+        $statePath = Join-Path $TestDrive "legacy-initial-state.json"
+        Write-Utf8Json -Path $statePath -Value $state
+
+        $migrate = Invoke-StateTool -Arguments @(
+            "migrate",
+            "--state", $statePath,
+            "--expected-revision", "0"
+        )
+        $migrate.ExitCode | Should -Be 0 -Because $migrate.Text
+        $migrated = Get-Content $statePath -Raw | ConvertFrom-Json -AsHashtable
+        $migrated.workspace.status | Should -Be "pending"
+
+        $proposalPath = Join-Path $TestDrive "legacy-initial-proposal.json"
+        Write-Utf8Json -Path $proposalPath -Value @{
+            contractVersion = "chaos-loop-contract/v1"
+            runId = $migrated.runId
+            expectedStateRevision = 1
+            phase = "resilience-analysis"
+            result = @{ mode = "initial"; hypotheses = @() }
+        }
+        $evaluate = Invoke-StateTool -Arguments @(
+            "evaluate",
+            "--state", $statePath,
+            "--expected-revision", "1",
+            "--phase", "resilience-analysis",
+            "--input", $proposalPath,
+            "--output", (Join-Path $TestDrive "legacy-initial-output.json")
+        )
+
+        $evaluate.ExitCode | Should -Be 2
+        $evaluate.Text | Should -Match "Workspace preflight is incomplete"
     }
 
     It "rejects a stale revision without mutating state" {

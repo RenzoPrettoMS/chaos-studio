@@ -12,7 +12,16 @@ Read the complete run state, then read
 - `state.phase == "resilience-analysis"`;
 - the supplied expected revision equals `state.stateRevision`;
 - state is active;
+- `state.workspace.status == "ready"` and `state.workspace.selected` names the
+  workspace ARM ID, name, subscription, resource group, region, identity,
+  managed scopes, and `provisioningState == "Succeeded"`;
+- every `analysis.scope.targetResources` entry is covered by
+  `state.workspace.selected.managedScopes`;
 - `analysis.scope` contains repository, commit, and target resources.
+
+If the workspace is not ready, stop and return control to the controller. Never
+list, create, choose, or ask about a workspace: preflight already selected one
+and it is immutable for the run.
 
 You are read-only. Do not inject a fault, query impact telemetry, diagnose,
 advise, edit code/IaC, invoke an agent, invoke another phase, or mutate state.
@@ -20,11 +29,12 @@ Write only the phase-output JSON requested by the controller.
 
 ## Scenario grounding
 
-Use the current workspace's discovered recommendations when workspace
-coordinates are available:
+Use the selected workspace's discovered recommendations. The workspace
+coordinates come from `state.workspace.selected`; never rediscover them:
 
 Call `chaos_list_recommended_scenarios` from the bundled `chaos-studio` MCP
-server with the workspace subscription, resource group, and name.
+server with `state.workspace.selected.subscriptionId`,
+`state.workspace.selected.resourceGroup`, and `state.workspace.selected.name`.
 
 Preserve the exact versioned Scenario name and an existing validated
 configuration name. Otherwise use only a currently supported custom Scenario

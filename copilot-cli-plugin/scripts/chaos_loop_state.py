@@ -27,7 +27,8 @@ from typing import Any, Callable
 STATE_VERSION = "chaos-loop-state/v1"
 CONTRACT_VERSION = "chaos-loop-contract/v1"
 GATE_VERSION = "chaos-loop-gate/v1"
-POLICY_VERSION = "chaos-loop-policy/v1"
+POLICY_VERSION = "chaos-loop-policy/v2"
+WORKSPACE_PLAN_VERSION = "chaos-loop-workspace-plan/v1"
 CATALOG_PATH = (
     Path(__file__).resolve().parent.parent
     / "references"
@@ -56,6 +57,21 @@ TERMINATION_REASONS = {
 
 VERDICTS = {"CONFIRMED", "REFUTED", "NOT EXERCISED"}
 UTC_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+WORKSPACE_STATUSES = {"pending", "ready", "failed"}
+WORKSPACE_DECISIONS = {"reused", "created"}
+WORKSPACE_PLAN_DECISIONS = {"reuse", "create"}
+WORKSPACE_RESOURCE_TYPE = "microsoft.chaos/workspaces"
+USER_ASSIGNED_IDENTITY_TYPE = "microsoft.managedidentity/userassignedidentities"
+IDENTITY_TYPES = ("SystemAssigned", "UserAssigned")
+REQUIRED_PROVISIONING_STATE = "Succeeded"
+UUID_PATTERN = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+RESOURCE_GROUP_PATTERN = re.compile(r"^[-\w\.\(\)]+$", re.UNICODE)
+LOCATION_PATTERN = re.compile(r"^[a-z0-9]{3,64}$")
+WORKSPACE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}[A-Za-z0-9]$")
+GENERATED_WORKSPACE_NAME_PREFIX = "chaos-loop-"
 
 PHASE_OWNERSHIP = {
     "resilience-analysis": {"analysisDecision", "unresolvedCaveats"},
@@ -236,14 +252,996 @@ def new_handoff() -> dict[str, Any]:
     }
 
 
-def migrate_state_document(state: dict[str, Any]) -> bool:
+def new_workspace(request: dict[str, Any] | None, caveats: list[str] | None = None) -> dict[str, Any]:
+    """Return the pending workspace preflight record persisted at run start."""
+    return {
+        "status": "pending",
+        "request": copy.deepcopy(request),
+        "decision": None,
+        "selected": None,
+        "alternatives": [],
+        "caveats": list(caveats or []),
+        "discoveryEvidence": None,
+        "provisioningEvidence": None,
+        "observedAt": None,
+        "remediationBrief": None,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Workspace preflight: normalization
+# -----------------------------------------------------------------------------
+
+
+def load_json_argument(value: Any, label: str) -> dict[str, Any]:
+    """Accept an inline JSON object, a JSON string, or a path to a JSON file."""
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    require(isinstance(value, str) and value.strip(), f"{label} is required")
+    text = value.strip()
+    if text.startswith("{"):
+        parsed = json.loads(text)
+        require(isinstance(parsed, dict), f"{label} must be a JSON object")
+        return parsed
+    return read_json(Path(text))
+
+
+def normalize_subscription_id(value: Any, field: str = "subscriptionId") -> str:
+    require(isinstance(value, str), f"{field} must be a string")
+    normalized = value.strip().lower()
+    require(
+        UUID_PATTERN.match(normalized) is not None,
+        f"{field} must be an Azure subscription UUID: {value!r}",
+    )
+    return normalized
+
+
+def normalize_resource_group(value: Any, field: str = "resourceGroup") -> str:
+    require(isinstance(value, str), f"{field} must be a string")
+    normalized = value.strip()
+    require(normalized != "", f"{field} cannot be empty")
+    require(len(normalized) <= 90, f"{field} cannot exceed 90 characters: {value!r}")
+    require(not normalized.endswith("."), f"{field} cannot end with a period: {value!r}")
+    require(
+        RESOURCE_GROUP_PATTERN.match(normalized) is not None,
+        f"{field} contains characters Azure does not allow: {value!r}",
+    )
+    return normalized
+
+
+def normalize_location(value: Any, field: str = "location") -> str:
+    require(isinstance(value, str), f"{field} must be a string")
+    normalized = re.sub(r"\s+", "", value).strip().lower()
+    require(normalized != "", f"{field} cannot be empty")
+    require(
+        LOCATION_PATTERN.match(normalized) is not None,
+        f"{field} must be an Azure region name such as 'eastus': {value!r}",
+    )
+    return normalized
+
+
+def parse_arm_id(value: Any, field: str = "ARM ID") -> dict[str, Any]:
+    """Parse a subscription-rooted ARM ID into its canonical parts.
+
+    Supports exactly three scope kinds: a subscription, a resource group, and a
+    provider resource inside a resource group. Every other shape (management
+    group, tenant, subscription-level provider resource, deployment scope) is
+    rejected so an ambiguous scope can never be silently accepted.
+    """
+    require(isinstance(value, str), f"{field} must be a string")
+    raw = value.strip()
+    require(raw.startswith("/"), f"{field} must start with '/': {value!r}")
+    segments = raw.strip("/").split("/")
+    require(all(segments), f"{field} contains an empty segment: {value!r}")
+    require(
+        len(segments) >= 2 and segments[0].casefold() == "subscriptions",
+        f"{field} must be a subscription-rooted ARM ID: {value!r}",
+    )
+    subscription = normalize_subscription_id(segments[1], f"{field} subscription")
+    parsed: dict[str, Any] = {
+        "subscriptionId": subscription,
+        "resourceGroup": None,
+        "resourceType": None,
+        "name": None,
+        "kind": "subscription",
+        "canonical": f"/subscriptions/{subscription}",
+    }
+    rest = segments[2:]
+    if not rest:
+        return parsed
+    require(
+        rest[0].casefold() == "resourcegroups",
+        f"{field} names an unsupported scope kind: {value!r}",
+    )
+    require(len(rest) >= 2, f"{field} names no resource group: {value!r}")
+    resource_group = normalize_resource_group(rest[1], f"{field} resourceGroup")
+    parsed["resourceGroup"] = resource_group
+    parsed["kind"] = "resourceGroup"
+    parsed["canonical"] = f"/subscriptions/{subscription}/resourceGroups/{resource_group}"
+    tail = rest[2:]
+    if not tail:
+        return parsed
+    require(
+        tail[0].casefold() == "providers",
+        f"{field} names an unsupported scope kind: {value!r}",
+    )
+    body = tail[1:]
+    require(
+        len(body) >= 3 and len(body) % 2 == 1,
+        f"{field} is not a complete provider resource ID: {value!r}",
+    )
+    namespace = body[0]
+    type_segments = [body[index] for index in range(1, len(body), 2)]
+    name_segments = [body[index] for index in range(2, len(body), 2)]
+    parsed["kind"] = "resource"
+    parsed["resourceType"] = namespace + "/" + "/".join(type_segments)
+    parsed["name"] = name_segments[-1]
+    parsed["canonical"] = (
+        f"{parsed['canonical']}/providers/{namespace}/"
+        + "/".join(
+            segment
+            for pair in zip(type_segments, name_segments)
+            for segment in pair
+        )
+    )
+    return parsed
+
+
+def scope_covers(scope: str, resource_id: str) -> bool:
+    """True when `scope` is `resource_id` or one of its ARM ancestors."""
+    outer = scope.casefold().rstrip("/")
+    inner = resource_id.casefold().rstrip("/")
+    return inner == outer or inner.startswith(outer + "/")
+
+
+def normalize_managed_scope(
+    value: Any, subscription_id: str | None, field: str = "managedScopes entry"
+) -> str:
+    parsed = parse_arm_id(value, field)
+    require(
+        parsed["kind"] in {"subscription", "resourceGroup", "resource"},
+        f"{field} names an unsupported scope kind: {value!r}",
+    )
+    if subscription_id is not None:
+        require(
+            parsed["subscriptionId"] == subscription_id,
+            f"{field} is outside the requested subscription: {value!r}",
+        )
+    return parsed["canonical"]
+
+
+def normalize_workspace_identity(raw: Any) -> tuple[dict[str, Any], bool]:
+    """Return the normalized identity and whether the request specified one."""
+    if raw is None:
+        return {"type": "SystemAssigned"}, False
+    require(isinstance(raw, dict), "workspaceRequest.identity must be an object")
+    unsupported = sorted(set(raw) - {"type", "userAssignedIdentityResourceId"})
+    require(
+        not unsupported,
+        f"workspaceRequest.identity has unsupported fields: {unsupported}",
+    )
+    raw_type = raw.get("type")
+    require(isinstance(raw_type, str), "workspaceRequest.identity.type is required")
+    matches = [item for item in IDENTITY_TYPES if item.casefold() == raw_type.strip().casefold()]
+    require(
+        len(matches) == 1,
+        "workspaceRequest.identity.type must be SystemAssigned or UserAssigned",
+    )
+    identity_type = matches[0]
+    if identity_type == "SystemAssigned":
+        require(
+            not raw.get("userAssignedIdentityResourceId"),
+            "SystemAssigned identity cannot name a userAssignedIdentityResourceId",
+        )
+        return {"type": "SystemAssigned"}, True
+    resource_id = raw.get("userAssignedIdentityResourceId")
+    require(
+        isinstance(resource_id, str) and resource_id.strip(),
+        "UserAssigned identity requires exactly one userAssignedIdentityResourceId",
+    )
+    parsed = parse_arm_id(resource_id, "workspaceRequest.identity.userAssignedIdentityResourceId")
+    require(
+        parsed["kind"] == "resource"
+        and parsed["resourceType"].casefold() == USER_ASSIGNED_IDENTITY_TYPE,
+        "userAssignedIdentityResourceId must name a "
+        "Microsoft.ManagedIdentity/userAssignedIdentities resource",
+    )
+    return {
+        "type": "UserAssigned",
+        "userAssignedIdentityResourceId": parsed["canonical"],
+    }, True
+
+
+def workspace_request_hash(request: dict[str, Any]) -> str:
+    payload = {key: value for key, value in request.items() if key != "requestHash"}
+    return hashlib.sha256(canonical(payload).encode("utf-8")).hexdigest()
+
+
+def normalize_workspace_request(
+    raw: Any, target_resources: list[Any]
+) -> dict[str, Any]:
+    """Validate and canonicalize the required workspace request.
+
+    Every field is grounded in the real `Microsoft.Chaos/workspaces` payload:
+    subscription, resource group, region, managed scopes, optional preferred
+    name, and optional managed identity. Target resources must be valid ARM
+    resource IDs in the same subscription and covered by a requested scope.
+    """
+    require(isinstance(raw, dict), "workspace-request must be a JSON object")
+    supported = {
+        "subscriptionId",
+        "resourceGroup",
+        "location",
+        "managedScopes",
+        "preferredName",
+        "identity",
+    }
+    unsupported = sorted(set(raw) - supported)
+    require(not unsupported, f"workspace-request has unsupported fields: {unsupported}")
+    missing = sorted(
+        {"subscriptionId", "resourceGroup", "location", "managedScopes"} - set(raw)
+    )
+    require(not missing, f"workspace-request is missing: {missing}")
+
+    subscription = normalize_subscription_id(raw["subscriptionId"])
+    resource_group = normalize_resource_group(raw["resourceGroup"])
+    location = normalize_location(raw["location"])
+
+    raw_scopes = raw["managedScopes"]
+    require(
+        isinstance(raw_scopes, list) and raw_scopes,
+        "workspaceRequest.managedScopes must be a non-empty array",
+    )
+    scopes: list[str] = []
+    for item in raw_scopes:
+        scope = normalize_managed_scope(item, subscription)
+        if scope not in scopes:
+            scopes.append(scope)
+    scopes.sort(key=lambda item: (item.casefold(), item))
+
+    preferred_name = raw.get("preferredName")
+    if preferred_name is not None:
+        require(isinstance(preferred_name, str), "workspaceRequest.preferredName must be a string")
+        preferred_name = preferred_name.strip()
+        require(
+            WORKSPACE_NAME_PATTERN.match(preferred_name) is not None,
+            f"workspaceRequest.preferredName is not a valid workspace name: {preferred_name!r}",
+        )
+
+    identity, identity_specified = normalize_workspace_identity(raw.get("identity"))
+
+    require(
+        isinstance(target_resources, list) and target_resources,
+        "target-resources must be a non-empty JSON array",
+    )
+    targets: list[str] = []
+    for target in target_resources:
+        parsed = parse_arm_id(target, "target resource")
+        require(
+            parsed["kind"] == "resource",
+            f"Target must be a provider resource ARM ID: {target!r}",
+        )
+        require(
+            parsed["subscriptionId"] == subscription,
+            f"Target is outside the requested subscription: {target!r}",
+        )
+        require(
+            any(scope_covers(scope, parsed["canonical"]) for scope in scopes),
+            f"Target is not covered by any requested managed scope: {target!r}",
+        )
+        if parsed["canonical"] not in targets:
+            targets.append(parsed["canonical"])
+
+    request = {
+        "subscriptionId": subscription,
+        "resourceGroup": resource_group,
+        "location": location,
+        "managedScopes": scopes,
+        "preferredName": preferred_name,
+        "identity": identity,
+        "identitySpecified": identity_specified,
+        "targetResources": targets,
+    }
+    request["requestHash"] = workspace_request_hash(request)
+    return request
+
+
+# -----------------------------------------------------------------------------
+# Workspace preflight: discovery, compatibility, and planning
+# -----------------------------------------------------------------------------
+
+
+def workspace_discovery_candidates(
+    document: Any,
+) -> tuple[list[dict[str, Any]], str, str | None]:
+    """Extract candidate workspaces from a raw `chaos_list_workspaces` result."""
+    require(isinstance(document, dict), "Workspace discovery must be a JSON object")
+    if "ok" in document:
+        require(
+            document.get("ok") is True,
+            "Workspace discovery reported a failed tool call; "
+            f"record it with workspace-fail: {document.get('error', 'unknown error')}",
+        )
+        payload = document.get("result")
+        require(isinstance(payload, dict), "Workspace discovery result must be an object")
+    else:
+        payload = document
+    keys = [key for key in ("workspaces", "value") if key in payload]
+    require(
+        len(keys) == 1,
+        "Workspace discovery must contain exactly one of 'workspaces' or 'value'",
+    )
+    candidates = payload[keys[0]]
+    require(isinstance(candidates, list), "Workspace discovery candidates must be an array")
+    scope = payload.get("scope")
+    resource_group = payload.get("resourceGroup")
+    require(
+        scope == "resourceGroup",
+        "Workspace discovery must be resource-group scoped for deterministic reuse",
+    )
+    require(
+        isinstance(resource_group, str) and resource_group.strip(),
+        "Workspace discovery must identify its resourceGroup",
+    )
+    return candidates, scope, resource_group.strip()
+
+
+def normalize_workspace_resource(raw: Any) -> dict[str, Any]:
+    """Canonicalize one `Microsoft.Chaos/workspaces` ARM resource payload."""
+    require(isinstance(raw, dict), "Workspace resource must be an object")
+    parsed = parse_arm_id(raw.get("id"), "workspace id")
+    require(
+        parsed["kind"] == "resource"
+        and parsed["resourceType"].casefold() == WORKSPACE_RESOURCE_TYPE,
+        f"Resource is not a Microsoft.Chaos/workspaces resource: {raw.get('id')!r}",
+    )
+    name = raw.get("name") or parsed["name"]
+    require(isinstance(name, str) and name.strip(), "Workspace resource requires a name")
+    require(
+        name.strip().casefold() == parsed["name"].casefold(),
+        f"Workspace name {name!r} does not match its ARM ID {raw.get('id')!r}",
+    )
+    properties = raw.get("properties")
+    require(isinstance(properties, dict), "Workspace resource requires a properties object")
+    raw_scopes = properties.get("scopes")
+    require(
+        isinstance(raw_scopes, list),
+        "Workspace resource requires a properties.scopes array",
+    )
+    scopes: list[str] = []
+    for item in raw_scopes:
+        scope = normalize_managed_scope(item, None, "workspace properties.scopes entry")
+        if scope not in scopes:
+            scopes.append(scope)
+    scopes.sort(key=lambda item: (item.casefold(), item))
+    provisioning_state = properties.get("provisioningState")
+    require(
+        isinstance(provisioning_state, str) and provisioning_state.strip(),
+        "Workspace resource requires properties.provisioningState",
+    )
+    raw_identity = raw.get("identity")
+    require(isinstance(raw_identity, dict), "Workspace resource requires an identity object")
+    identity_type = raw_identity.get("type")
+    require(
+        isinstance(identity_type, str) and identity_type.strip(),
+        "Workspace identity requires a type",
+    )
+    user_assigned = raw_identity.get("userAssignedIdentities") or {}
+    require(
+        isinstance(user_assigned, dict),
+        "Workspace identity.userAssignedIdentities must be an object",
+    )
+    user_assigned_ids = sorted(
+        (
+            parse_arm_id(item, "workspace userAssignedIdentities key")["canonical"]
+            for item in user_assigned
+        ),
+        key=lambda item: item.casefold(),
+    )
+    return {
+        "id": parsed["canonical"],
+        "name": name.strip(),
+        "subscriptionId": parsed["subscriptionId"],
+        "resourceGroup": parsed["resourceGroup"],
+        "location": normalize_location(raw.get("location"), "workspace location"),
+        "identity": {
+            "type": identity_type.strip(),
+            "userAssignedIdentityResourceIds": user_assigned_ids,
+            "principalId": raw_identity.get("principalId"),
+        },
+        "managedScopes": scopes,
+        "provisioningState": provisioning_state.strip(),
+    }
+
+
+def workspace_identity_mismatch(
+    request: dict[str, Any], candidate: dict[str, Any]
+) -> str | None:
+    """Return why a candidate identity fails the request, or None when it fits."""
+    requested = request["identity"]
+    observed = candidate["identity"]
+    if observed["type"].casefold() != requested["type"].casefold():
+        return (
+            f"identity type is {observed['type']!r}, requested {requested['type']!r}"
+        )
+    if requested["type"] == "UserAssigned":
+        expected = requested["userAssignedIdentityResourceId"].casefold()
+        observed_ids = [item.casefold() for item in observed["userAssignedIdentityResourceIds"]]
+        if observed_ids != [expected]:
+            return (
+                "user-assigned identity set is "
+                f"{observed['userAssignedIdentityResourceIds']}, requested exactly "
+                f"[{requested['userAssignedIdentityResourceId']}]"
+            )
+    return None
+
+
+def workspace_incompatibility(
+    request: dict[str, Any], candidate: dict[str, Any]
+) -> str | None:
+    """Return the first concrete reason a candidate cannot be reused, or None."""
+    if candidate["subscriptionId"] != request["subscriptionId"]:
+        return (
+            f"workspace is in subscription {candidate['subscriptionId']}, "
+            f"requested {request['subscriptionId']}"
+        )
+    if candidate["resourceGroup"].casefold() != request["resourceGroup"].casefold():
+        return (
+            f"workspace is in resource group {candidate['resourceGroup']!r}, "
+            f"requested {request['resourceGroup']!r}"
+        )
+    if candidate["provisioningState"] != REQUIRED_PROVISIONING_STATE:
+        return (
+            f"provisioningState is {candidate['provisioningState']!r}, "
+            f"requires {REQUIRED_PROVISIONING_STATE!r}"
+        )
+    if candidate["location"] != request["location"]:
+        return f"region is {candidate['location']!r}, requested {request['location']!r}"
+    if request["identitySpecified"]:
+        mismatch = workspace_identity_mismatch(request, candidate)
+        if mismatch:
+            return mismatch
+    uncovered_scopes = [
+        scope
+        for scope in request["managedScopes"]
+        if not any(scope_covers(owned, scope) for owned in candidate["managedScopes"])
+    ]
+    if uncovered_scopes:
+        return f"managed scopes do not cover requested scopes: {uncovered_scopes}"
+    uncovered_targets = [
+        target
+        for target in request["targetResources"]
+        if not any(scope_covers(owned, target) for owned in candidate["managedScopes"])
+    ]
+    if uncovered_targets:
+        return f"managed scopes do not cover target resources: {uncovered_targets}"
+    return None
+
+
+def workspace_candidate_sort_key(
+    request: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[int, int, str]:
+    """Stable selection precedence: preferred name, exact scope set, then ID."""
+    preferred = request.get("preferredName")
+    name_rank = (
+        0 if preferred and candidate["name"].casefold() == preferred.casefold() else 1
+    )
+    scope_rank = (
+        0
+        if [item.casefold() for item in candidate["managedScopes"]]
+        == [item.casefold() for item in request["managedScopes"]]
+        else 1
+    )
+    return (name_rank, scope_rank, candidate["id"].casefold())
+
+
+def deterministic_workspace_name(
+    request: dict[str, Any], unavailable_names: set[str] | None = None
+) -> str:
+    unavailable = unavailable_names or set()
+    for attempt in range(100):
+        digest = (
+            request["requestHash"]
+            if attempt == 0
+            else hashlib.sha256(
+                f"{request['requestHash']}:{attempt}".encode("utf-8")
+            ).hexdigest()
+        )
+        name = GENERATED_WORKSPACE_NAME_PREFIX + digest[:12]
+        require(
+            WORKSPACE_NAME_PATTERN.match(name) is not None,
+            f"Generated workspace name is invalid: {name!r}",
+        )
+        if name.casefold() not in unavailable:
+            return name
+    raise ContractError("Could not allocate a collision-free deterministic workspace name")
+
+
+def workspace_create_request(
+    request: dict[str, Any], unavailable_names: set[str] | None = None
+) -> dict[str, Any]:
+    unavailable = unavailable_names or set()
+    preferred = request.get("preferredName")
+    workspace_name = (
+        preferred
+        if preferred and preferred.casefold() not in unavailable
+        else deterministic_workspace_name(request, unavailable)
+    )
+    return {
+        "subscriptionId": request["subscriptionId"],
+        "resourceGroup": request["resourceGroup"],
+        "workspaceName": workspace_name,
+        "location": request["location"],
+        "scopes": list(request["managedScopes"]),
+        "identity": copy.deepcopy(request["identity"]),
+    }
+
+
+def plan_workspace(
+    request: dict[str, Any], discovery: Any, observed_at: str
+) -> dict[str, Any]:
+    """Deterministically decide reuse-versus-create from raw discovery output."""
+    validate_utc(observed_at, "observedAt")
+    candidates, discovery_scope, discovery_resource_group = workspace_discovery_candidates(
+        discovery
+    )
+    require(
+        discovery_resource_group.casefold() == request["resourceGroup"].casefold(),
+        f"Workspace discovery resource group {discovery_resource_group!r} does not "
+        f"match requested {request['resourceGroup']!r}",
+    )
+    compatible: list[dict[str, Any]] = []
+    rejected: list[dict[str, str]] = []
+    observed_ids: list[str] = []
+    observed_names: set[str] = set()
+    for raw in candidates:
+        if isinstance(raw, dict) and isinstance(raw.get("name"), str):
+            observed_names.add(raw["name"].strip().casefold())
+        try:
+            candidate = normalize_workspace_resource(raw)
+        except ContractError as exc:
+            rejected.append(
+                {"id": str((raw or {}).get("id", "")) if isinstance(raw, dict) else "", "reason": str(exc)}
+            )
+            continue
+        observed_ids.append(candidate["id"])
+        reason = workspace_incompatibility(request, candidate)
+        if reason is None:
+            compatible.append(candidate)
+        else:
+            rejected.append({"id": candidate["id"], "reason": reason})
+    compatible.sort(key=lambda item: workspace_candidate_sort_key(request, item))
+    rejected.sort(key=lambda item: (item["id"].casefold(), item["reason"]))
+
+    discovery_evidence = {
+        "source": "chaos_list_workspaces",
+        "scope": discovery_scope,
+        "resourceGroup": discovery_resource_group,
+        "observedAt": observed_at,
+        "candidateCount": len(candidates),
+        "candidateIds": sorted(observed_ids, key=lambda item: item.casefold()),
+        "compatibleIds": [item["id"] for item in compatible],
+        "rejected": rejected,
+    }
+
+    caveats: list[str] = []
+    if compatible:
+        selected = compatible[0]
+        alternatives = [
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "reason": "compatible but not selected by deterministic precedence",
+            }
+            for item in compatible[1:]
+        ]
+        if alternatives:
+            caveats.append(
+                f"{len(alternatives)} other compatible workspace(s) were rejected by "
+                "deterministic selection precedence"
+            )
+        if [item.casefold() for item in selected["managedScopes"]] != [
+            item.casefold() for item in request["managedScopes"]
+        ]:
+            caveats.append(
+                "reused workspace manages a broader scope set than requested: "
+                f"{selected['managedScopes']}"
+            )
+        if not request["identitySpecified"] and workspace_identity_mismatch(request, selected):
+            caveats.append(
+                "reused workspace identity is "
+                f"{selected['identity']['type']!r}; the request did not pin an identity"
+            )
+        return {
+            "decision": "reuse",
+            "selected": selected,
+            "createRequest": None,
+            "alternatives": alternatives,
+            "caveats": caveats,
+            "discoveryEvidence": discovery_evidence,
+        }
+
+    if rejected:
+        caveats.append(
+            f"{len(rejected)} discovered workspace(s) were incompatible; a new workspace is required"
+        )
+    preferred = request.get("preferredName")
+    if preferred and preferred.casefold() in observed_names:
+        caveats.append(
+            f"preferred workspace name {preferred!r} already exists but is incompatible; "
+            "using a deterministic collision-free name instead"
+        )
+    return {
+        "decision": "create",
+        "selected": None,
+        "createRequest": workspace_create_request(request, observed_names),
+        "alternatives": [],
+        "caveats": caveats,
+        "discoveryEvidence": discovery_evidence,
+    }
+
+
+def workspace_plan_document(
+    state: dict[str, Any], request: dict[str, Any], plan: dict[str, Any], observed_at: str
+) -> dict[str, Any]:
+    return {
+        "planVersion": WORKSPACE_PLAN_VERSION,
+        "contractVersion": CONTRACT_VERSION,
+        "runId": state["runId"],
+        "expectedStateRevision": state["stateRevision"],
+        "evaluation": evaluation_stamp(),
+        "requestHash": request["requestHash"],
+        "observedAt": observed_at,
+        "decision": plan["decision"],
+        "selected": plan["selected"],
+        "createRequest": plan["createRequest"],
+        "alternatives": plan["alternatives"],
+        "caveats": plan["caveats"],
+        "discoveryEvidence": plan["discoveryEvidence"],
+    }
+
+
+# -----------------------------------------------------------------------------
+# Workspace preflight: finalization
+# -----------------------------------------------------------------------------
+
+
+def validate_workspace_plan(
+    state: dict[str, Any], plan: Any, expected_revision: int
+) -> dict[str, Any]:
+    require(isinstance(plan, dict), "Workspace plan must be a JSON object")
+    require(plan.get("planVersion") == WORKSPACE_PLAN_VERSION, "Unsupported workspace planVersion")
+    require(plan.get("contractVersion") == CONTRACT_VERSION, "Workspace plan contractVersion mismatch")
+    require(plan.get("runId") == state["runId"], "Workspace plan runId mismatch")
+    require(
+        plan.get("expectedStateRevision") == expected_revision,
+        "Workspace plan expectedStateRevision mismatch",
+    )
+    require(
+        plan.get("evaluation") == evaluation_stamp(),
+        "Workspace plan was not produced by the deterministic policy evaluator",
+    )
+    require(
+        plan.get("decision") in WORKSPACE_PLAN_DECISIONS,
+        "Workspace plan decision must be reuse or create",
+    )
+    request = state["workspace"].get("request")
+    require(
+        isinstance(request, dict),
+        "Workspace preflight requires a normalized workspaceRequest on the run",
+    )
+    require(
+        plan.get("requestHash") == request["requestHash"],
+        "Workspace plan was produced for a different workspace request",
+    )
+    validate_utc(plan.get("observedAt"), "Workspace plan observedAt")
+    return request
+
+
+def workspace_tool_result(document: Any, label: str) -> dict[str, Any]:
+    require(isinstance(document, dict), f"{label} must be a JSON object")
+    if "ok" not in document:
+        return document
+    require(
+        document.get("ok") is True,
+        f"{label} reported a failed tool call: {document.get('error', 'unknown error')}",
+    )
+    payload = document.get("result")
+    require(isinstance(payload, dict), f"{label} result must be an object")
+    return payload
+
+
+def verify_workspace_readback(
+    request: dict[str, Any], plan: dict[str, Any], result: Any
+) -> dict[str, Any]:
+    """Verify the raw MCP get/create result proves the planned workspace exists.
+
+    Raises `ContractError` with a concrete reason on any tool failure, failed
+    RBAC grant, non-`Succeeded` provisioning, or readback mismatch.
+    """
+    decision = plan["decision"]
+    role_assignments: list[dict[str, Any]] = []
+    if decision == "reuse":
+        payload = workspace_tool_result(result, "Workspace get result")
+        resource = payload.get("workspace") if "workspace" in payload else payload
+    else:
+        payload = workspace_tool_result(result, "Workspace create result")
+        require(
+            isinstance(payload.get("workspace"), dict),
+            "chaos_create_workspace result must contain the workspace readback",
+        )
+        resource = payload["workspace"]
+        raw_assignments = payload.get("roleAssignments") or []
+        require(isinstance(raw_assignments, list), "roleAssignments must be an array")
+        role_assignments = [item for item in raw_assignments if isinstance(item, dict)]
+        failed = [
+            item
+            for item in role_assignments
+            if str(item.get("status", "")).casefold() not in {"granted", "already-granted"}
+        ]
+        require(
+            not failed,
+            "workspace identity role assignment did not succeed: "
+            + json.dumps(failed, sort_keys=True),
+        )
+        assigned_scopes = {
+            str(item.get("scope", "")).casefold()
+            for item in role_assignments
+            if str(item.get("status", "")).casefold()
+            in {"granted", "already-granted"}
+        }
+        expected_scopes = {
+            str(item).casefold() for item in plan["createRequest"]["scopes"]
+        }
+        require(
+            assigned_scopes == expected_scopes,
+            "workspace identity role assignments do not cover exactly the requested "
+            f"managed scopes: expected {sorted(expected_scopes)}, "
+            f"observed {sorted(assigned_scopes)}",
+        )
+    observed = normalize_workspace_resource(resource)
+    require(
+        observed["provisioningState"] == REQUIRED_PROVISIONING_STATE,
+        f"workspace provisioningState is {observed['provisioningState']!r}, "
+        f"requires {REQUIRED_PROVISIONING_STATE!r}",
+    )
+    require(
+        observed["subscriptionId"] == request["subscriptionId"],
+        f"workspace readback subscription {observed['subscriptionId']} "
+        f"does not match the requested {request['subscriptionId']}",
+    )
+    if decision == "reuse":
+        selected = plan["selected"]
+        require(isinstance(selected, dict), "Reuse plan must name the selected workspace")
+        require(
+            observed["id"].casefold() == str(selected["id"]).casefold(),
+            f"workspace readback {observed['id']} is not the planned workspace {selected['id']}",
+        )
+        require(
+            observed["name"] == selected["name"],
+            f"workspace readback name {observed['name']!r} is not {selected['name']!r}",
+        )
+        require(
+            observed["location"] == selected["location"],
+            f"workspace readback region {observed['location']!r} is not {selected['location']!r}",
+        )
+        require(
+            canonical(observed["managedScopes"]) == canonical(selected["managedScopes"]),
+            "workspace readback managed scopes drifted from discovery: "
+            f"{observed['managedScopes']}",
+        )
+    else:
+        create_request = plan["createRequest"]
+        require(isinstance(create_request, dict), "Create plan must contain the create request")
+        require(
+            observed["name"] == create_request["workspaceName"],
+            f"created workspace name {observed['name']!r} is not the requested "
+            f"{create_request['workspaceName']!r}",
+        )
+        require(
+            observed["resourceGroup"].casefold() == create_request["resourceGroup"].casefold(),
+            f"created workspace resource group {observed['resourceGroup']!r} is not the requested "
+            f"{create_request['resourceGroup']!r}",
+        )
+        require(
+            observed["location"] == create_request["location"],
+            f"created workspace region {observed['location']!r} is not the requested "
+            f"{create_request['location']!r}",
+        )
+        require(
+            canonical(observed["managedScopes"]) == canonical(sorted(create_request["scopes"], key=lambda item: (item.casefold(), item))),
+            "created workspace scopes are not exactly the requested managed scopes: "
+            f"{observed['managedScopes']}",
+        )
+    mismatch = workspace_identity_mismatch(request, observed)
+    require(
+        not (request["identitySpecified"] and mismatch),
+        f"workspace identity does not match the request: {mismatch}",
+    )
+    require(
+        decision == "reuse" or not mismatch,
+        f"created workspace identity does not match the request: {mismatch}",
+    )
+    uncovered = [
+        target
+        for target in request["targetResources"]
+        if not any(scope_covers(scope, target) for scope in observed["managedScopes"])
+    ]
+    require(
+        not uncovered,
+        f"workspace managed scopes do not cover the target resources: {uncovered}",
+    )
+    return {"selected": observed, "roleAssignments": role_assignments}
+
+
+def workspace_remediation_brief(
+    stage: str, reason: str, corrections: list[str], evidence: Any = None
+) -> dict[str, Any]:
+    brief = {
+        "stage": stage,
+        "reason": reason,
+        "requiredCorrections": list(corrections),
+    }
+    if evidence is not None:
+        brief["evidence"] = evidence
+    return brief
+
+
+def fail_workspace(
+    state: dict[str, Any],
+    brief: dict[str, Any],
+    observed_at: str,
+    discovery_evidence: Any = None,
+    provisioning_evidence: Any = None,
+) -> None:
+    workspace = state["workspace"]
+    workspace["status"] = "failed"
+    workspace["decision"] = None
+    workspace["selected"] = None
+    workspace["observedAt"] = observed_at
+    workspace["remediationBrief"] = brief
+    if discovery_evidence is not None:
+        workspace["discoveryEvidence"] = discovery_evidence
+    if provisioning_evidence is not None:
+        workspace["provisioningEvidence"] = provisioning_evidence
+    caveat = f"workspace preflight failed at stage {brief['stage']}: {brief['reason']}"
+    if caveat not in workspace["caveats"]:
+        workspace["caveats"].append(caveat)
+    terminate(state, "resilience-analysis", "escalated")
+
+
+def validate_workspace_selection(selected: Any) -> None:
+    require(isinstance(selected, dict), "Ready workspace requires the selected workspace")
+    required = {
+        "id",
+        "name",
+        "subscriptionId",
+        "resourceGroup",
+        "location",
+        "identity",
+        "managedScopes",
+        "provisioningState",
+    }
+    missing = sorted(required - selected.keys())
+    require(not missing, f"Selected workspace is missing: {missing}")
+    require(
+        selected["provisioningState"] == REQUIRED_PROVISIONING_STATE,
+        "Selected workspace must be provisioned Succeeded",
+    )
+    require(
+        isinstance(selected["managedScopes"], list) and selected["managedScopes"],
+        "Selected workspace must record its managed scopes",
+    )
+    require(isinstance(selected["identity"], dict), "Selected workspace must record its identity")
+
+
+def validate_workspace(workspace: Any) -> None:
+    require(isinstance(workspace, dict), "state.workspace must be an object")
+    required = {
+        "status",
+        "request",
+        "decision",
+        "selected",
+        "alternatives",
+        "caveats",
+        "discoveryEvidence",
+        "provisioningEvidence",
+        "observedAt",
+        "remediationBrief",
+    }
+    missing = sorted(required - workspace.keys())
+    require(not missing, f"state.workspace is missing: {missing}")
+    status = workspace["status"]
+    require(status in WORKSPACE_STATUSES, f"Invalid workspace status: {status}")
+    require(
+        workspace["request"] is None or isinstance(workspace["request"], dict),
+        "state.workspace.request must be an object or null",
+    )
+    require(isinstance(workspace["alternatives"], list), "state.workspace.alternatives must be an array")
+    require(isinstance(workspace["caveats"], list), "state.workspace.caveats must be an array")
+    if status == "pending":
+        require(
+            workspace["decision"] is None and workspace["selected"] is None,
+            "A pending workspace cannot record a decision or selection",
+        )
+    elif status == "ready":
+        require(
+            workspace["decision"] in WORKSPACE_DECISIONS,
+            "A ready workspace decision must be reused or created",
+        )
+        validate_workspace_selection(workspace["selected"])
+        require(
+            isinstance(workspace["discoveryEvidence"], dict),
+            "A ready workspace requires discovery evidence",
+        )
+        require(
+            isinstance(workspace["provisioningEvidence"], dict),
+            "A ready workspace requires provisioning evidence",
+        )
+        validate_utc(workspace["observedAt"], "state.workspace.observedAt")
+        require(
+            workspace["remediationBrief"] is None,
+            "A ready workspace cannot carry a remediation brief",
+        )
+    else:
+        brief = workspace["remediationBrief"]
+        require(isinstance(brief, dict), "A failed workspace requires a remediationBrief")
+        require(brief.get("stage"), "workspace remediationBrief.stage is required")
+        require(brief.get("reason"), "workspace remediationBrief.reason is required")
+        require(
+            brief.get("requiredCorrections"),
+            "workspace remediationBrief.requiredCorrections cannot be empty",
+        )
+
+
+def require_ready_workspace(state: dict[str, Any]) -> None:
+    workspace = state.get("workspace")
+    require(isinstance(workspace, dict), "State has no workspace preflight record")
+    require(
+        workspace.get("status") == "ready",
+        "Workspace preflight is incomplete; run workspace-plan and workspace-finalize "
+        f"before any phase (status: {workspace.get('status')})",
+    )
+    validate_workspace_selection(workspace.get("selected"))
+
+
+def migrate_state_document(
+    state: dict[str, Any], workspace_request: dict[str, Any] | None = None
+) -> bool:
     require(state.get("schemaVersion") == STATE_VERSION, "Unsupported state schemaVersion")
     require(
         state.get("contractVersion") == CONTRACT_VERSION,
         "Unsupported state contractVersion",
     )
-    if state.get("policyVersion") == POLICY_VERSION:
+    supplied_request: dict[str, Any] | None = None
+    if workspace_request is not None:
+        supplied_request = normalize_workspace_request(
+            workspace_request,
+            state.get("analysis", {}).get("scope", {}).get("targetResources", []),
+        )
+    needs_workspace = not isinstance(state.get("workspace"), dict)
+    needs_request = (
+        supplied_request is not None
+        and not isinstance(state.get("workspace", {}).get("request"), dict)
+    )
+    if (
+        state.get("policyVersion") == POLICY_VERSION
+        and not needs_workspace
+        and not needs_request
+    ):
         return False
+    if needs_workspace:
+        # A policy/v1 run never proved a workspace. Migrate it to a pending
+        # preflight so an in-flight run cannot skip discovery and readback.
+        state["workspace"] = new_workspace(
+            supplied_request,
+            [
+                "migrated from an earlier policy version; workspace preflight has not "
+                "been proven for this run"
+            ],
+        )
+    elif needs_request:
+        state["workspace"]["request"] = copy.deepcopy(supplied_request)
     handoff = state.setdefault("handoff", {})
     handoff.setdefault("analysisDecision", {})
     handoff.setdefault("executionDecision", {})
@@ -286,6 +1284,7 @@ def validate_state(state: dict[str, Any]) -> None:
         "handoff",
         "transition",
         "events",
+        "workspace",
     }
     require(required <= state.keys(), f"State is missing: {sorted(required - state.keys())}")
     require(state["schemaVersion"] == STATE_VERSION, "Unsupported state schemaVersion")
@@ -336,6 +1335,7 @@ def validate_state(state: dict[str, Any]) -> None:
     require(isinstance(state["events"], list), "events must be an array")
     for event in state["events"]:
         require(UTC_PATTERN.match(event["timestamp"]) is not None, "Event timestamp must be UTC")
+    validate_workspace(state["workspace"])
 
 
 def validate_revision(state: dict[str, Any], expected: int) -> None:
@@ -1499,8 +2499,10 @@ def apply_coding(state: dict[str, Any], output: dict[str, Any]) -> None:
 
 def apply_phase(state: dict[str, Any], output: dict[str, Any], phase: str, expected: int) -> None:
     require(state["phase"] == phase, f"Expected phase {phase}, observed {state['phase']}")
+    require_ready_workspace(state)
     validate_phase_envelope(state, output, phase, expected)
     prior_handoff = copy.deepcopy(state["handoff"])
+    prior_workspace = canonical(state["workspace"])
     handoff = output["handoff"]
     deep_merge(state["handoff"], handoff)
     if phase == "resilience-analysis":
@@ -1515,6 +2517,10 @@ def apply_phase(state: dict[str, Any], output: dict[str, Any], phase: str, expec
         apply_coding(state, output)
     else:
         raise ContractError(f"Unsupported phase application: {phase}")
+    require(
+        canonical(state["workspace"]) == prior_workspace,
+        "The selected workspace is immutable after preflight; no phase may change it",
+    )
 
 
 def mutate_state(
@@ -1939,6 +2945,7 @@ def evaluate_phase(
     state: dict[str, Any], proposal: dict[str, Any], phase: str
 ) -> dict[str, Any]:
     require(state["phase"] == phase, f"Expected phase {phase}, observed {state['phase']}")
+    require_ready_workspace(state)
     require(proposal.get("runId") == state["runId"], "Proposal runId mismatch")
     require(
         proposal.get("expectedStateRevision") == state["stateRevision"],
@@ -1977,6 +2984,15 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
     require(isinstance(guardrails, dict), "guardrails must be a JSON object")
     for field in ("environmentScope", "blastRadiusCap", "safetyHalts"):
         require(guardrails.get(field), f"guardrails.{field} is required")
+    raw_request = getattr(args, "workspace_request", None)
+    require(
+        raw_request not in (None, ""),
+        "workspace-request is required: a run cannot start without a validated "
+        "Chaos Studio workspace request",
+    )
+    workspace_request = normalize_workspace_request(
+        load_json_argument(raw_request, "workspace-request"), targets
+    )
     state = {
         "schemaVersion": STATE_VERSION,
         "contractVersion": CONTRACT_VERSION,
@@ -1990,12 +3006,13 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
         "maxIterations": args.max_iterations,
         "verdict": "in-progress",
         "terminationReason": None,
+        "workspace": new_workspace(workspace_request),
         "analysis": {
             "mode": "initial",
             "scope": {
                 "repo": args.repo,
                 "commit": args.commit,
-                "targetResources": targets,
+                "targetResources": list(workspace_request["targetResources"]),
             },
             "hypotheses": [],
             "selectedHypothesisId": None,
@@ -2026,6 +3043,7 @@ def cmd_start(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
     state = read_json(Path(args.state))
     validate_state(state)
+    workspace = state["workspace"]
     return {
         "statePath": str(Path(args.state)),
         "runId": state["runId"],
@@ -2036,15 +3054,28 @@ def cmd_status(args: argparse.Namespace) -> dict[str, Any]:
         "verdict": state["verdict"],
         "terminationReason": state["terminationReason"],
         "transition": state["transition"],
+        "workspace": {
+            "status": workspace["status"],
+            "decision": workspace["decision"],
+            "selected": workspace["selected"],
+            "caveats": workspace["caveats"],
+            "remediationBrief": workspace["remediationBrief"],
+        },
     }
 
 
 def cmd_migrate(args: argparse.Namespace) -> dict[str, Any]:
     state_path = Path(args.state)
+    raw_request = getattr(args, "workspace_request", None)
+    workspace_request = (
+        load_json_argument(raw_request, "workspace-request")
+        if raw_request not in (None, "")
+        else None
+    )
     with state_lock(state_path):
         state = read_json(state_path)
         validate_revision(state, args.expected_revision)
-        changed = migrate_state_document(state)
+        changed = migrate_state_document(state, workspace_request)
         if changed:
             state["stateRevision"] += 1
             add_event(
@@ -2062,6 +3093,188 @@ def cmd_migrate(args: argparse.Namespace) -> dict[str, Any]:
         "migrated": changed,
         "stateRevision": state["stateRevision"],
         "policyVersion": state["policyVersion"],
+        "workspaceStatus": state["workspace"]["status"],
+    }
+
+
+def cmd_workspace_plan(args: argparse.Namespace) -> dict[str, Any]:
+    """Produce the deterministic reuse-or-create plan. Never mutates state."""
+    state = read_json(Path(args.state))
+    validate_state(state)
+    validate_revision(state, args.expected_revision)
+    workspace = state["workspace"]
+    require(
+        workspace["status"] == "pending",
+        "Workspace preflight is already complete for this run; later phases reuse the "
+        f"selected workspace and never rediscover (status: {workspace['status']})",
+    )
+    request = workspace.get("request")
+    require(
+        isinstance(request, dict),
+        "Workspace preflight requires a normalized workspaceRequest; start a new run "
+        "or migrate this run with --workspace-request",
+    )
+    discovery = load_json_argument(args.discovery, "workspace discovery")
+    observed_at = args.observed_at
+    validate_utc(observed_at, "observedAt")
+    plan = plan_workspace(request, discovery, observed_at)
+    document = workspace_plan_document(state, request, plan, observed_at)
+    output_path = Path(args.output)
+    atomic_write_json(output_path, document)
+    return {"planPath": str(output_path), "plan": document}
+
+
+def cmd_workspace_finalize(args: argparse.Namespace) -> dict[str, Any]:
+    """Prove the planned workspace exists and is usable, then persist it."""
+    plan = load_json_argument(args.plan, "workspace plan")
+    result_document = load_json_argument(args.result, "workspace tool result")
+    outcome: dict[str, Any] = {}
+
+    def finalize(state: dict[str, Any]) -> None:
+        workspace = state["workspace"]
+        require(
+            workspace["status"] == "pending",
+            "Workspace preflight is already complete for this run "
+            f"(status: {workspace['status']})",
+        )
+        request = validate_workspace_plan(state, plan, args.expected_revision)
+        observed_at = args.observed_at or plan["observedAt"]
+        validate_utc(observed_at, "observedAt")
+        stage = "readback" if plan["decision"] == "reuse" else "create"
+        try:
+            verified = verify_workspace_readback(request, plan, result_document)
+        except ContractError as exc:
+            brief = workspace_remediation_brief(
+                stage,
+                str(exc),
+                [
+                    "Correct the workspace so it matches the validated request "
+                    f"(region {request['location']}, identity {request['identity']['type']}, "
+                    f"scopes {request['managedScopes']}), or re-start the run with a "
+                    "workspace request that matches the environment.",
+                    "Start a new run after correcting the workspace or request.",
+                ],
+                {"decision": plan["decision"], "toolResult": result_document},
+            )
+            fail_workspace(
+                state,
+                brief,
+                observed_at,
+                discovery_evidence=plan.get("discoveryEvidence"),
+            )
+            outcome["workspaceStatus"] = "failed"
+            outcome["remediationBrief"] = brief
+            return
+        workspace["status"] = "ready"
+        workspace["decision"] = "reused" if plan["decision"] == "reuse" else "created"
+        workspace["selected"] = verified["selected"]
+        workspace["alternatives"] = copy.deepcopy(plan.get("alternatives") or [])
+        for caveat in plan.get("caveats") or []:
+            if caveat not in workspace["caveats"]:
+                workspace["caveats"].append(caveat)
+        workspace["discoveryEvidence"] = copy.deepcopy(plan["discoveryEvidence"])
+        workspace["provisioningEvidence"] = {
+            "source": (
+                "chaos_get_workspace"
+                if plan["decision"] == "reuse"
+                else "chaos_create_workspace"
+            ),
+            "decision": plan["decision"],
+            "observedAt": observed_at,
+            "workspaceId": verified["selected"]["id"],
+            "provisioningState": verified["selected"]["provisioningState"],
+            "roleAssignments": verified["roleAssignments"],
+        }
+        workspace["observedAt"] = observed_at
+        workspace["remediationBrief"] = None
+        if (
+            state["phase"] == "resilience-analysis"
+            and state["transition"]["status"] == "ready"
+        ):
+            set_transition(
+                state,
+                "ready",
+                state["transition"].get("from"),
+                "resilience-analysis",
+                f"workspace preflight complete: {workspace['decision']} "
+                f"{verified['selected']['id']}",
+            )
+        outcome["workspaceStatus"] = "ready"
+
+    state = mutate_state(
+        Path(args.state),
+        args.expected_revision,
+        finalize,
+        "workspace-finalized",
+        {"decision": plan.get("decision")},
+    )
+    return {
+        "statePath": args.state,
+        "workspaceStatus": outcome.get("workspaceStatus"),
+        "workspace": state["workspace"],
+        "state": state,
+    }
+
+
+def cmd_workspace_fail(args: argparse.Namespace) -> dict[str, Any]:
+    """Persist a list/get/create permission or policy failure and escalate."""
+    failure = load_json_argument(args.result, "workspace tool result")
+    require(
+        failure.get("ok") is not True,
+        "workspace-fail requires a failed tool result; a successful result must be "
+        "finalized with workspace-finalize",
+    )
+    error_text = (
+        failure.get("error")
+        or json.dumps(failure.get("result", failure), sort_keys=True)
+    )
+    stage = args.stage
+    corrections = {
+        "list": [
+            "Grant the caller Reader on the subscription or resource group so "
+            "chaos_list_workspaces can enumerate Microsoft.Chaos/workspaces.",
+            "Re-run the controller start protocol after the permission is in place.",
+        ],
+        "get": [
+            "Grant the caller Reader on the selected workspace so chaos_get_workspace "
+            "can read it back.",
+            "Start a new run after the permission is in place.",
+        ],
+        "create": [
+            "Grant the caller permission to create Microsoft.Chaos/workspaces and to "
+            "assign Reader on the requested managed scopes, or supply an existing "
+            "compatible workspace via preferredName.",
+            "Resolve any Azure Policy denial for the requested region or resource group, "
+            "then start a new run.",
+        ],
+    }[stage]
+
+    def fail(state: dict[str, Any]) -> None:
+        require(
+            state["workspace"]["status"] == "pending",
+            "Workspace preflight is already complete for this run "
+            f"(status: {state['workspace']['status']})",
+        )
+        brief = workspace_remediation_brief(
+            stage,
+            f"chaos workspace {stage} failed: {error_text}",
+            corrections,
+            {"toolResult": failure},
+        )
+        fail_workspace(state, brief, args.observed_at or utc_now())
+
+    state = mutate_state(
+        Path(args.state),
+        args.expected_revision,
+        fail,
+        "workspace-failed",
+        {"stage": stage},
+    )
+    return {
+        "statePath": args.state,
+        "workspaceStatus": state["workspace"]["status"],
+        "workspace": state["workspace"],
+        "state": state,
     }
 
 
@@ -2280,6 +3493,7 @@ def parser() -> argparse.ArgumentParser:
     start.add_argument("--commit", required=True)
     start.add_argument("--target-resources", required=True)
     start.add_argument("--guardrails", required=True)
+    start.add_argument("--workspace-request", required=True)
     start.add_argument("--run-id")
     start.add_argument("--max-iterations", type=int, default=3)
     start.add_argument("--state-root", default="tmp/chaos-loop/runs")
@@ -2292,7 +3506,32 @@ def parser() -> argparse.ArgumentParser:
     migrate = sub.add_parser("migrate")
     migrate.add_argument("--state", required=True)
     migrate.add_argument("--expected-revision", required=True, type=int)
+    migrate.add_argument("--workspace-request")
     migrate.set_defaults(handler=cmd_migrate)
+
+    workspace_plan = sub.add_parser("workspace-plan")
+    workspace_plan.add_argument("--state", required=True)
+    workspace_plan.add_argument("--expected-revision", required=True, type=int)
+    workspace_plan.add_argument("--discovery", required=True)
+    workspace_plan.add_argument("--observed-at", required=True)
+    workspace_plan.add_argument("--output", required=True)
+    workspace_plan.set_defaults(handler=cmd_workspace_plan)
+
+    workspace_finalize = sub.add_parser("workspace-finalize")
+    workspace_finalize.add_argument("--state", required=True)
+    workspace_finalize.add_argument("--expected-revision", required=True, type=int)
+    workspace_finalize.add_argument("--plan", required=True)
+    workspace_finalize.add_argument("--result", required=True)
+    workspace_finalize.add_argument("--observed-at")
+    workspace_finalize.set_defaults(handler=cmd_workspace_finalize)
+
+    workspace_fail = sub.add_parser("workspace-fail")
+    workspace_fail.add_argument("--state", required=True)
+    workspace_fail.add_argument("--expected-revision", required=True, type=int)
+    workspace_fail.add_argument("--stage", required=True, choices=("list", "get", "create"))
+    workspace_fail.add_argument("--result", required=True)
+    workspace_fail.add_argument("--observed-at")
+    workspace_fail.set_defaults(handler=cmd_workspace_fail)
 
     apply = sub.add_parser("apply")
     apply.add_argument("--state", required=True)
@@ -2339,22 +3578,58 @@ def main(action: str, arguments: dict[str, Any]) -> dict[str, Any]:
         "start": cmd_start,
         "status": cmd_status,
         "migrate": cmd_migrate,
+        "workspace_plan": cmd_workspace_plan,
+        "workspace_finalize": cmd_workspace_finalize,
+        "workspace_fail": cmd_workspace_fail,
         "evaluate": cmd_evaluate,
         "apply": cmd_apply,
         "approve": cmd_approve,
         "resume": cmd_resume,
         "terminate_analysis_only": cmd_terminate_analysis,
     }
+    required_arguments = {
+        "start": ("repo", "commit", "target_resources", "guardrails", "workspace_request"),
+        "status": ("state",),
+        "migrate": ("state", "expected_revision"),
+        "workspace_plan": ("state", "expected_revision", "discovery", "observed_at", "output"),
+        "workspace_finalize": ("state", "expected_revision", "plan", "result"),
+        "workspace_fail": ("state", "expected_revision", "stage", "result"),
+        "evaluate": ("state", "expected_revision", "phase", "input", "output"),
+        "apply": ("state", "expected_revision", "phase", "output"),
+        "approve": ("state", "expected_revision", "advisory_ids"),
+        "resume": ("state", "expected_revision", "gate"),
+        "terminate_analysis_only": ("state", "expected_revision"),
+    }
     try:
         if action not in handlers:
             raise ContractError(f"Unsupported action: {action}")
         values = dict(arguments or {})
+        missing = sorted(
+            name
+            for name in required_arguments[action]
+            if values.get(name) in (None, "")
+        )
+        require(not missing, f"{action} is missing required arguments: {missing}")
+        if action == "workspace_fail":
+            require(
+                values["stage"] in {"list", "get", "create"},
+                "workspace_fail stage must be list, get, or create",
+            )
         values.setdefault("run_id", None)
         values.setdefault("max_iterations", 3)
         values.setdefault("state_root", "tmp/chaos-loop/runs")
+        values.setdefault("workspace_request", None)
+        values.setdefault("observed_at", None)
         response = handlers[action](argparse.Namespace(**values))
         return {"ok": True, "result": response}
-    except (ContractError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (
+        ContractError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        json.JSONDecodeError,
+    ) as exc:
         return {"ok": False, "errorType": type(exc).__name__, "error": str(exc)}
 
 
@@ -2364,7 +3639,14 @@ def cli_main() -> int:
         response = args.handler(args)
         print(json.dumps({"ok": True, "result": response}, indent=2, ensure_ascii=False))
         return 0
-    except (ContractError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    except (
+        ContractError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        json.JSONDecodeError,
+    ) as exc:
         print(
             json.dumps(
                 {"ok": False, "errorType": type(exc).__name__, "error": str(exc)},
