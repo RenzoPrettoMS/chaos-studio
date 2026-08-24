@@ -18,9 +18,7 @@ from typing import Any
 import httpx
 
 from . import azure as az
-
-METRICS_API_VERSION = "2024-02-01"
-ACTIVITY_LOG_API_VERSION = "2015-04-01"
+from .apiversions import ACTIVITY_LOG_API_VERSION, METRICS_API_VERSION
 
 
 def _validation_error(message: str) -> dict[str, Any]:

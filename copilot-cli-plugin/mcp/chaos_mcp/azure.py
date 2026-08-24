@@ -23,9 +23,16 @@ from typing import Any
 
 import httpx
 
+from .apiversions import (
+    APP_SERVICE_IDENTITY_API_VERSION,
+    CHAOS_API_VERSION,
+    IMDS_API_VERSION,
+    LOG_ANALYTICS_QUERY_VERSION,
+)
+
 ARM_ENDPOINT = "https://management.azure.com"
 LOG_ANALYTICS_ENDPOINT = "https://api.loganalytics.io"
-DEFAULT_API_VERSION = "2026-05-01-preview"
+DEFAULT_API_VERSION = CHAOS_API_VERSION
 DEFAULT_LRO_TIMEOUT_S = 30 * 60
 DEFAULT_LRO_INTERVAL_S = 5
 
@@ -59,12 +66,11 @@ _MANAGED_IDENTITY_ALIASES = frozenset(
 )
 _CLI_ALIASES = frozenset({"cli", "az", "user", "user-principal", "userprincipal", "default"})
 
-# IMDS token endpoint (VMs, VMSS, AKS).
+# IMDS token endpoint (VMs, VMSS, AKS). The api-versions for this endpoint and
+# for the App Service / Container Apps / Functions identity endpoint (which
+# injects IDENTITY_ENDPOINT + IDENTITY_HEADER instead of exposing IMDS) are
+# pinned in `chaos_mcp.apiversions`.
 IMDS_TOKEN_ENDPOINT = "http://169.254.169.254/metadata/identity/oauth2/token"
-IMDS_API_VERSION = "2018-02-01"
-# App Service / Container Apps / Functions inject IDENTITY_ENDPOINT +
-# IDENTITY_HEADER instead of exposing IMDS.
-APP_SERVICE_IDENTITY_API_VERSION = "2019-08-01"
 
 # Session-scoped runtime override (set via the chaos_set_auth_mode tool). None
 # means "not overridden — fall back to env / default". This is process-global
@@ -507,7 +513,10 @@ def loganalytics_post(
     Uses a token scoped to `https://api.loganalytics.io` (NOT ARM). Returns the
     raw `httpx.Response` so callers can inspect 4xx/5xx without exceptions.
     """
-    url = f"{LOG_ANALYTICS_ENDPOINT}/v1/workspaces/{workspace_id}/query"
+    url = (
+        f"{LOG_ANALYTICS_ENDPOINT}/{LOG_ANALYTICS_QUERY_VERSION}"
+        f"/workspaces/{workspace_id}/query"
+    )
     headers = {
         "Authorization": f"Bearer {_get_token(LOG_ANALYTICS_ENDPOINT)}",
         "Content-Type": "application/json",

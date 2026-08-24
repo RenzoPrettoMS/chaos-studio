@@ -22,11 +22,11 @@ from mcp.server.fastmcp import FastMCP
 
 from . import azure as az
 from . import monitor as mon
+from .apiversions import ROLE_ASSIGNMENT_API_VERSION
 
 mcp = FastMCP("chaos-studio")
 
 READER_ROLE_DEFINITION_ID = "acdd72a7-3385-48ef-bd42-f606fba81ae7"
-ROLE_ASSIGNMENT_API_VERSION = "2022-04-01"
 
 
 def _ws_path(subscription_id: str, resource_group: str, workspace_name: str) -> str:

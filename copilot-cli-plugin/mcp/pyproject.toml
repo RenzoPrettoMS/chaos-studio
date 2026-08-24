@@ -38,6 +38,17 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 
+[project.optional-dependencies]
+# Contract/schema tests validate tool envelopes and impact schema v1 against
+# JSON Schema, so `jsonschema` is a hard test prerequisite — without it the
+# schema tests are collected and silently skipped.
+test = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "httpx>=0.27.0",
+    "jsonschema>=4.0",
+]
+
 [project.urls]
 Homepage = "https://learn.microsoft.com/azure/chaos-studio/"
 Documentation = "https://learn.microsoft.com/azure/chaos-studio/"

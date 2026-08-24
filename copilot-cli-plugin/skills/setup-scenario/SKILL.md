@@ -1,6 +1,12 @@
 ---
 name: setup-scenario
 description: "Discover recommended scenarios, build and validate a ScenarioConfiguration, and auto-fix resource permissions."
+requiredTools:
+  - chaos_refresh_recommendations
+  - chaos_list_recommended_scenarios
+  - chaos_create_scenario_configuration
+  - chaos_validate_scenario_configuration
+  - chaos_fix_resource_permissions
 ---
 
 # SetupScenario — Scenario Discovery, Configuration & Validation
@@ -14,6 +20,28 @@ This skill is the **human-interactive** path: it shares state with the rest of t
 If you are an **autonomous agent** with no user to prompt, use the MCP tools directly: `chaos_refresh_recommendations`, `chaos_list_recommended_scenarios`, `chaos_create_scenario_configuration`, `chaos_validate_scenario_configuration`, `chaos_fix_resource_permissions`. See `mcp/README.md`.
 
 Both surfaces target `Microsoft.Chaos` `2026-05-01-preview` and use the local `az login` session for auth.
+
+## Tool preflight (before any MCP-backed path)
+
+This skill's frontmatter declares, under `requiredTools`, the MCP tools it
+depends on. Before taking the MCP path, compare that declaration against the
+tool inventory **the host reports** — the CLI's `tools/list` view of the MCP
+servers registered in this session. Never ask the `chaos-studio` server to
+describe itself: that reports what the server *registers*, not what this
+session can actually call, which is precisely the gap this preflight exists to
+catch.
+
+```powershell
+. "<plugin-root>/scripts/Preflight.ps1"
+$required = Get-SkillRequiredTools -SkillPath "<skill-dir>/SKILL.md"
+$result   = Test-RequiredTools -RequiredTools $required -AvailableTools $hostTools
+if (-not $result.ok) { throw $result.message }
+```
+
+If any declared tool is missing, STOP and render `$result.message` — it names
+every missing tool exactly. Do NOT substitute a different tool and do NOT
+improvise an `az` / `az rest` equivalent. The PowerShell path documented below
+does not use these tools and is unaffected by a preflight failure.
 
 ## How It Works
 
