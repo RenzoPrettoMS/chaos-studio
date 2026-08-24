@@ -1,0 +1,321 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "run-record.v1.schema.json",
+  "title": "ChaosRunRecordV1",
+  "description": "What was actually executed: scenario run identity, fault window and per-action outcome.",
+  "type": "object",
+  "required": [
+    "artifactSchemaVersion",
+    "artifactType",
+    "scopeId",
+    "runId",
+    "generatedAt",
+    "provenance",
+    "warnings",
+    "scenarioRunId",
+    "workspace",
+    "configuration",
+    "window",
+    "actions",
+    "errors"
+  ],
+  "properties": {
+    "artifactSchemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "artifactType": {
+      "type": "string",
+      "const": "run-record"
+    },
+    "scopeId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "provenance": {
+      "$ref": "#/definitions/provenance"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/warning"
+      }
+    },
+    "scenarioRunId": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "workspace": {
+      "type": "object",
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "configuration": {
+      "type": "object",
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "parameters": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "window": {
+      "type": "object",
+      "required": [
+        "startedAt",
+        "completedAt",
+        "bufferIso",
+        "partial"
+      ],
+      "properties": {
+        "startedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "completedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "bufferIso": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "partial": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "actions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "status",
+          "startedAt",
+          "completedAt"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "startedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "completedAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          },
+          "targets": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "source": {
+      "type": "object",
+      "description": "Which tool produced the item, at which API version, with which query.",
+      "required": [
+        "tool",
+        "apiVersion",
+        "query"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "apiVersion": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "null only when the source is not a versioned REST surface."
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "KQL/OData/ARM path the item was read from; null when not applicable."
+        }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Mandatory on every evidence item. An item without provenance is invalid and is rejected by schema validation.",
+      "required": [
+        "source",
+        "collectedAt",
+        "confidence",
+        "maxAgeMinutes",
+        "stale"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/source"
+        },
+        "collectedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "Assigned by code from the collection method, never chosen by the model."
+        },
+        "maxAgeMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "Computed from collectedAt + maxAgeMinutes. A stale item is usable only with an explicit warning and never for a CONFIRMED verdict."
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "citedNumber": {
+      "type": "object",
+      "description": "A measured scalar. value 0 means 'measured zero from a successful query'; absence, failure or an unqueryable source is value null plus a caveat naming why.",
+      "required": [
+        "value",
+        "caveat",
+        "provenance"
+      ],
+      "properties": {
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/definitions/provenance"
+        }
+      },
+      "additionalProperties": false
+    },
+    "warning": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

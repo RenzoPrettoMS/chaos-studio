@@ -96,7 +96,7 @@ configuration show *intent*, not deployed state.
 | MCP Python SDK version resolved by `mcp>=1.2.0,<2` | ✅ Yes | `mcp` **1.29.0** installed on CPython 3.13 (Windows). |
 | SDK exposes `outputSchema` on `tools/list` | ✅ Yes | `Tool` model carries `outputSchema`; all 15 tools return one. |
 | `outputSchema` is *useful* for envelope contract tests | ❌ No | FastMCP derives `{"type": "object", "additionalProperties": true}` from the `dict[str, Any]` return annotation — it asserts nothing about `ok`/`errorType`. Contract tests therefore validate against the checked-in `TOOL_ENVELOPE_SCHEMA` in `tests/test_lifecycle_contract.py`. Revisit only if the tools gain typed return models. |
-| Registry still advertises exactly 15 tools | ✅ Yes | `tests/test_tool_manifest.py::test_server_registers_exactly_the_original_fifteen_tools`. |
+| Registry still advertises the frozen 15 tools | ✅ Yes | `tests/test_tool_manifest.py::test_server_registers_the_frozen_fifteen_plus_declared_additions`. |
 | `chaos-mcp` published on PyPI | ❓ Unknown | Not verified from a target environment. `pip install chaos-mcp` below remains marked "once published"; install from source until a real install is recorded. (Q13) |
 | `Microsoft.Chaos` `2026-05-01-preview` preview operations available in a target subscription | ❓ Unknown | No live tenant was exercised. All lifecycle coverage is replayed from recorded ARM payloads. Per Q6 the pin **stays** at `2026-05-01-preview`; moving to `2026-08-01-preview` requires recorded fixtures plus compatibility evidence. |
 | ScenarioRun retention / cancel semantics of the target service | ❓ Unknown | `chaos_cancel_scenario_run` is asserted only to report `cancelRequested` (best-effort). Actual cancellation behaviour is unverified. (Q13) |

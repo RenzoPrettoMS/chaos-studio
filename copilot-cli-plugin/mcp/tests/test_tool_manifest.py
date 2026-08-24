@@ -62,6 +62,21 @@ ORIGINAL_FIFTEEN_TOOLS = frozenset(
     }
 )
 
+#: E2-T3 — the durable evidence store's cross-session access tools. Added
+#: deliberately on top of the frozen 15; every one of the 15 stays registered
+#: and callable.
+EVIDENCE_TOOLS = frozenset(
+    {
+        "chaos_evidence_put",
+        "chaos_evidence_get",
+        "chaos_evidence_list",
+    }
+)
+
+#: The complete expected registry. New entries are only ever appended by an
+#: epic that declares them.
+EXPECTED_TOOLS = ORIGINAL_FIFTEEN_TOOLS | EVIDENCE_TOOLS
+
 #: Any quoted `YYYY-MM-DD` / `YYYY-MM-DD-preview` literal is an api-version pin.
 API_VERSION_LITERAL = re.compile(r"""(['"])(\d{4}-\d{2}-\d{2}(?:-preview)?)\1""")
 
@@ -136,20 +151,20 @@ SKILL_FILES = sorted(SKILLS_DIR.glob("*/SKILL.md"))
 # ---------------------------------------------------------------------------
 
 
-def test_server_registers_exactly_the_original_fifteen_tools():
+def test_server_registers_the_frozen_fifteen_plus_declared_additions():
     registered = registered_tool_names()
-    assert registered == set(ORIGINAL_FIFTEEN_TOOLS), (
-        "All 15 MCP tools are EXTEND-only. Removed: "
-        f"{sorted(ORIGINAL_FIFTEEN_TOOLS - registered)}; "
-        f"added without updating this manifest: {sorted(registered - ORIGINAL_FIFTEEN_TOOLS)}."
+    missing = sorted(ORIGINAL_FIFTEEN_TOOLS - registered)
+    assert not missing, f"All 15 MCP tools are EXTEND-only. Removed: {missing}."
+    assert registered == set(EXPECTED_TOOLS), (
+        "a tool was added without declaring it in this manifest: "
+        f"{sorted(registered - EXPECTED_TOOLS)}"
     )
-    assert len(registered) == 15
 
 
 def test_every_registered_tool_has_a_decorator_and_is_callable():
     decorated = decorated_tool_names()
-    assert decorated == set(ORIGINAL_FIFTEEN_TOOLS)
-    for name in ORIGINAL_FIFTEEN_TOOLS:
+    assert decorated == set(EXPECTED_TOOLS)
+    for name in EXPECTED_TOOLS:
         assert callable(getattr(srv, name, None)), f"{name} is not callable"
 
 
@@ -178,7 +193,7 @@ def test_all_five_skills_declare_required_tools():
 @pytest.mark.parametrize("skill_md", SKILL_FILES, ids=lambda p: p.parent.name)
 def test_declared_required_tools_exist_on_the_server(skill_md):
     declared = skill_required_tools(skill_md)
-    unknown = sorted(set(declared) - set(ORIGINAL_FIFTEEN_TOOLS))
+    unknown = sorted(set(declared) - set(EXPECTED_TOOLS))
     assert not unknown, (
         f"{skill_md.parent.name}/SKILL.md declares tool(s) the server does not "
         f"register: {unknown}"

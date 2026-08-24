@@ -7,6 +7,42 @@ the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html
 
 ## [Unreleased]
 
+### Added
+
+- **Durable evidence store (F12).** Phase outputs are now mirrored atomically to
+  `$CHAOS_EVIDENCE_ROOT/<scopeHash>/<runId>/{artifacts,raw,rendered}`, which
+  defaults to a per-user application-data directory and is deliberately outside
+  the repository and any session `tmp/`. `$STARTCHAOS_STATE_PATH` remains the
+  source of truth and is mirrored, never relocated. Writes are serialized on a
+  per-item lock, replaced atomically and stamped with a monotonic revision
+  counter. Configure via `.chaos-plugins.yaml` (`evidence.root`,
+  `evidence.retention_days`, `evidence.disabled`) or the matching environment
+  variables; retention defaults to 90 days.
+- **Backward-compatible state importer.** `Import-State` in `scripts/State.ps1`
+  imports an existing `startchaos-state.json` forward without a schema bump:
+  missing sections are filled from defaults, and existing keys — including keys
+  this version does not recognise — are preserved verbatim.
+- **Focused artifact schemas** under `schemas/`: `scope-setup`, `inventory`,
+  `availability`, `hypotheses`, `recommendations`, `run-record`, `diagnosis`,
+  `evidence-bundle` and `mechanism-ledger` (all `.v1.schema.json`). Each encodes
+  mandatory provenance, code-assigned confidence, computed freshness, and
+  `null` + caveat for missing data. Impact schema v1 is unchanged.
+- **Three MCP evidence tools** — `chaos_evidence_put`, `chaos_evidence_get`,
+  `chaos_evidence_list` — for cross-session recovery only. Every requested path
+  is canonicalized after symlink resolution and confined to
+  `$CHAOS_EVIDENCE_ROOT`; `$CHAOS_KEY_DIR` is on a hard denylist; secret-bearing
+  keys and secret-shaped values are redacted on write and again on read. The
+  original 15 tools are unchanged. `chaos_evidence_put` accepts an
+  `expected_revision` optimistic-concurrency guard and reports the JSON
+  Pointers it redacted; omitting `run_id` writes a scope-keyed artifact that
+  outlives every run (the mechanism-class ledger); `chaos_evidence_list`
+  filters by `artifact_type` and pages with a `continuationToken`. `name` and
+  `artifact_type` are interchangeable aliases for an item's identity across
+  all three tools, and `artifact_type` filtering is an exact match on that
+  name.
+- **Shared contracts** `references/chaos/evidence-contract.md` and
+  `references/chaos/verdict-matrix.md`.
+
 ### Changed
 
 - The PowerShell skills (`create-workspace`, `setup-scenario`, `run-scenario`)

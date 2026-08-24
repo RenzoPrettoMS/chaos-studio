@@ -22,5 +22,31 @@ startchaos:
   # State file path (absolute or relative to session directory)
   # state_path: "startchaos-state.json"
 
+  # ── Durable evidence store (F12) ─────────────────────
+  # Phase outputs are mirrored here after every state write. The state file
+  # above stays the source of truth and is never relocated. The root MUST be
+  # outside the repository and outside any session tmp/ directory: tmp/ has
+  # been wiped mid-run twice, taking two runs' evidence with it.
+  #
+  # Default (per-user application data):
+  #   Windows  %LOCALAPPDATA%\chaos-studio\evidence
+  #   macOS    ~/Library/Application Support/chaos-studio/evidence
+  #   Linux    ${XDG_DATA_HOME:-~/.local/share}/chaos-studio/evidence
+  #
+  # Overridden by the $CHAOS_EVIDENCE_ROOT environment variable.
+  # evidence:
+  #   root: ""                     # empty = per-user application-data default
+  #   retention_days: 90           # $CHAOS_EVIDENCE_RETENTION_DAYS
+  #   disabled: false              # $CHAOS_EVIDENCE_DISABLED=1 skips mirroring
+  #
+  # Layout: <root>/<scopeHash>/<runId>/{artifacts,raw,rendered}
+  # Size: a run mirrors its state plus its focused artifacts; expect low
+  # single-digit MB per run, so ~a few hundred MB at the 90-day default.
+
+  # Approval-key directory. MUST be outside the evidence root; it is on the
+  # evidence_* path denylist and is never readable through an evidence tool.
+  # Overridden by $CHAOS_KEY_DIR.
+  # key_dir: ""                    # empty = <app data>/chaos-studio/keys
+
   # Non-interactive mode — skip all confirmation prompts
   # noninteractive: false

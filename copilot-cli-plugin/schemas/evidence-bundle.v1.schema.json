@@ -1,0 +1,230 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "evidence-bundle.v1.schema.json",
+  "title": "ChaosEvidenceBundleV1",
+  "description": "Index of durable evidence items mirrored to $CHAOS_EVIDENCE_ROOT for one run.",
+  "type": "object",
+  "required": [
+    "artifactSchemaVersion",
+    "artifactType",
+    "scopeId",
+    "runId",
+    "generatedAt",
+    "provenance",
+    "warnings",
+    "scopeHash",
+    "items"
+  ],
+  "properties": {
+    "artifactSchemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "artifactType": {
+      "type": "string",
+      "const": "evidence-bundle"
+    },
+    "scopeId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "provenance": {
+      "$ref": "#/definitions/provenance"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/warning"
+      }
+    },
+    "scopeHash": {
+      "type": "string",
+      "minLength": 1
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "relativePath",
+          "revision",
+          "bytes",
+          "sha256",
+          "provenance"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "kind": {
+            "enum": [
+              "artifacts",
+              "raw",
+              "rendered"
+            ]
+          },
+          "relativePath": {
+            "type": "string",
+            "minLength": 1
+          },
+          "revision": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provenance": {
+            "$ref": "#/definitions/provenance"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "source": {
+      "type": "object",
+      "description": "Which tool produced the item, at which API version, with which query.",
+      "required": [
+        "tool",
+        "apiVersion",
+        "query"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "apiVersion": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "null only when the source is not a versioned REST surface."
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "KQL/OData/ARM path the item was read from; null when not applicable."
+        }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Mandatory on every evidence item. An item without provenance is invalid and is rejected by schema validation.",
+      "required": [
+        "source",
+        "collectedAt",
+        "confidence",
+        "maxAgeMinutes",
+        "stale"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/source"
+        },
+        "collectedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "Assigned by code from the collection method, never chosen by the model."
+        },
+        "maxAgeMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "Computed from collectedAt + maxAgeMinutes. A stale item is usable only with an explicit warning and never for a CONFIRMED verdict."
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "citedNumber": {
+      "type": "object",
+      "description": "A measured scalar. value 0 means 'measured zero from a successful query'; absence, failure or an unqueryable source is value null plus a caveat naming why.",
+      "required": [
+        "value",
+        "caveat",
+        "provenance"
+      ],
+      "properties": {
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/definitions/provenance"
+        }
+      },
+      "additionalProperties": false
+    },
+    "warning": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

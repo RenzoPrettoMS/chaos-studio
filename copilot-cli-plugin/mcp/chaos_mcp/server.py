@@ -11,6 +11,10 @@ setup-scenario, run-scenario) against the same `Microsoft.Chaos`
 
 Every tool returns the structured envelope described in `chaos_mcp.monitor`
 so agents can branch on `ok`/`errorType` instead of parsing tracebacks.
+
+The `chaos_evidence_*` tools front the durable evidence store in
+`chaos_mcp.evidence`; they are the only cross-session read path and are
+confined to `$CHAOS_EVIDENCE_ROOT`.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from . import azure as az
+from . import evidence as ev
 from . import monitor as mon
 from .apiversions import ROLE_ASSIGNMENT_API_VERSION
 
@@ -414,6 +419,74 @@ def monitor_search_activity_log(
     return mon.monitor_search_activity_log(
         subscription_id, start_time, end_time, resource_uri
     )
+
+
+# ---------------------------------------------------------------------------
+# Durable evidence (E2-T3)
+#
+# Thin wrappers over `chaos_mcp.evidence`. They exist only so evidence written
+# by one session is reachable from another; the PowerShell skills remain the
+# writers of record. Path canonicalization, the `$CHAOS_KEY_DIR` denylist and
+# redaction all live in the module, not here.
+# ---------------------------------------------------------------------------
+
+
+@mcp.tool()
+def chaos_evidence_put(
+    scope_hash: str,
+    run_id: str | None = None,
+    name: str = "",
+    data: dict[str, Any] | None = None,
+    kind: str = "artifacts",
+    expected_revision: int | None = None,
+    artifact_type: str | None = None,
+) -> dict[str, Any]:
+    """Write one evidence item to the durable store atomically, bumping its
+    revision. Omit run_id for artifacts keyed by scope that must outlive a run.
+    artifact_type is an alias for name — the same string evidence_list filters
+    on. Pass expected_revision (0 = must not exist) to guard against a lost
+    update. Secret-bearing keys and secret-shaped values are redacted before
+    the bytes reach disk; the paths redacted are reported in `redactions`."""
+    return ev.evidence_put(
+        scope_hash,
+        run_id,
+        name,
+        data,
+        kind,
+        expected_revision=expected_revision,
+        artifact_type=artifact_type,
+    )
+
+
+@mcp.tool()
+def chaos_evidence_get(
+    scope_hash: str,
+    run_id: str | None = None,
+    name: str = "",
+    kind: str = "artifacts",
+    artifact_type: str | None = None,
+) -> dict[str, Any]:
+    """Read one evidence item from the durable store, for cross-session
+    recovery of a previous run. Omit run_id for scope-keyed artifacts.
+    artifact_type is an alias for name. The payload is returned as `artifact`
+    (`data` is a deprecated alias for the same object). Results are redacted
+    and confined to $CHAOS_EVIDENCE_ROOT."""
+    return ev.evidence_get(scope_hash, run_id, name, kind, artifact_type=artifact_type)
+
+
+@mcp.tool()
+def chaos_evidence_list(
+    scope_hash: str | None = None,
+    run_id: str | None = None,
+    artifact_type: str | None = None,
+    max_items: int | None = None,
+    continuation_token: str | None = None,
+) -> dict[str, Any]:
+    """List evidence scopes, the runs of a scope, or the items of a run.
+    Returns metadata only, never item contents. artifact_type filters on the
+    item's exact name as passed to chaos_evidence_put. Item listings are paged;
+    pass back `continuationToken` to fetch the next page."""
+    return ev.evidence_list(scope_hash, run_id, artifact_type, max_items, continuation_token)
 
 
 def main() -> None:

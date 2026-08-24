@@ -1454,23 +1454,34 @@ There is no "Deleted from main" table because none of these prototype paths exis
 
 ---
 
-### Epic 2 — Compatible state and durable evidence
+### Epic 2 — Compatible state and durable evidence — DONE
 
 **Goal:** Preserve current state while adding evidence that survives repo/session cleanup.
 **Prerequisites:** Epic 1.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E2-T1 | IMPL | Define focused artifact schemas plus a backward-compatible importer for current `startchaos-state.json`; keep impact schema v1 | `schemas/*.v1.schema.json`, `scripts/State.ps1` | TO DO |
-| E2-T2 | IMPL | Mirror phase outputs atomically to `$CHAOS_EVIDENCE_ROOT` (per-user default), while continuing to update `STARTCHAOS_STATE_PATH` | `scripts/State.ps1`, `.chaos-plugins.yaml.example` | TO DO |
-| E2-T3 | IMPL | Add MCP evidence read/write/list only for cross-session access; path canonicalization, redaction and key denylist are mandatory | `mcp/chaos_mcp/evidence.py`, `server.py` | TO DO |
-| E2-T4 | IMPL | Add `evidence-contract.md` and `verdict-matrix.md`; re-express `[PR32 PROTOTYPE]` invariants without copying its state engine | `references/chaos/*.md` | TO DO |
-| E2-T5 | TEST | State round-trip/import, tmp/repo wipe survival, atomic concurrency, redaction, traversal/symlink/key-material denial | `mcp/tests/test_evidence.py`, Pester state tests | TO DO |
+| E2-T1 | IMPL | Define focused artifact schemas plus a backward-compatible importer for current `startchaos-state.json`; keep impact schema v1 | `schemas/*.v1.schema.json`, `scripts/State.ps1` | DONE |
+| E2-T2 | IMPL | Mirror phase outputs atomically to `$CHAOS_EVIDENCE_ROOT` (per-user default), while continuing to update `STARTCHAOS_STATE_PATH` | `scripts/State.ps1`, `.chaos-plugins.yaml.example` | DONE |
+| E2-T3 | IMPL | Add MCP evidence read/write/list only for cross-session access; path canonicalization, redaction and key denylist are mandatory | `mcp/chaos_mcp/evidence.py`, `server.py` | DONE |
+| E2-T4 | IMPL | Add `evidence-contract.md` and `verdict-matrix.md`; re-express `[PR32 PROTOTYPE]` invariants without copying its state engine | `references/chaos/*.md` | DONE |
+| E2-T5 | TEST | State round-trip/import, tmp/repo wipe survival, atomic concurrency, redaction, traversal/symlink/key-material denial | `mcp/tests/test_evidence.py`, Pester state tests | DONE |
 
 **Acceptance criteria**
-- [ ] An existing `startchaos-state.json` resumes unchanged and is mirrored, not relocated.
-- [ ] Evidence survives deletion of repo/session temporary content (F12).
-- [ ] No secret or approval key is reachable through evidence tools.
+- [x] An existing `startchaos-state.json` resumes unchanged and is mirrored, not relocated.
+- [x] Evidence survives deletion of repo/session temporary content (F12).
+- [x] No secret or approval key is reachable through evidence tools.
+
+**Completed:** 2026-08-24
+
+**Completion notes**
+- Verification gate on this machine: `python -m pytest -q` → 193 passed / 1 skipped; `ruff check chaos_mcp tests` → all checks passed.
+- E2-T3 hardening: `_is_ascii_digits(value)` (`bool(value) and value.isascii() and value.isdigit()`) is the single pinned predicate for model-supplied numeric strings. `str.isdigit()` alone was unsafe on both sides — `int('\u00b2')` raises (escaping the `{ok, errorType}` envelope as a raw `ValueError`) while `int('\u0967')` silently succeeds as `1`. `try/except ValueError` would have closed only the crash half, so the alphabet is pinned to ASCII instead.
+- Call sites converted: `_coerce_revision` (checks `value.strip()`, so the pre-existing lenient `' 5 '` padding behaviour is preserved) returns `EvidenceBadRevision`; `_decode_token` (after the `isinstance(str)` guard) returns `EvidenceBadToken`.
+- Audited every `int(` in `evidence.py` for the same defect: `retention_days()` is env-sourced and already `try/except`-wrapped; the L625 parse reads a revision the store itself wrote. No sibling instances remain.
+- Regression coverage was added as parametrized inputs to the tests that already own those behaviours; `test_a_non_integer_expected_revision_stays_inside_the_envelope` asserts the named `errorType` *and* that the refused write never landed, giving the silent-accept path explicit no-side-effect coverage.
+- Test hygiene: the manifest guard was renamed to `test_server_registers_the_frozen_fifteen_plus_declared_additions` to match what it now asserts against the 18-tool registry (nothing removed from the frozen 15, nothing added undeclared); the redundant `len(ORIGINAL_FIFTEEN_TOOLS & registered) == 15` assertion was dropped as implied by `missing`. `mcp/README.md` was updated so the cited test name stays resolvable.
+- `references/chaos/evidence-contract.md` §10 records the ASCII-digits-only rule for `expected_revision` and `continuation_token`, and folds the `sha256`/`digest` duplicate spelling into the existing deprecation note (`digest` is the contract field, `sha256` the deprecated alias).
 
 ---
 

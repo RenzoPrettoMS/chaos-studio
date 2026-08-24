@@ -330,7 +330,8 @@ def test_activity_log_403_structured_error(monkeypatch):
 
 
 def test_server_lists_all_tools():
-    """Importing server.py should register all 15 tools on the FastMCP instance."""
+    """Importing server.py should register the 15 original tools plus the
+    three E2-T3 evidence tools on the FastMCP instance."""
     import asyncio
 
     from chaos_mcp import server as srv
@@ -342,4 +343,4 @@ def test_server_lists_all_tools():
     assert "monitor_search_activity_log" in names
     assert "chaos_set_auth_mode" in names
     assert "chaos_get_auth_mode" in names
-    assert len(names) == 15, f"expected 15 tools, got {len(names)}: {sorted(names)}"
+    assert len(names) == 18, f"expected 18 tools, got {len(names)}: {sorted(names)}"
