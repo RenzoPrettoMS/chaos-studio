@@ -74,6 +74,44 @@ For non-interactive sessions, set `$env:STARTCHAOS_NONINTERACTIVE=1` to skip the
 | **0** | Run reached a terminal state (Succeeded / Failed / Canceled) | Done — final card already rendered by script. Inspect `state.run.status` for terminal classification. |
 | **1** | Hard error before/during execution | STOP. Render the error from script output. Wait for user. State has `run.lastError`. |
 
+## Permission blockers and the consent protocol
+
+The pre-execute gate always validates. When validation reports blockers the
+shared helper normalizes them, persists them at
+`state.setup.configuration.validation.blockers`, and **offers the targeted
+grants first** — the exact, minimum-scope `az role assignment create` commands
+that would clear them, persisted at
+`state.setup.configuration.validation.targetedGrants`.
+
+`chaos_fix_resource_permissions` / `az chaos scenario config fix-permissions`
+remains available, but it is a **broad** mutation: it grants whatever roles the
+service decides are required to the workspace identity, on every target resource
+in the configuration's scope, in a single call. It is not limited to the
+reported blockers and the grants cannot be enumerated in advance.
+
+Without consent the script exits 1 with `run.lastError` starting
+`broadPermissionFixConsentRequired`. On that error:
+
+1. Render the consent prompt from
+   `state.setup.configuration.validation.permissionFix.consentPrompt` — it
+   describes exactly this breadth.
+2. Show the targeted grants and let the user run those instead if they prefer.
+3. Only if the user explicitly consents, set
+   `$env:STARTCHAOS_CONSENT_BROAD_PERMISSION_FIX = '1'` and re-run.
+
+Any value other than the exact string `1` is **not** consent. Never set that
+variable on the user's behalf, and never call `chaos_fix_resource_permissions`
+over MCP without having shown the same breadth description and received an
+explicit answer.
+
+The blast radius predicted at setup time is at `state.setup.blastRadius`. It is
+an **advisory prediction**, not a filter the configuration was created with:
+`az chaos scenario config create` accepts no include/exclude argument, so
+`resourceTargeting` is never transmitted to the service and any resource listed
+as excluded there **can still be targeted by this run**. Do not tell the user an
+excluded resource is spared. The precedence and starvation rules, and how to
+enforce an exclusion for real, are in `references/chaos/blast-radius.md`.
+
 ## Cancellation
 
 On `Ctrl+C`, the script invokes `ScenarioRuns_Cancel` (POST `.../runs/{runId}/cancel`) best-effort and persists `state.run.lastError = "user-cancelled"`.

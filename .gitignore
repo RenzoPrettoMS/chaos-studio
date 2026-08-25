@@ -69,6 +69,8 @@ Generated\ Files/
 # NUnit
 *.VisualState.xml
 TestResult.xml
+# Pester's NUnit output file (plural), e.g. Invoke-Pester -OutputFile testResults.xml
+[Tt]est[Rr]esults.xml
 nunit-*.xml
 
 # Approval Tests result files

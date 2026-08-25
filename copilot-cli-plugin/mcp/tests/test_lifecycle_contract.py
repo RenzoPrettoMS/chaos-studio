@@ -842,3 +842,262 @@ def test_all_fifteen_tools_use_the_pinned_chaos_api_version(monkeypatch):
     srv.chaos_get_scenario_run(SUB, RG, WS, SCENARIO, RUN_ID)
 
     assert versions == {apiversions.CHAOS_API_VERSION}
+
+
+# ---------------------------------------------------------------------------
+# E3-T5 — blocker normalization, targeted-first grants and consent
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_blockers_collects_every_reporting_site_and_spelling():
+    """`validations/latest` reports blockers from three places with two spellings."""
+    latest = {
+        "properties": {
+            "errors": [{"code": "MissingPermission", "message": "access denied"}],
+            "validationErrors": [
+                {
+                    "errorCode": "TargetNotEnabled",
+                    "errorMessage": "target resource is not onboarded",
+                    "targetResourceId": "/subscriptions/s/rg/vm-a",
+                }
+            ],
+            "resources": [
+                {
+                    "resourceId": "/subscriptions/s/rg/vm-b",
+                    "errors": [{"code": "AuthorizationFailed", "message": "no rbac"}],
+                }
+            ],
+        }
+    }
+
+    blockers = srv.normalize_validation_blockers(latest)
+    by_code = {b["code"]: b for b in blockers}
+
+    assert set(by_code) == {"MissingPermission", "TargetNotEnabled", "AuthorizationFailed"}
+    assert by_code["MissingPermission"]["category"] == "permission"
+    assert by_code["TargetNotEnabled"]["category"] == "resource"
+    # A blocker nested under `resources[]` inherits that resource's id.
+    assert by_code["AuthorizationFailed"]["resourceId"] == "/subscriptions/s/rg/vm-b"
+    assert by_code["TargetNotEnabled"]["resourceId"] == "/subscriptions/s/rg/vm-a"
+    for blocker in blockers:
+        assert set(blocker) == {
+            "code",
+            "category",
+            "resourceId",
+            "roleName",
+            "principalId",
+            "message",
+        }
+
+
+def test_normalize_blockers_falls_back_to_other_and_dedupes():
+    latest = {
+        "properties": {
+            "errors": [
+                {"code": "SomethingElse", "message": "nothing familiar here"},
+                {"code": "MissingPermission", "message": "denied", "resourceId": "/r/1"},
+            ],
+            # The same blocker reported twice must collapse to one.
+            "validationErrors": [
+                {"code": "MissingPermission", "message": "denied", "resourceId": "/r/1"}
+            ],
+        }
+    }
+
+    blockers = srv.normalize_validation_blockers(latest)
+    assert len(blockers) == 2
+    assert [b["category"] for b in blockers] == ["other", "permission"]
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"properties": None}, "not-a-dict", []])
+def test_normalize_blockers_tolerates_unusable_payloads(payload):
+    assert srv.normalize_validation_blockers(payload) == []
+
+
+def test_normalize_blockers_skips_error_entries_that_are_not_objects():
+    """Both planes skip them; `Test-StructuredValidationError` is the mirror."""
+    latest = {
+        "properties": {
+            "status": "Failed",
+            "errors": ["a bare string", 42],
+            "resources": [{"resourceId": "/r/1", "errors": ["another bare string"]}],
+        }
+    }
+    assert srv.normalize_validation_blockers(latest) == []
+
+    mixed = {
+        "properties": {
+            "status": "Failed",
+            "errors": ["a bare string", {"code": "MissingPermission", "resourceId": "/r/1"}],
+        }
+    }
+    assert len(srv.normalize_validation_blockers(mixed)) == 1
+
+
+def test_targeted_grants_are_scoped_to_the_reporting_resource_only():
+    blockers = [
+        {
+            "code": "MissingPermission",
+            "category": "permission",
+            "resourceId": "/subscriptions/s/rg/vm-a",
+            "roleName": "Chaos Studio Target Contributor",
+            "principalId": None,
+            "message": "denied",
+        }
+    ]
+    grants = srv.build_targeted_grant_proposal(blockers, principal_id="pid-1")
+
+    assert len(grants) == 1
+    grant = grants[0]
+    assert grant["roleName"] == "Chaos Studio Target Contributor"
+    assert grant["blockerCode"] == "MissingPermission"
+    # Minimum scope: the single resource that reported the blocker, never wider.
+    assert '--scope "/subscriptions/s/rg/vm-a"' in grant["command"]
+    assert grant["command"].startswith("az role assignment create")
+    assert "pid-1" in grant["command"]
+
+
+def test_targeted_grants_skip_unfixable_blockers_and_dedupe():
+    blockers = [
+        # Not a permission problem — no role assignment can clear it.
+        {"code": "TargetNotEnabled", "category": "resource", "resourceId": "/r/1"},
+        # Permission problem with no resource: the scope would be a guess.
+        {"code": "MissingPermission", "category": "permission", "resourceId": None},
+        {"code": "MissingPermission", "category": "permission", "resourceId": "/r/2"},
+        {"code": "MissingPermission", "category": "permission", "resourceId": "/R/2"},
+    ]
+    grants = srv.build_targeted_grant_proposal(blockers)
+
+    assert [g["resourceId"] for g in grants] == ["/r/2"]
+    # No role named by the service falls back to the least-privileged default.
+    assert grants[0]["roleName"] == "Reader"
+    # An unknown identity is visible, never silently unassignable.
+    assert srv.PRINCIPAL_PLACEHOLDER in grants[0]["command"]
+
+
+def test_validate_tool_enriches_payload_with_blockers_and_targeted_grants(monkeypatch):
+    latest = {
+        "properties": {
+            "status": "Failed",
+            "errors": [
+                {
+                    "code": "MissingPermission",
+                    "message": "authorization failed",
+                    "resourceId": "/subscriptions/s/rg/vm-a",
+                    "roleName": "Chaos Studio Target Contributor",
+                }
+            ],
+        }
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"{CFG_PATH}/validate":
+            return httpx.Response(200, json={"status": "Succeeded"})
+        if request.url.path == f"{CFG_PATH}/validations/latest":
+            return httpx.Response(200, json=latest)
+        raise AssertionError(f"unrecorded call {request.url.path}")
+
+    install_arm_transport(monkeypatch, handler)
+
+    result = srv.chaos_validate_scenario_configuration(SUB, RG, WS, SCENARIO, CONFIG)
+    assert_envelope(result)
+    assert result["ok"] is True
+    payload = result["result"]
+    # Additive only: the raw service payload is preserved untouched.
+    assert payload["properties"]["errors"][0]["code"] == "MissingPermission"
+    assert payload["normalizedBlockers"][0]["category"] == "permission"
+    grant = payload["targetedGrantProposal"][0]
+    assert '--scope "/subscriptions/s/rg/vm-a"' in grant["command"]
+
+
+def test_validate_tool_never_overwrites_service_supplied_fields(monkeypatch):
+    latest = {
+        "properties": {"status": "Failed", "errors": [{"code": "MissingPermission"}]},
+        "normalizedBlockers": "service-owned",
+        "targetedGrantProposal": "service-owned",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(200, json={"status": "Succeeded"})
+        return httpx.Response(200, json=latest)
+
+    install_arm_transport(monkeypatch, handler)
+
+    payload = srv.chaos_validate_scenario_configuration(SUB, RG, WS, SCENARIO, CONFIG)["result"]
+    assert payload["normalizedBlockers"] == "service-owned"
+    assert payload["targetedGrantProposal"] == "service-owned"
+
+
+def test_broad_fix_tool_documents_its_breadth_and_the_consent_requirement():
+    """E3-T3: the host-visible description must state the breadth and the gate."""
+    doc = (srv.chaos_fix_resource_permissions.__doc__ or "").lower()
+    assert "explicit consent" in doc
+    assert "broad" in doc
+    assert "every" in doc
+    # It must point the caller at the minimum-scope alternative first.
+    assert "targetedgrantproposal" in doc
+    assert "chaos_validate_scenario_configuration" in doc
+
+
+def test_powershell_and_python_blocker_categories_stay_in_sync():
+    """The helper is mirrored in scripts/Validate-AndFix.ps1; drift is silent."""
+    ps = (
+        Path(__file__).resolve().parents[2] / "scripts" / "Validate-AndFix.ps1"
+    ).read_text(encoding="utf-8")
+    for token in ("permission", "authoriz", "forbidden", "denied", "rbac"):
+        assert token in ps, f"PowerShell permission pattern lost '{token}'"
+    assert "ConvertTo-ValidationBlocker" in ps
+    assert "Test-BroadPermissionFixConsent" in ps
+    # The non-object error entry is skipped on both planes (see
+    # test_normalize_blockers_skips_error_entries_that_are_not_objects); the
+    # PowerShell side must keep applying its guard at both reporting sites.
+    assert "Test-StructuredValidationError" in ps
+    assert ps.count("if (Test-StructuredValidationError -Entry $item)") == 2
+
+
+def test_powershell_and_python_emit_the_same_targeted_grant_command_shape():
+    """The `az role assignment create` string is hand-written on both planes.
+
+    `Build-RoleAssignmentRemediation` (scripts/Rbac.ps1) and
+    `build_targeted_grant_proposal` (server.py) must produce byte-identical
+    commands for the same inputs; a flag added on one plane only would silently
+    ship an unrunnable "minimum-scope alternative" to half the callers.
+    """
+    rbac = (Path(__file__).resolve().parents[2] / "scripts" / "Rbac.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    def ps_template(marker: str) -> str:
+        line = next(ln for ln in rbac.splitlines() if marker in ln)
+        body = line.split("=", 1)[1].strip()
+        assert body.startswith('"') and body.endswith('"'), body
+        # Strip the outer quotes, then the backticks PowerShell uses to escape
+        # the inner ones.
+        body = body[1:-1].replace("`", "")
+        for ps_var, token in (
+            ("$PrincipalId", "{principal}"),
+            ("$RoleName", "{role}"),
+            ("$Scope", "{scope}"),
+        ):
+            body = body.replace(ps_var, token)
+        return body
+
+    principal, role, scope = "pid-1", "Chaos Studio Target Contributor", "/subs/s/rg/vm-a"
+    grant = srv.build_targeted_grant_proposal(
+        [{"category": "permission", "resourceId": scope, "roleName": role, "code": "X"}],
+        principal_id=principal,
+    )[0]
+
+    def py_template(value: str) -> str:
+        # Order matters: substitute the longest values first.
+        for actual, token in (
+            (scope, "{scope}"),
+            (role, "{role}"),
+            (principal, "{principal}"),
+        ):
+            value = value.replace(actual, token)
+        return value
+
+    assert py_template(grant["command"]) == ps_template('$command = "az role assignment create')
+    assert py_template(grant["description"]) == ps_template('description = "Grant')

@@ -84,6 +84,157 @@ def _grant_reader(scope: str, principal_id: str) -> dict[str, Any]:
         return {"scope": scope, "status": "failed", "error": str(e)}
 
 
+#: Blocker codes/messages a role assignment could plausibly fix. Mirrors
+#: `$script:PermissionBlockerPattern` in scripts/Validate-AndFix.ps1.
+_PERMISSION_BLOCKER = re.compile(
+    r"permission|authoriz|forbidden|denied|rbac|roleassignment|role assignment",
+    re.IGNORECASE,
+)
+
+#: Blocker codes/messages describing the target resource itself, not access to
+#: it. Mirrors `$script:ResourceBlockerPattern` in scripts/Validate-AndFix.ps1.
+_RESOURCE_BLOCKER = re.compile(
+    r"resource|target|notfound|not found|unsupported|agent|extension|sku|zone"
+    r"|capacity|state",
+    re.IGNORECASE,
+)
+
+#: Emitted in a targeted grant command when the workspace identity is unknown,
+#: so the command is never silently unassignable.
+PRINCIPAL_PLACEHOLDER = "<workspace-identity-principal-id>"
+
+
+def _first(source: dict[str, Any], *keys: str) -> Any:
+    """First present, truthy value among `keys`."""
+    for key in keys:
+        value = source.get(key)
+        if value:
+            return value
+    return None
+
+
+def normalize_validation_blockers(validation: Any) -> list[dict[str, Any]]:
+    """Normalize a `validations/latest` payload into one blocker shape (E3-T2).
+
+    The service reports blockers from several places (`properties.errors`,
+    `properties.validationErrors`, `properties.resources[].errors`) using
+    several field spellings. Everything downstream reads
+    `{code, category, resourceId, roleName, principalId, message}` instead,
+    where `category` is one of `permission`, `resource` or `other`. Identical
+    blockers reported twice collapse to one.
+
+    Error entries that are not objects (a bare string in `errors[]`) are
+    skipped: they carry no code, message or resource id. `Test-StructuredValidationError`
+    in scripts/Validate-AndFix.ps1 applies the same rule so both planes produce
+    the same blocker count for the same payload.
+
+    See `references/chaos/blast-radius.md` §5.
+    """
+    if not isinstance(validation, dict):
+        return []
+    props = validation.get("properties")
+    if not isinstance(props, dict):
+        return []
+
+    raw: list[tuple[dict[str, Any], str | None]] = []
+    for field in ("errors", "validationErrors"):
+        for item in props.get(field) or []:
+            if isinstance(item, dict):
+                raw.append((item, None))
+    for resource in props.get("resources") or []:
+        if not isinstance(resource, dict):
+            continue
+        parent = _first(resource, "resourceId", "id")
+        for field in ("errors", "validationErrors"):
+            for item in resource.get(field) or []:
+                if isinstance(item, dict):
+                    raw.append((item, parent))
+
+    blockers: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for error, parent in raw:
+        code = _first(error, "errorCode", "code") or "Unknown"
+        message = _first(error, "errorMessage", "message") or ""
+        resource_id = (
+            _first(error, "resourceId", "targetResourceId", "target", "id") or parent
+        )
+        role_name = _first(error, "roleName", "requiredRole", "roleDefinitionName")
+
+        probe = f"{code} {message}"
+        if _PERMISSION_BLOCKER.search(probe):
+            category = "permission"
+        elif _RESOURCE_BLOCKER.search(probe):
+            category = "resource"
+        else:
+            category = "other"
+
+        # Deliberately message-free: one code on one resource for one role is a
+        # single actionable blocker however it was worded. Mirrors the dedupe
+        # key in ConvertTo-ValidationBlocker (scripts/Validate-AndFix.ps1).
+        key = (str(code).lower(), str(resource_id or "").lower(), str(role_name or "").lower())
+        if key in seen:
+            continue
+        seen.add(key)
+
+        blockers.append(
+            {
+                "code": str(code),
+                "category": category,
+                "resourceId": str(resource_id) if resource_id else None,
+                "roleName": str(role_name) if role_name else None,
+                "principalId": str(error["principalId"]) if error.get("principalId") else None,
+                "message": str(message),
+            }
+        )
+    return blockers
+
+
+def build_targeted_grant_proposal(
+    blockers: list[dict[str, Any]],
+    principal_id: str | None = None,
+    default_role_name: str = "Reader",
+) -> list[dict[str, Any]]:
+    """Exact, minimum-scope grants that would clear the permission blockers.
+
+    Always offered *before* `chaos_fix_resource_permissions`, which is a
+    broad-breadth mutation. Blockers no role assignment can fix, and blockers
+    with no resource id (the scope would be a guess), are skipped. Duplicate
+    (resource, role) pairs collapse.
+
+    Mirrors `Build-TargetedGrantProposal` in scripts/Rbac.ps1.
+    """
+    principal = principal_id or PRINCIPAL_PLACEHOLDER
+    proposal: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for blocker in blockers:
+        if blocker.get("category") != "permission":
+            continue
+        resource_id = blocker.get("resourceId")
+        if not resource_id:
+            continue
+        role_name = blocker.get("roleName") or default_role_name
+        key = (resource_id.lower(), role_name.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        proposal.append(
+            {
+                "resourceId": resource_id,
+                "roleName": role_name,
+                "blockerCode": blocker.get("code"),
+                "command": (
+                    f'az role assignment create --assignee-object-id "{principal}" '
+                    f'--assignee-principal-type ServicePrincipal '
+                    f'--role "{role_name}" --scope "{resource_id}"'
+                ),
+                "description": (
+                    f"Grant '{role_name}' to principal {principal} on scope {resource_id}"
+                ),
+            }
+        )
+    return proposal
+
+
 # ---------------------------------------------------------------------------
 # Workspace lifecycle
 # ---------------------------------------------------------------------------
@@ -253,14 +404,33 @@ def chaos_validate_scenario_configuration(
     configuration_name: str,
 ) -> dict[str, Any]:
     """Validate a Scenario configuration and return the latest validation
-    result (including any per-resource validation errors)."""
+    result (including any per-resource validation errors).
+
+    The returned payload is the raw `validations/latest` resource, additively
+    enriched with `normalizedBlockers` (one shape for the several the service
+    uses) and `targetedGrantProposal` (the exact, minimum-scope
+    `az role assignment create` commands that would clear the permission
+    blockers). Offer those grants before ever considering
+    `chaos_fix_resource_permissions`. Their `--assignee-object-id` carries the
+    `<workspace-identity-principal-id>` placeholder — substitute the workspace
+    identity's object ID before running them. See
+    `references/chaos/blast-radius.md`.
+    """
     path = _config_path(
         subscription_id, resource_group, workspace_name, scenario_name, configuration_name
     )
     try:
         resp = az.arm_post(f"{path}/validate")
         az.wait_for_lro(resp)
-        return _ok(az.arm_get(f"{path}/validations/latest"))
+        latest = az.arm_get(f"{path}/validations/latest")
+        if isinstance(latest, dict):
+            blockers = normalize_validation_blockers(latest)
+            # Additive only: never overwrite a field the service itself sent.
+            latest.setdefault("normalizedBlockers", blockers)
+            latest.setdefault(
+                "targetedGrantProposal", build_targeted_grant_proposal(blockers)
+            )
+        return _ok(latest)
     except az.AzureError as e:
         return _err(e)
 
@@ -275,7 +445,19 @@ def chaos_fix_resource_permissions(
     what_if: bool = False,
 ) -> dict[str, Any]:
     """Auto-grant the roles a Scenario configuration needs on its target
-    resources. Set `what_if=True` to preview without granting."""
+    resources. Set `what_if=True` to preview without granting.
+
+    BROAD MUTATION — REQUIRES EXPLICIT CONSENT. This grants whatever roles the
+    service decides are required to the workspace identity, on **every** target
+    resource in this configuration's scope, in a single call. It is not limited
+    to the reported blockers and the grants cannot be enumerated in advance.
+
+    Before calling this with `what_if=False`: run
+    `chaos_validate_scenario_configuration`, show the caller the
+    `targetedGrantProposal` it returns (minimum-scope, per-resource
+    `az role assignment create` commands), describe the breadth above, and
+    obtain an explicit answer. See `references/chaos/blast-radius.md` §6.
+    """
     path = _config_path(
         subscription_id, resource_group, workspace_name, scenario_name, configuration_name
     )

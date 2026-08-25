@@ -59,12 +59,17 @@ try {
         # In direct invocation, proceeding automatically.
     }
 
-    # ── Step 2: Validate + auto-fix permissions ─────────
+    # ── Step 2: Validate + consent-gated permission fix ──
     # ALWAYS validate before execute. If validation returns anything other than
-    # 'Succeeded', the shared helper invokes fixResourcePermissions and
-    # re-validates. Execution is STRICTLY gated on the final status below.
+    # 'Succeeded', the shared helper normalizes the blockers, offers the exact
+    # per-resource grants first, and STOPS for explicit consent rather than
+    # running the broad fixResourcePermissions mutation (E3-T3). It only calls
+    # fixResourcePermissions and re-validates once consent has been given.
+    # Execution is STRICTLY gated on the final status below.
     try {
-        Invoke-ValidateAndFix -ResourceGroup $rg -WorkspaceName $wsName -ScenarioName $scenarioName -ConfigName $configName -StateBasePath 'setup.configuration'
+        # -PrincipalId is what makes the targeted `az role assignment create`
+        # commands runnable as printed; without it they carry a placeholder.
+        Invoke-ValidateAndFix -ResourceGroup $rg -WorkspaceName $wsName -ScenarioName $scenarioName -ConfigName $configName -StateBasePath 'setup.configuration' -PrincipalId $state.workspace.identity.principalId
     } catch {
         $vfErr = $_.Exception.Message
         Set-StateProperty -PropertyPath 'run.lastError' -Value $vfErr

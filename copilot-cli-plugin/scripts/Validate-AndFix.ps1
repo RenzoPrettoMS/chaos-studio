@@ -10,25 +10,43 @@
     Used by both the setup-scenario skill (creation-time validation) and the
     run-scenario skill (pre-execute gate).
 
-    Behavior (always-on validation + always-on remediation when applicable):
+    Behavior (always-on validation + consent-gated broad remediation):
       1. `az chaos scenario config validate` (CLI polls the LRO to completion).
       2. Read the validation status (from the validate result, falling back to
          `az chaos scenario config show-validation`) -> $valStatus.
       3. If $valStatus is NOT 'Succeeded' (i.e. Failed/RequiresAttention/etc.) OR
-         validationErrors are present, `az chaos scenario config fix-permissions`
-         (actual fix, not --what-if), then re-validate.
+         validationErrors are present:
+           a. normalize the blockers into one shape (`ConvertTo-ValidationBlocker`);
+           b. render the exact, per-resource `az role assignment create` grants
+              that would clear them (`Build-TargetedGrantProposal`) — always
+              offered FIRST, because they are minimum-scope;
+           c. only then, and only with explicit consent, run the broad
+              `az chaos scenario config fix-permissions` (actual fix, not
+              --what-if) and re-validate.
       4. Returns the final validation status string via state.
+
+    Consent (E3-T3): `fixResourcePermissions` grants whatever the service
+    decides is required across every target resource in a single call. Without
+    consent this function persists the prompt, renders it, and throws
+    `broadPermissionFixConsentRequired: ...` so the caller can pause for the
+    user. Consent is given by `-ConsentToBroadPermissionFix` or by
+    `$env:STARTCHAOS_CONSENT_BROAD_PERMISSION_FIX = '1'`.
 
     State persistence:
       - Always writes the final validation status to
         "$StateBasePath.validation.lastResult".
+      - When validation reports blockers, also writes:
+          $StateBasePath.validation.blockers
+          $StateBasePath.validation.targetedGrants
+          $StateBasePath.validation.permissionFix.consent        ('required'|'granted')
+          $StateBasePath.validation.permissionFix.consentPrompt
       - When fix runs, also writes:
           $StateBasePath.validation.permissionFix.state
           $StateBasePath.validation.permissionFix.summary
           $StateBasePath.validation.permissionFix.whatIfMode
 
     Required dot-sourced dependencies (caller must load before invoking):
-      State.ps1, Render.ps1, Invoke-AzChaos.ps1
+      State.ps1, Render.ps1, Invoke-AzChaos.ps1, Rbac.ps1
 
 .PARAMETER ResourceGroup
     Resource group containing the workspace.
@@ -41,11 +59,164 @@
 .PARAMETER StateBasePath
     Dotted state path under which to persist validation/permissionFix results
     (e.g. 'setup.configuration').
+.PARAMETER PrincipalId
+    Object ID of the workspace identity, used to build the targeted grant
+    commands. Optional — a placeholder is emitted when it is unknown.
+.PARAMETER ConsentToBroadPermissionFix
+    Explicit consent to run the broad `fixResourcePermissions` mutation.
 
 .OUTPUTS
     None. Callers should read the final status from state at
     "$StateBasePath.validation.lastResult" after this function returns.
 #>
+
+#: Codes/messages that a role assignment could plausibly fix.
+$script:PermissionBlockerPattern = '(?i)(permission|authoriz|forbidden|denied|rbac|roleassignment|role assignment)'
+
+#: Codes/messages that describe the target resource itself, not access to it.
+$script:ResourceBlockerPattern = '(?i)(resource|target|notfound|not found|unsupported|agent|extension|sku|zone|capacity|state)'
+
+function Test-StructuredValidationError {
+    <#
+    .SYNOPSIS
+        True only for error entries that carry named fields.
+    .DESCRIPTION
+        Mirrors the `isinstance(item, dict)` guard in
+        `normalize_validation_blockers` (mcp/chaos_mcp/server.py). A bare string
+        or number in `errors[]` has no code, message or resource id; emitting a
+        `code='Unknown'` blocker for it would produce a different blocker count
+        on the two planes for the same payload. Both planes skip it.
+    #>
+    [CmdletBinding()]
+    param([Parameter()][AllowNull()][object]$Entry)
+
+    if ($null -eq $Entry) { return $false }
+    if ($Entry -is [System.Collections.IDictionary]) { return $true }
+    return ($Entry -is [PSCustomObject])
+}
+
+function ConvertTo-ValidationBlocker {
+    <#
+    .SYNOPSIS
+        Normalizes the errors on a `validations/latest` payload into one shape.
+    .DESCRIPTION
+        Pure function — no ARM calls, no state writes. The service reports
+        blockers from several places and with several field spellings:
+
+          properties.errors[]              / properties.validationErrors[]
+          properties.resources[].errors[]  / .validationErrors[]
+          errorCode|code, errorMessage|message, resourceId|targetResourceId|target|id
+
+        Every blocker is emitted as
+        `{ code, category, resourceId, roleName, principalId, message }` where
+        category is one of 'permission', 'resource' or 'other'. Identical
+        blockers reported from two places collapse to one.
+    .PARAMETER ValidationResult
+        The object returned by `validate` / `show-validation`.
+    .OUTPUTS
+        [PSCustomObject[]]
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [object]$ValidationResult
+    )
+
+    if (-not $ValidationResult -or -not $ValidationResult.properties) { return @() }
+    $props = $ValidationResult.properties
+
+    $raw = @()
+    foreach ($field in @('errors', 'validationErrors')) {
+        foreach ($item in @($props.$field)) {
+            if (Test-StructuredValidationError -Entry $item) {
+                $raw += [PSCustomObject]@{ error = $item; parentResourceId = $null }
+            }
+        }
+    }
+    foreach ($resource in @($props.resources)) {
+        if (-not $resource) { continue }
+        $parentId = $resource.resourceId
+        if (-not $parentId) { $parentId = $resource.id }
+        foreach ($field in @('errors', 'validationErrors')) {
+            foreach ($item in @($resource.$field)) {
+                if (Test-StructuredValidationError -Entry $item) {
+                    $raw += [PSCustomObject]@{ error = $item; parentResourceId = $parentId }
+                }
+            }
+        }
+    }
+
+    $blockers = @()
+    $seen = @{}
+
+    foreach ($entry in $raw) {
+        $e = $entry.error
+
+        $code = $e.errorCode
+        if (-not $code) { $code = $e.code }
+        if (-not $code) { $code = 'Unknown' }
+
+        $message = $e.errorMessage
+        if (-not $message) { $message = $e.message }
+        if (-not $message) { $message = '' }
+
+        $resourceId = $e.resourceId
+        if (-not $resourceId) { $resourceId = $e.targetResourceId }
+        if (-not $resourceId) { $resourceId = $e.target }
+        if (-not $resourceId) { $resourceId = $e.id }
+        if (-not $resourceId) { $resourceId = $entry.parentResourceId }
+
+        $roleName = $e.roleName
+        if (-not $roleName) { $roleName = $e.requiredRole }
+        if (-not $roleName) { $roleName = $e.roleDefinitionName }
+
+        $probe = "$code $message"
+        $category = if ($probe -match $script:PermissionBlockerPattern) {
+            'permission'
+        } elseif ($probe -match $script:ResourceBlockerPattern) {
+            'resource'
+        } else {
+            'other'
+        }
+
+        # Deliberately message-free: the same code on the same resource for the
+        # same role is one actionable blocker however many times (and with
+        # whatever wording) the service reported it. Two different messages
+        # under one code on one resource intentionally collapse.
+        $key = "$code|$resourceId|$roleName".ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+
+        $blockers += [PSCustomObject]@{
+            code        = "$code"
+            category    = $category
+            resourceId  = if ($resourceId) { "$resourceId" } else { $null }
+            roleName    = if ($roleName) { "$roleName" } else { $null }
+            principalId = if ($e.principalId) { "$($e.principalId)" } else { $null }
+            message     = "$message"
+        }
+    }
+
+    return $blockers
+}
+
+function Test-BroadPermissionFixConsent {
+    <#
+    .SYNOPSIS
+        Returns $true only when consent to the broad permission fix is explicit.
+    .DESCRIPTION
+        Any value other than the exact string '1' in
+        `STARTCHAOS_CONSENT_BROAD_PERMISSION_FIX` is NOT consent — a broad
+        mutation must never turn on because an env var happened to be set.
+    #>
+    [CmdletBinding()]
+    param([Parameter()][switch]$Consented)
+
+    if ($Consented) { return $true }
+    return ($env:STARTCHAOS_CONSENT_BROAD_PERMISSION_FIX -eq '1')
+}
+
 function Invoke-ValidateAndFix {
     [CmdletBinding()]
     param(
@@ -53,7 +224,9 @@ function Invoke-ValidateAndFix {
         [Parameter(Mandatory)][string]$WorkspaceName,
         [Parameter(Mandatory)][string]$ScenarioName,
         [Parameter(Mandatory)][string]$ConfigName,
-        [Parameter(Mandatory)][string]$StateBasePath
+        [Parameter(Mandatory)][string]$StateBasePath,
+        [Parameter()][string]$PrincipalId,
+        [Parameter()][switch]$ConsentToBroadPermissionFix
     )
 
     $idArgs = @(
@@ -93,8 +266,67 @@ function Invoke-ValidateAndFix {
         return
     }
 
-    # ── Step 3: Attempt fix-permissions ─────────────────────
-    Write-Card -Title 'Validation Needs Attention — Auto-Fixing Permissions' -Status '⚠️' `
+    # ── Step 3: Normalize blockers and offer targeted grants FIRST ──
+    # `validations/latest` reports blockers from several places with several
+    # field spellings; normalize once so everything downstream reads one shape.
+    $blockers = @(ConvertTo-ValidationBlocker -ValidationResult $valResult)
+    Set-StateProperty -PropertyPath "$StateBasePath.validation.blockers" -Value $blockers
+
+    if ($blockers.Count -gt 0) {
+        Write-Table -Data @($blockers | ForEach-Object {
+            [ordered]@{
+                'Code'     = $_.code
+                'Category' = $_.category
+                'Resource' = $_.resourceId
+                'Role'     = $_.roleName
+                'Message'  = $_.message
+            }
+        }) -Title "Validation Blockers ($($blockers.Count))"
+    }
+
+    $targetedGrants = @(Build-TargetedGrantProposal -Blockers $blockers -PrincipalId $PrincipalId)
+    Set-StateProperty -PropertyPath "$StateBasePath.validation.targetedGrants" -Value $targetedGrants
+
+    if ($targetedGrants.Count -gt 0) {
+        Write-Card -Title 'Targeted Grants (minimum scope — try these first)' -Status 'ℹ️' -Body @"
+Validation status: ``$valStatus``. These are the exact, per-resource role
+assignments that would clear the permission blockers above. Each one is scoped
+to a single resource — nothing wider:
+
+$(($targetedGrants | ForEach-Object { "- ``$($_.command)``" }) -join "`n")
+"@
+    } else {
+        Write-Card -Title 'No Targeted Grants Available' -Status 'ℹ️' -Body @"
+Validation status: ``$valStatus``. None of the reported blockers can be cleared
+by a per-resource role assignment (they are not permission blockers, or the
+service did not name the resource).
+"@
+    }
+
+    # ── Step 4: Consent gate on the broad fix (E3-T3) ───────
+    $consentPrompt = @"
+``fixResourcePermissions`` is a **broad** mutation. It asks Chaos Studio to grant
+whatever roles it decides are required to the workspace identity, on every target resource
+in this configuration's scope, in a single call. It is not limited to the
+$($blockers.Count) blocker(s) listed above, and the plugin cannot enumerate the
+grants in advance.
+
+Prefer the targeted grants above. To proceed with the broad fix anyway, re-run
+with ``-ConsentToBroadPermissionFix`` or set
+``STARTCHAOS_CONSENT_BROAD_PERMISSION_FIX=1``.
+"@
+    Set-StateProperty -PropertyPath "$StateBasePath.validation.permissionFix.consentPrompt" -Value $consentPrompt
+
+    if (-not (Test-BroadPermissionFixConsent -Consented:$ConsentToBroadPermissionFix)) {
+        Set-StateProperty -PropertyPath "$StateBasePath.validation.permissionFix.consent" -Value 'required'
+        Write-Card -Title 'Consent Required — Broad Permission Fix' -Status '⏸️' -Body $consentPrompt
+        throw "broadPermissionFixConsentRequired: validation is '$valStatus' and the broad fixResourcePermissions mutation needs explicit consent."
+    }
+
+    Set-StateProperty -PropertyPath "$StateBasePath.validation.permissionFix.consent" -Value 'granted'
+
+    # ── Step 5: Attempt fix-permissions ─────────────────────
+    Write-Card -Title 'Consent Given — Running Broad Permission Fix' -Status '⚠️' `
         -Body "Validation status: ``$valStatus``. Running ``az chaos scenario config fix-permissions``..."
 
     $fixResult = $null
@@ -168,14 +400,14 @@ To resolve this, contact your security administrator and ask them to either:
         'Skipped'        = $fixSummary.skipped
     })
 
-    # ── Step 4: Re-validate after fix ───────────────────────
+    # ── Step 6: Re-validate after fix ───────────────────────
     Write-Card -Title 'Re-validating Configuration' -Status '🔄'
 
     $reValResult = & $runValidate
     $valStatus = $reValResult.properties.status
     Set-StateProperty -PropertyPath "$StateBasePath.validation.lastResult" -Value $valStatus
 
-    # ── Step 5: Wait for RBAC propagation ───────────────────
+    # ── Step 7: Wait for RBAC propagation ───────────────────
     # New role assignments take 30s-5min to propagate in ARM. If validation is
     # still not 'Succeeded' immediately after the fix, retry on an interval —
     # but ONLY when the failure looks like it could be a transient permission
