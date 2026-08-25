@@ -1,222 +1,215 @@
-# Targeted Chaos Skills & Tools — Solution Design and Implementation Plan
+# Azure Chaos Reliability Study — Solution Design and Implementation Plan
 
 | | |
 |---|---|
 | **Repository** | `microsoft/chaos-studio` |
-| **Component** | `copilot-cli-plugin/` (plugin `startchaos`), `copilot-cli-plugin/mcp/chaos_mcp` (MCP server `chaos-studio`) |
-| **Status** | Draft for implementation review; independent review corrections applied (Technical 86/100, Readability 91/100; re-review pending) |
-| **Audience** | Chaos Studio engineering, Copilot plugin owners, Azure Monitor/Advisor partners |
-| **Revision** | Revision 5 — contract-correction pass; see §Appendix A |
-| **Research baseline** | **`55c74c59a5eb123edecd91374be4d385407be8f0`** (authoritative `main` snapshot for every `[MAIN]` statement) |
+| **Component** | `copilot-cli-plugin/` (plugin `startchaos`); `copilot-cli-plugin/mcp/chaos_mcp` (optional MCP adapter `chaos-studio`) |
+| **Status** | **Approved for implementation — Revision 6, final review pass.** Independently reviewed twice; every blocker from both passes is fixed and recorded in Appendix A, and the final pass re-verified each correction against the working tree rather than against the previous draft. All ID namespaces closed: F1–F15, P1–P9, G1–G12, N1–N9, FR-1–FR-22 + FR-7a, NFR-1–NFR-12, D1–D20, ALT-1–ALT-9, CS-1–CS-12, L1–L9, Q1–Q14, EPIC-001–EPIC-016. |
+| **Audience** | Chaos Studio engineering, Copilot plugin owners, AKS + Azure Monitor partners |
+| **Research baseline** | **`55c74c59a5eb123edecd91374be4d385407be8f0`** (`origin/main`) plus the local branch `renzopretto-microsoft-ground-targeted-chaos-plan` at `4befd5e` and the EPIC-003 working tree that was uncommitted at the time of planning and is now landed at `283cb61` |
+| **Date** | 2026-08-24 |
+| **Supersedes** | Revision 5 of this document (the "eight targeted peer skills" design) and PR #32 / `renzopretto-microsoft-add-chaos-loop-plugin` (the chaos-loop controller) |
 
 ---
 
 ## How to Read This Document
 
-**Evidence/source labels.** Every implementation claim is classified:
+**Source labels.** Claims about **existing code** are always labelled; unlabelled prose in §Proposed Design, §Detailed Design and §Implementation Plan describes proposed work and is `[NEW]` by default.
 
-- **`[MAIN]`** — proved from commit **`55c74c59a5eb123edecd91374be4d385407be8f0`** with `git show`/`git ls-tree`.
-- **`[PR32 PROTOTYPE]`** — useful prior art from PR #32 / `renzopretto-microsoft-add-chaos-loop-plugin`; it never merged and does **not** exist on current main.
-- **`[NEW]`** — proposed additive or backward-compatible hardening.
+- **`[MAIN]`** — proved from `55c74c59a5eb123edecd91374be4d385407be8f0`.
+- **`[E1]` / `[E2]` / `[E3]`** — implemented on the local branch: EPIC-001 (`5257c2a`), EPIC-002 (`4befd5e`), EPIC-003 (`283cb61`; described below as an uncommitted working tree at planning time, landed in Phase 0). These are *real code that exists on this machine*, not proposals.
+- **`[PR32]`** — the never-merged chaos-loop prototype. **Replaced, not extended** (see §Migration and Disposition).
+- **`[NEW]`** — proposed work, stated explicitly where it sits next to existing code.
 
-**ID namespaces.** Ten reference schemes are used throughout; every cross-reference resolves to one of these.
+**Disposition vocabulary.** Every existing asset is classified exactly once as **RETAINED** (kept as-is), **RESHAPED** (kept, contract or role changes), **DEFERRED** (kept on disk, not on the near-term path, not deleted), or **REMOVED** (deleted or replaced). §Migration and Disposition is the single authoritative table.
+
+**ID namespaces.**
 
 | Prefix | Meaning | Defined in |
 |---|---|---|
-| **F1–F15** | Field evidence — observations from a real engagement, treated as requirements | §Background → Field evidence |
-| **P1–P11** | Problems the design addresses | §Problem Statement |
-| **G1–G11** / **N1–N8** | Goals / Non-Goals | §Goals and Non-Goals |
-| **FR-1–FR-18** / **NFR-1–NFR-10** | Functional / Non-functional requirements | §Requirements |
-| **D1–D18** | Design decisions with rationale | §Proposed Design → Design Decisions |
-| **DQ-\*** | Deterministic disqualification rules for recommendations | §Recommendation Scoring and Disqualification |
-| **ALT-1–ALT-10** | Alternatives evaluated and why they were rejected or deferred | §Alternatives Considered |
-| **Q1–Q13** | Open questions with a stated current lean | §Open Questions |
-| **CS-1–CS-10** | Chaos Studio **product/service** issues — filed with the service team, not fixed here | §Chaos Studio Product Issues |
-| **E\<n\>-T\<n\>** | Epic *n*, task *n* | §Implementation Plan |
+| **F1–F15** | Field evidence from a live engagement | §Background → Field evidence |
+| **P1–P9** | Problems addressed | §Problem Statement |
+| **G1–G12** / **N1–N9** | Goals / Non-Goals | §Goals and Non-Goals |
+| **FR-1–FR-22** (plus **FR-7a**) / **NFR-1–NFR-12** | Functional / Non-functional requirements | §Requirements |
+| **D1–D20** | Design decisions | §Proposed Design → Design Decisions |
+| **ALT-1–ALT-9** | Alternatives evaluated | §Alternatives Considered |
+| **CS-1–CS-12** | Chaos Studio **product/service** issues — filed, not fixed here | §Chaos Studio Product Issues |
+| **L1–L9** | Report limitation classes | §Detailed Design → Findings derivation |
+| **Q1–Q14** | Open questions with a stated lean | §Open Questions |
+| **EPIC-001–EPIC-016** / **E\<n\>-T\<n\>** | Epics and their tasks | §Implementation Plan |
 
 **Contents**
 
 1. [Executive Summary](#executive-summary)
-2. [Background](#background) — current state, prior art, why now, field evidence F1–F15, corrections
-3. [Problem Statement](#problem-statement) — P1–P11
-4. [Goals and Non-Goals](#goals-and-non-goals) — G1–G11, N1–N8
-5. [Requirements](#requirements) — FR-1–FR-18, NFR-1–NFR-10
-6. [Proposed Design](#proposed-design) — architecture, the eight skills, reference documents, permission-blocker acquisition, MCP tools, data flow, API contracts, decisions D1–D18
-7. [Detailed Design](#detailed-design) — code/IaC analysis, scoring and disqualification, execution guardrails, run monitoring, evidence provenance, testing strategy, migration and reuse
-8. [Chaos Studio Product Issues](#chaos-studio-product-issues-separate-from-this-plan) — CS-1–CS-10
-9. [Alternatives Considered](#alternatives-considered) — ALT-1–ALT-10
-10. [Dependencies](#dependencies) · [Impact Analysis](#impact-analysis) · [Security Considerations](#security-considerations) · [Risks and Mitigations](#risks-and-mitigations)
-11. [Open Questions](#open-questions) — Q1–Q13
-12. [Implementation Phases](#implementation-phases) — Phases 0–7 mapped to epics
-13. [Files Affected](#files-affected) — modified main assets, new assets, and prototype assets not ported
-14. [Implementation Plan](#implementation-plan) — Epics 1–11 plus Epic 7a
-15. [References](#references)
-16. [Appendix A: Revision History and Corrections](#appendix-a-revision-history-and-corrections)
+2. [Background](#background)
+3. [Problem Statement](#problem-statement)
+4. [Goals and Non-Goals](#goals-and-non-goals)
+5. [Requirements](#requirements)
+6. [Proposed Design](#proposed-design)
+7. [Detailed Design](#detailed-design)
+8. [Chaos Studio Product Issues](#chaos-studio-product-issues)
+9. [Alternatives Considered](#alternatives-considered)
+10. [Dependencies](#dependencies)
+11. [Impact Analysis](#impact-analysis)
+12. [Security Considerations](#security-considerations)
+13. [Risks and Mitigations](#risks-and-mitigations)
+14. [Open Questions](#open-questions)
+15. [Migration and Disposition](#migration-and-disposition)
+16. [Implementation Phases](#implementation-phases)
+17. [Files Affected](#files-affected)
+18. [Implementation Plan](#implementation-plan)
+19. [References](#references)
+20. [Appendix A: Revision History](#appendix-a-revision-history)
 
 ---
 
 ## Executive Summary
 
-This is an **evolution and hardening plan for the shipped `startchaos` v0.3.0 plugin**, not a greenfield replacement. **`[MAIN]`** already provides five independently invocable skills, a resumable orchestration path, shared PowerShell libraries, an impact schema/report and offline replay, and 15 MCP tools for workspace, scenario, run, auth, metrics, logs and Activity Log. **`[NEW]`** work begins by making those contracts safer and more durable, then adds targeted entry skills only where they clarify ownership. **Do not port the never-merged prototype; evolve current shipped assets.**
+We are building an **opinionated Azure Chaos reliability study experience** on top of the shipped `startchaos` Copilot CLI plugin. A *study* is a single, named, dated, reproducible unit of work: pick a scope, form a hypothesis, run a small number of real Chaos Studio faults inside a bounded window, measure against a captured steady-state baseline, and produce a **self-contained HTML report** with the tests run, dated evidence, prioritized findings, stated limitations and concrete remediation guidance. Study results are written **once, immutably, outside the repository and outside session-temporary state**, so a later conversation — with no memory of the first — can list previous studies, compare two of them, and rerun one.
 
-The proposed targeted entry points remain `chaos-scope-setup`, `chaos-inventory`, `chaos-availability`, `chaos-analyze`, `chaos-recommend`, `chaos-run`, `chaos-diagnose`, and `chaos-evidence`, but they compose the current five skills rather than replacing them in the first release. Deterministic code owns discovery joins, scoring, window arithmetic, proof and verdicts; the model owns semantic code/IaC analysis and narrative. The field-derived verdict decisions remain load-bearing: two-sided per-leg proof, mechanism liveness, failure-mechanism classes, and `CONFIRMED` / `REFUTED` / `NOT EXERCISED`.
+The product is built **directly over `az chaos`**. It is not an SRE-Agent-specific wrapper, it does not require an MCP server, and it is not the `[PR32]` chaos-loop controller. It is also **not one monolithic skill**: it is a small suite of five composable skills with one obvious entry point (`chaos-study`) and four focused supporting skills covering discovery/analysis, execution/monitoring, reporting, and comparison/rerun. Every user-facing `SKILL.md` — the five new ones and the five shipped ones — stays principle-led and is capped at **under 200 lines** by a CI test, reaching scenario- and fault-specific detail through progressive discovery into `references/chaos/**`. Every deterministic or safety-critical behaviour — validation gates, consent, blast-radius resolution, window arithmetic, redaction, atomic writes, report rendering — lives in reusable PowerShell scripts, not in prompt text.
+
+**Kubernetes reliability study is the first vertical slice.** The fault and scenario guidance structure is designed to be extensible so additional verticals and newly shipped Kubernetes faults are additive reference files, not code changes.
+
+Substantially all of the delivered `[E1]`/`[E2]`/`[E3]` work is retained: lifecycle scripts and `az chaos` wrapper, the strict validate/fix/revalidate gate, consent gates, blast-radius rendering, the durable evidence store with redaction and atomic revisioned writes, the nine v1 artifact schemas, and the Pester/pytest/ruff test matrices. What changes is **shape, not substance**: eight speculative peer skills collapse into five real ones, MCP moves from required to optional, the durable evidence store gains an immutable dated study layer, and the deliverable becomes a single self-contained HTML file carrying an executive summary, dated evidence, prioritized findings, mandatory limitations and per-finding remediation (FR-16 – FR-19).
 
 ---
 
 ## Background
 
-### Current state — authoritative `[MAIN]` baseline
+### Current state
 
-**Research SHA: `55c74c59a5eb123edecd91374be4d385407be8f0`.** All facts in this section were read from that tree; runtime/service behavior not represented there remains an open question.
+#### `[MAIN]` — shipped plugin at `55c74c5`
 
-`[MAIN]` `startchaos` is version **0.3.0** in `copilot-cli-plugin/plugin.json`, `copilot-cli-plugin/mcp/pyproject.toml`, and `.github/plugin/marketplace.json`. It already provides:
+`startchaos` is version **0.3.0** in `copilot-cli-plugin/plugin.json`, `copilot-cli-plugin/mcp/pyproject.toml` and `.github/plugin/marketplace.json`. It ships five skills — `start-chaos`, `create-workspace`, `setup-scenario`, `run-scenario`, `chaos-impact` — plus shared PowerShell libraries, an impact schema/report with an offline replay harness, and 15 MCP tools.
 
-- workspace create/get and recommendation refresh;
-- scenario listing, configuration create, validation, permission fix, execute/get/cancel;
-- CLI and managed-identity authentication;
-- MCP metrics, Log Analytics logs, and Activity Log queries;
-- PowerShell impact collection across metrics, logs, Activity Log, **alert instances, and Service Health**;
-- impact schema/report generation and an offline replay harness;
-- resumable state through `$env:STARTCHAOS_STATE_PATH`, defaulting to **`./startchaos-state.json`** through `scripts/State.ps1`.
+**The plugin already drives the Chaos Studio v2 workspace/scenario CLI surface.** Verified call sites:
 
-The last two surfaces must not be conflated: `[MAIN]` PowerShell `chaos-impact` queries alerts and Service Health; `[MAIN]` MCP exposes only metrics/logs/Activity Log monitoring. Also, `[MAIN]` has **no durable evidence store outside the repository/session tree**. Its configurable state path and reports are resumable, but default to the current directory or alongside that state file.
+| Command | Call site |
+|---|---|
+| `az chaos workspace create` | `skills/create-workspace/scripts/Invoke-CreateWorkspace.ps1:69` |
+| `az chaos workspace show` | `scripts/Invoke-AzChaos.ps1:31` |
+| `az chaos workspace show-evaluation` | `skills/setup-scenario/scripts/Invoke-SetupScenario.ps1:55,65` |
+| `az chaos workspace refresh-recommendation` | `Invoke-SetupScenario.ps1:64` |
+| `az chaos scenario list` | `Invoke-SetupScenario.ps1:82` |
+| `az chaos scenario config create` | `Invoke-SetupScenario.ps1:271` |
+| `az chaos scenario config validate` / `show-validation` | `scripts/Validate-AndFix.ps1:243,245` |
+| `az chaos scenario config fix-permissions` / `show-permission-fix` | `Validate-AndFix.ps1:334,357` |
+| `az chaos scenario run start --skip-validation --no-wait` | `skills/run-scenario/scripts/Invoke-RunScenario.ps1:103–109` |
+| `az chaos scenario run show` / `run list` | `Invoke-RunScenario.ps1:158,132` |
 
-#### Exhaustive baseline inventory and disposition
+All chaos calls route through `scripts/Invoke-AzChaos.ps1` (`copilot-cli-plugin/scripts/Invoke-AzChaos.ps1:99` builds `@('chaos') + $ChaosArgs`). `agents/start-chaos.md` forbids ad-hoc `az chaos` / `az rest` from skill prompt text. **This is exactly the "built directly over `az chaos`" posture the product now requires — it already exists and is the single most valuable asset to keep.**
 
-Disposition is conservative. No shipped asset is retired in the initial hardening release.
+#### `[E1]` — EPIC-001, commit `5257c2a`, "Baseline contracts, tests, and runtime preflight"
 
-| Existing asset/path | Current responsibility | Strengths | Observed field/source gap | Disposition |
-|---|---|---|---|---|
-| `[MAIN] copilot-cli-plugin/skills/start-chaos/SKILL.md` + `copilot-cli-plugin/skills/start-chaos/scripts/Invoke-StartChaos.ps1` | Human orchestration: auth → workspace → setup → run with resumable state | Shipped trigger/front door; fixed error/exit protocol | Does not own durable external evidence or targeted cold-entry diagnosis (F12/F14) | EXTEND |
-| `[MAIN] copilot-cli-plugin/skills/create-workspace/**` | Workspace, identity, scope validation and Reader grants | Explicit interactive path; uses shared CLI/RBAC/state | Scope planning/reuse proof and evidence durability can improve | EXTEND |
-| `[MAIN] copilot-cli-plugin/skills/setup-scenario/**` | Refresh/list recommendations, configure, validate, fix permissions | Already validates and persists results; scenario names come from service | Broad permission fix is default fallback; exclusions/fault semantics are hard to discover (F8) | REFACTOR |
-| `[MAIN] copilot-cli-plugin/skills/run-scenario/**` | Confirm, validate/fix, start, recover run ID, poll, report | Strict validation gate exists before CLI `--skip-validation`; resumable polling/report | Run fallback lacks request-time/concurrency proof; identity fields may be null (F7) | EXTEND |
-| `[MAIN] copilot-cli-plugin/skills/chaos-impact/**` | Post-run impact collection/correlation/report | Mature schema, templates, Pester tests, replay; alerts + Service Health included | No two-sided data-plane verdict, normalized App Insights pack, or durable external store (F2–F6/F12) | EXTEND |
-| `[MAIN] copilot-cli-plugin/agents/start-chaos.md` | Top-level agent instructions for the shipped workflow | Preserves the guided path | Needs runtime tool preflight and new evidence/verdict contracts | EXTEND |
-| `[MAIN] copilot-cli-plugin/scripts/Ensure-AzLogin.ps1`, `copilot-cli-plugin/scripts/Invoke-AzRest.ps1`, `copilot-cli-plugin/scripts/Invoke-AzChaos.ps1`, `copilot-cli-plugin/scripts/Wait-AzureLro.ps1` | Auth, ARM/CLI invocation, Chaos extension bootstrap, LRO polling | Central retry/invocation seams; cross-platform | API/version and provenance metadata are distributed | EXTEND |
-| `[MAIN] copilot-cli-plugin/scripts/Rbac.ps1`, `copilot-cli-plugin/scripts/Validate-AndFix.ps1` | RBAC preflight/remediation and validate/fix/revalidate | Existing exact remediation helpers and strict validation flow | Auto-fix is broad; targeted validation output should be preferred | REFACTOR |
-| `[MAIN] copilot-cli-plugin/scripts/State.ps1`, `copilot-cli-plugin/scripts/Render.ps1`, `copilot-cli-plugin/scripts/New-RunReport.ps1` | JSON state, terminal rendering, run report | Reusable and already integrated | Repo/session-local default does not survive F12-class cleanup | EXTEND |
-| `[MAIN] copilot-cli-plugin/.chaos-plugins.yaml.example` | Optional API/polling/workspace/state overrides | Existing compatibility/configuration surface | No external evidence-root/retention or proof policy | EXTEND |
-| `[MAIN] copilot-cli-plugin/skills/chaos-impact/schema/impact-report.schema.json` | `impactReportSchemaVersion: 1` contract | Stable machine-readable sidecar | Not a verdict/evidence-bundle schema | EXTEND |
-| `[MAIN] copilot-cli-plugin/skills/chaos-impact/templates/{kql,metrics}/**`, `copilot-cli-plugin/skills/chaos-impact/templates/report.md.tmpl` | KQL, metric defaults/thresholds, report rendering | Service/resource-specific reusable knowledge | App Insights classic normalization and proof predicates are incomplete | EXTEND |
-| `[MAIN] copilot-cli-plugin/skills/chaos-impact/scripts/{Constants,Get-DiagnosticSettings,Get-MonitorSignals,Build-ImpactCorrelation,New-ImpactReport,Invoke-ChaosImpact}.ps1` | Six-surface collection, correlation and report pipeline | Alerts fallback, Service Health separation, query trail, partial-mode handling | Fault-window normalization and data-plane proof are not first-class | EXTEND |
-| `[MAIN] copilot-cli-plugin/skills/chaos-impact/tests/*.Tests.ps1` | Unit/regression coverage for impact scripts | Existing Pester investment | Needs F1–F15 regressions and compatibility assertions | EXTEND |
-| `[MAIN] copilot-cli-plugin/skills/chaos-impact/tests/e2e/OfflineReplayE2E.Tests.ps1`, `copilot-cli-plugin/skills/chaos-impact/tests/e2e/Run-OfflineReplay.ps1`, `copilot-cli-plugin/skills/chaos-impact/tests/e2e/recorded-*.json`, `copilot-cli-plugin/skills/chaos-impact/tests/e2e/expected-impact.json` | Hermetic replay and golden expected impact | Network-free, recorded evidence | Covers impact path, not all targeted contracts | EXTEND |
-| `[MAIN] copilot-cli-plugin/mcp/chaos_mcp/server.py` | **All 15 `@mcp.tool()` registrations** and 12 Chaos/auth implementations plus 3 monitor wrappers | Single registry; stable envelope; direct lifecycle coverage | Missing additive proof/pack tools and stronger run identity | EXTEND |
-| `[MAIN] copilot-cli-plugin/mcp/chaos_mcp/azure.py` | CLI/MSI token acquisition, ARM/LA HTTP, retry/LRO, `_TEST_TRANSPORT` | Offline-test seam; structured `AzureError` | API pins distributed; list/paging/provenance helpers limited | EXTEND |
-| `[MAIN] copilot-cli-plugin/mcp/chaos_mcp/monitor.py` | Helpers called by the 3 monitor wrappers | Correct metrics/logs/Activity Log request construction and envelope | No alert-instance/App Insights normalization/fault-window pack (F2–F4) | EXTEND |
-| `[MAIN] copilot-cli-plugin/mcp/tests/test_auth_mode.py`, `copilot-cli-plugin/mcp/tests/test_monitor_tools.py` | Auth/tool tests; monitor happy/error/retry tests; tool-list count | Hermetic pytest and explicit 15-tool registry assertion | Ten lifecycle tools lack direct tests | EXTEND |
-| `[MAIN] copilot-cli-plugin/mcp/pyproject.toml`, `copilot-cli-plugin/mcp/README.md`, `copilot-cli-plugin/mcp/mcp-config.example.json`, `copilot-cli-plugin/mcp/LICENSE`, `copilot-cli-plugin/mcp/chaos_mcp/__init__.py` | Package/version/entry point, operator docs/config, package identity | `chaos-mcp` console script; Python 3.10+; MCP guidance | Actual PyPI publication/runtime installation is not proved by source | EXTEND |
-| `[MAIN] copilot-cli-plugin/plugin.json` | Registers `skills/`, `agents/`, and `mcpServers.chaos-studio` command `chaos-mcp` | One installable plugin surface | Registration does not prove a given runtime session exposes any tool (F5) | EXTEND |
-| `[MAIN] .github/plugin/marketplace.json` | Marketplace metadata/version | Version aligned at 0.3.0 | Must remain lockstep with package/manifest | EXTEND |
-| `[MAIN] copilot-cli-plugin/README.md`, `copilot-cli-plugin/CHANGELOG.md`, `copilot-cli-plugin/CONTRIBUTING.md`, `copilot-cli-plugin/docs/impact-synthesis-skill.md` | User, release, contributor, and impact docs | Documents both skill/MCP surfaces and impact output | Some historical counts/names drift; targeted evolution needs explicit compatibility docs | EXTEND |
-| `[MAIN] .github/workflows/test.yml` | Pester on ubuntu/windows/macos; pytest Python 3.10–3.13; ruff | Cross-OS/cross-version matrices | Needs compatibility/contract regressions, not replacement | EXTEND |
-| `[MAIN] .github/workflows/release.yml` | Builds sdist/wheel, publishes `chaos-mcp`, creates GitHub release | Existing release automation | Workflow presence does not prove current PyPI publication status | RETAIN AS-IS |
-| `[MAIN] .github/dependabot.yml` | Weekly pip and GitHub Actions updates | Existing dependency hygiene | No field-derived gap | RETAIN AS-IS |
+- `mcp/chaos_mcp/apiversions.py` (51 lines) — all Python ARM api-version pins consolidated; a lint test asserts no pin is dead and no literal escapes the module.
+- `mcp/tests/test_lifecycle_contract.py` (844 lines) and `mcp/tests/test_tool_manifest.py` (318 lines) — the previously untested ten lifecycle tools now have recorded coverage; `FROZEN_SKILLS` pins real normalised description strings for all five skills.
+- `scripts/Preflight.ps1` (152 lines) — `Get-PreflightFailurePrefix`, `Get-SkillRequiredTools`, `Test-RequiredTools`, `Assert-RequiredTools`. Reads the **host-visible** tool inventory; never introspects the server.
+- `requiredTools:` front-matter added to all five `SKILL.md` files; `skills/start-chaos/tests/Preflight.Tests.ps1` (194 lines) pins the contract in Pester.
+- `mcp/pyproject.toml` — `jsonschema` promoted to a hard test dependency.
+- Gate on this machine: pytest 104 passed, ruff clean, Pester 112 passed / 0 failed.
 
-#### Exact current-state 15-tool matrix
+#### `[E2]` — EPIC-002, commit `4befd5e`, "Compatible state and durable evidence"
 
-All **15 decorators are in `[MAIN] copilot-cli-plugin/mcp/chaos_mcp/server.py`**. `monitor.py` contains helpers called by the final three wrappers; it contains **no decorators**. Every tool returns `{"ok": true, "result": ...}` or an `{"ok": false, "errorType": ..., "error": ...}` envelope. Chaos/auth tools currently use `AzureError`; monitor helpers additionally classify HTTP 401/403 as `AuthenticationFailed`/`PermissionDenied`. Additive work preserves these envelopes.
+- `mcp/chaos_mcp/evidence.py` (870 lines) — a durable store at `$CHAOS_EVIDENCE_ROOT/<scopeHash>/<runId>/{artifacts,raw,rendered}` with three load-bearing properties: **path canonicalization** (absolute/UNC/`..`/symlink-escape all rejected), a **key denylist** (`$CHAOS_KEY_DIR` unreachable), and **redaction on write and on read** by key name and by value shape (bearer, JWT, hex ≥32, base64 ≥40). Atomic temp-file + `os.replace` under an exclusive lock, with a monotonic revision counter and lost-update detection. Env: `CHAOS_EVIDENCE_ROOT`, `CHAOS_KEY_DIR`, `CHAOS_EVIDENCE_RETENTION_DAYS` (default 90), `CHAOS_EVIDENCE_DISABLED`.
+- `scripts/State.ps1` (+419/−26) — `Get-EvidenceRoot`, `Get-EvidenceScopeHash`, `Save-StateToEvidence`, `Mirror-State`, `Import-State`; the PowerShell redaction lists mirror the Python ones. `$env:STARTCHAOS_STATE_PATH` remains the source of truth and is unchanged.
+- Nine v1 artifact schemas in `copilot-cli-plugin/schemas/`: `availability`, `diagnosis`, `evidence-bundle`, `hypotheses`, `inventory`, `mechanism-ledger`, `recommendations`, `run-record`, `scope-setup`. All share the envelope `artifactSchemaVersion, artifactType, scopeId, runId, generatedAt, provenance, warnings` plus one payload key.
+- Three MCP tools added (`chaos_evidence_put` / `_get` / `_list`) taking the registry from 15 to 18.
+- `references/chaos/evidence-contract.md` (180 lines), `references/chaos/verdict-matrix.md` (64 lines).
+- `mcp/tests/test_evidence.py` (830 lines), `skills/start-chaos/tests/State.Tests.ps1` (337 lines).
+- Gate: pytest 193 passed / 1 skipped, ruff clean.
 
-`plugin.json` registers `skills/`, `agents/`, and `mcpServers.chaos-studio.command = "chaos-mcp"`. That registration makes tools installable; it does **not** guarantee that a particular runtime session connected the server or surfaced every tool (F5).
+#### `[E3]` — EPIC-003, commit `283cb61`, "Validation blockers, blast radius, consent" (uncommitted at planning time; landed in Phase 0)
 
-In the matrix, **Manifest/skill availability** means the server is registered once for the plugin and the named skill documentation recommends the MCP tool as the autonomous alternative. The interactive skill scripts remain a separate PowerShell surface; they do not invoke the Python MCP server internally.
+- `scripts/Render.ps1` (**+224 lines on the pre-existing 214-line `[MAIN]` file; 438 lines on the working tree**) — adds `Resolve-BlastRadius` and `Write-BlastRadiusCard` beside the existing `Write-Card`, `Write-Table`, `Write-Error-Card`. No ANSI; Markdown for CLI rendering.
+- `scripts/Validate-AndFix.ps1` (+250/−9) — `Test-StructuredValidationError`, `ConvertTo-ValidationBlocker`, `Build-RoleAssignmentRemediation`, full validate → fix → revalidate loop, and the **broad-fix consent gate** (`$env:STARTCHAOS_CONSENT_BROAD_PERMISSION_FIX`, setup exit code 4).
+- `scripts/Rbac.ps1` (+74) — `Build-TargetedGrantProposal`, a pure function producing minimum-scope `az role assignment create` commands from normalised blockers, mirrored by `build_targeted_grant_proposal()` in `server.py`.
+- `references/chaos/blast-radius.md` (198 lines; untracked at planning time, tracked in `283cb61`) — include/exclude precedence (empty include = all in scope; exclude always wins), the Candidate/Include/Exclude/Affected/Leg/Starved vocabulary, and the load-bearing honesty note: **`resourceTargeting` is advisory and is never transmitted to the service — `az chaos scenario config create` accepts no include/exclude.**
+- New Pester suites: `skills/setup-scenario/tests/{BlastRadius,PermissionBlockers,SetupExitContract}.Tests.ps1`, `skills/run-scenario/tests/PreExecuteGate.Tests.ps1`.
+- `server.py` (+188) and `mcp/tests/test_lifecycle_contract.py` (+259) — normalised blockers and the targeted-grant proposal surfaced on `chaos_validate_scenario_configuration`, with recorded coverage.
+- `skills/setup-scenario/SKILL.md` (+70) and `skills/run-scenario/SKILL.md` (+38) — the growth that motivates **P2** and **D3**.
+- `skills/setup-scenario/scripts/Invoke-SetupScenario.ps1` (+88/−…) — wires the validate → fix → revalidate loop and the broad-fix consent gate into the skill; this is where exit codes `2`, `3` and `4` are emitted (lines 139, 175, 313).
+- `skills/run-scenario/scripts/Invoke-RunScenario.ps1` (+13/−…) — the pre-execute gate that refuses to run against an unvalidated or drifted configuration.
+- Working-tree total at planning time: **9 modified files, +1180 / −24**, plus 5 untracked files (`references/chaos/blast-radius.md` at 198 lines and four Pester suites totalling 1,242 lines — 1,440 lines in all). This work was Phase 0's only job and is **now committed at `283cb61`, with all five formerly untracked files tracked**.
 
-| Tool | Parameters (current signature) | Current output/behavior | Implementation | Manifest/skill availability | Tests on main | Proposed additive/breaking change |
-|---|---|---|---|---|---|---|
-| `chaos_set_auth_mode` | `mode`, `msi_client_id=None` | Sets session override; returns effective `{mode, msiClientId, source}` | `server.py` → `azure.py` | MCP README; server registered, not host-guaranteed | `test_auth_mode.py` | Preserve name/signature/envelope; add preflight/docs only; **no breaking change** |
-| `chaos_get_auth_mode` | none | Returns effective auth config | `server.py` → `azure.py` | MCP README; server registered, not host-guaranteed | `test_auth_mode.py` | Preserve unchanged |
-| `chaos_create_workspace` | `subscription_id`, `resource_group`, `workspace_name`, `location`, `scopes`, `identity_type="SystemAssigned"`, `user_assigned_identity_resource_id=None` | PUT + LRO + GET; grants workspace identity Reader on scopes | `server.py` + `azure.py` | `create-workspace`, `start-chaos`, README | No direct lifecycle test | Add optional provenance/dry-run fields only if backward compatible |
-| `chaos_get_workspace` | `subscription_id`, `resource_group`, `workspace_name` | GET workspace | `server.py` + `azure.py` | README/start workflow | No direct lifecycle test | Preserve; enrich result only additively |
-| `chaos_refresh_recommendations` | `subscription_id`, `resource_group`, `workspace_name` | POST `refreshRecommendations`, wait, GET `evaluations/latest` | `server.py` + `azure.py` | `setup-scenario`, README | No direct lifecycle test | Retain canonical current name; additive freshness/provenance fields |
-| `chaos_list_recommended_scenarios` | `subscription_id`, `resource_group`, `workspace_name` | GET scenarios; returns `value[]` | `server.py` + `azure.py` | `setup-scenario`, README | No direct lifecycle test | Extend returned metadata; do not rename initially |
-| `chaos_create_scenario_configuration` | `subscription_id`, `resource_group`, `workspace_name`, `scenario_name`, `configuration_name`, `configuration` | PUT + LRO + GET final configuration | `server.py` + `azure.py` | `setup-scenario`, README | No direct lifecycle test | Preserve; support explicit targeting/exclusions through existing body |
-| `chaos_validate_scenario_configuration` | `subscription_id`, `resource_group`, `workspace_name`, `scenario_name`, `configuration_name` | POST validate + LRO + GET configuration-scoped `validations/latest` | `server.py` + `azure.py` | `setup-scenario`, run flow, README | No direct lifecycle test | Preserve; expose normalized errors additively |
-| `chaos_fix_resource_permissions` | same five identity fields, `what_if=False` | POST broad fix + LRO + GET latest fix result | `server.py` + `azure.py` | `setup-scenario`, README | No direct lifecycle test | Retain behind explicit consent; prefer targeted guidance; no initial deprecation |
-| `chaos_execute_scenario` | `subscription_id`, `resource_group`, `workspace_name`, `scenario_name`, `configuration_name` | POST execute; parse Location or choose newest matching config run; returns `scenarioRunId` or error | `server.py` + `azure.py` | `run-scenario`, `start-chaos`, README | No direct lifecycle test | Add request timestamp/retry and optional identity metadata in result; signature/envelope stay |
-| `chaos_get_scenario_run` | `subscription_id`, `resource_group`, `workspace_name`, `scenario_name`, `scenario_run_id` | GET one run snapshot | `server.py` + `azure.py` | `run-scenario`, README | No direct lifecycle test | Add normalized action identity fields without removing raw payload |
-| `chaos_cancel_scenario_run` | `subscription_id`, `resource_group`, `workspace_name`, `scenario_name`, `scenario_run_id` | POST best-effort cancel; returns `cancelRequested` | `server.py` + `azure.py` | `run-scenario`, README | No direct lifecycle test | Preserve semantics; actual service cancellation behavior remains open |
-| `monitor_query_metrics` | `resource_id`, `metric_names`, `start_time`, `end_time`, `aggregation="Average"`, `interval="PT1M"` | Validates names; Monitor metrics query | `server.py` wrapper → `monitor.py` | `chaos-impact`, README | `test_monitor_tools.py` | Preserve; compose into new pack |
-| `monitor_query_logs` | `workspace_id`, `kql`, `timespan=None` | Validates KQL; Log Analytics POST | `server.py` wrapper → `monitor.py` | `chaos-impact`, README | `test_monitor_tools.py` | Preserve raw escape hatch; add distinct App Insights normalizer |
-| `monitor_search_activity_log` | `subscription_id`, `start_time`, `end_time`, `resource_uri=None` | OData Activity Log query; returns `{count, events}` | `server.py` wrapper → `monitor.py` | `chaos-impact`, README | `test_monitor_tools.py` | Preserve; never treat as fault-landed proof |
+#### Current `SKILL.md` sizes (measured on the working tree)
 
-### Prior art — `[PR32 PROTOTYPE]`, never merged
+| Skill | Lines |
+|---|---|
+| `setup-scenario` | **181** |
+| `run-scenario` | 133 |
+| `start-chaos` | 119 |
+| `chaos-impact` | 111 |
+| `create-workspace` | 106 |
 
-PR #32 / branch `renzopretto-microsoft-add-chaos-loop-plugin` introduced `chaos-loop`, internal phases, `chaos_loop_state.py`, three schemas, and reference documents. **None of those paths exist on `[MAIN]`. Do not port the never-merged prototype; evolve current shipped assets.**
+`setup-scenario` at 181 lines is the warning sign: EPIC-003 added 69 lines of blast-radius and consent narrative to a file that is a *front door*. The under-200-line cap plus progressive discovery is a direct response to this trajectory.
 
-Useful patterns to re-express in `[MAIN]` assets are the proposal/evaluate split, locked revisioned writes, evidence invariants, `frozenValidation`, the three-verdict vocabulary, and the verify-mode changed-path rule. `[PR32 PROTOTYPE]` artifacts that are explicitly **not ported** are:
+### `az chaos` and Kubernetes — what is actually available
 
-- the monolithic `chaos-loop` controller and `advisory`/`coding` phases;
-- `references/chaos-loop/scenario-catalog.v1.json` and `.md` — **do not port** the prototype catalog; there is nothing to delete from main;
-- repo-local `tmp/chaos-loop/...` state;
-- the all-or-nothing external gate and monolithic run-state schema.
+Verified against Microsoft Learn (see §References for every URL):
 
-### Why evolve now
+1. **The `chaos` CLI extension has been rewritten around Chaos Studio v2** and requires Azure CLI ≥ 2.75.0. The current surface is `az chaos setup`, `az chaos workspace *`, `az chaos scenario *`, `az chaos scenario config *`, `az chaos scenario run *`, `az chaos discovered-resource *`. `az chaos setup` is GA; `show-discovery`, `show-evaluation`, `workspace wait` are GA; the rest of workspace/scenario is preview.
+2. **The classic CLI commands are gone.** `az chaos experiment`, `az chaos target`, `az chaos capability`, `az chaos target-type` no longer appear in the extension reference and their Learn pages 404. The classic model is still reachable **only via REST / `az rest`** at `api-version=2024-01-01` or `2025-01-01`.
+3. **The v2 workspace/scenario ARM surface is a preview-only surface, and the repository is not on the newest pin.** `mcp/chaos_mcp/apiversions.py:21` and `skills/chaos-impact/scripts/Constants.ps1:36` both pin **`2026-05-01-preview`**, with an in-code comment deferring a bump until a target environment has exercised the required operations. External spec research also confirms a later **`2026-08-01-preview`**. **This plan keeps the shipped `2026-05-01-preview` pin for v0.4.0**; bumping it is an explicit, evidence-gated task (E15-T7), not an assumption. Source proves a version exists; it does not prove an operation is deployed.
+4. **All eight AKS Kubernetes faults are Chaos Mesh service-direct faults at capability version 2.2**, under target type `Microsoft-AzureKubernetesServiceChaosMesh` on `Microsoft.ContainerService/managedClusters`: `podChaos`, `networkChaos`, `stressChaos`, `IOChaos`, `timeChaos`, `kernelChaos`, `httpChaos`, `dnsChaos`. Every one takes a single `jsonSpec` parameter carrying a minified Chaos Mesh CRD spec (no `metadata`, no `kind`). Prerequisites: Chaos Mesh installed in the `chaos-testing` namespace, Linux node pools only, target + capability enablement, and — for DNS chaos — the separate Chaos Mesh DNS service.
+5. **No native (Chaos-Mesh-free) Kubernetes faults are documented or announced.** No node restart, node drain, node-pool scale, or agentless AKS fault appears in the fault library, the v2 Scenarios catalog, or `Azure/chaos-studio-samples`. The only Kubernetes-adjacent faults without Chaos Mesh are `Microsoft-NetworkSecurityGroup` security-rule faults and VMSS shutdown (AKS node pools are VMSSs; the v2 "Compute Zone Down" scenario uses this).
+6. **The v2 Scenarios catalog contains no AKS scenario templates.** Listed scenarios target VMs, VMSSs, databases, caches, messaging and App Service.
 
-1. `[MAIN]` proves the end-to-end workspace/scenario/run and impact paths already work as a shipped plugin; hardening can be incremental.
-2. `[NEW]` can build on service-returned recommendation/scenario/configuration data and existing validation rather than prompt-side catalogs.
-3. Field evidence F1–F15 identifies concrete gaps in proof, durability, telemetry normalization and tool visibility without invalidating the current workflow.
-4. Workspace/service API availability, retention/cancel semantics, preview operation availability, and actual PyPI publication status remain open until verified in the target runtime; source alone does not settle them.
+**The consequence is the central near-term design tension, and it is stated plainly rather than assumed away:** the plugin drives the v2 workspace/scenario surface, but the Kubernetes faults that make a Kubernetes reliability study interesting live in the *classic* model, which no longer has a CLI. The design therefore carries an explicit `faultPath` (`scenario` | `experiment`) resolved by a runtime capability probe, not a guess. See **Q1**, **D5** and **EPIC-005**.
 
-### Field evidence — a real engagement
+The task brief refers to "upcoming Kubernetes faults". Public sources at this date do not describe any. This plan **does not encode unannounced faults**; it makes the guidance structure additive so that when they ship, a Kubernetes fault is a new reference file plus a routing-table row, and nothing else. That gap is **Q2**, owned by Chaos Studio product.
 
-The following observations come from an engineer running the Chaos Loop skills against a live workload. They are cited throughout this document as **F1–F15** and are the primary motivation for several requirements that would otherwise look like gold-plating.
+### Field evidence (condensed)
 
-| ID | Observation | Consequence |
+Fifteen observations from a live engagement continue to motivate specific requirements. The full narrative is preserved in the Revision 5 history; the load-bearing subset is:
+
+| ID | Observation | What it still forces |
 |---|---|---|
-| **F1** | No build-identity attestation existed. The running build was ultimately identified *behaviourally*, by the disappearance of `ServiceBusReceiver.Peek` dependency spans. No `/version` endpoint, ACR tags were timestamps, VMSS `customData` was null. | Largest single time sink of the engagement; the `external-gate` demand for artifact→deployment→serving-revision proof was unsatisfiable. |
-| **F2** | The same pre/during/post telemetry bundle (requests, dependencies, customMetrics, fired alerts) was hand-assembled four times across three runs. | Pure repeated toil; high transcription-error risk. |
-| **F3** | "Did an alert instance fire inside the window" — the core acceptance predicate — required dropping to `az rest` against `Microsoft.AlertsManagement` with a hand-built `timeRange` filter. | Core predicate had no first-class tool. |
-| **F4** | App Insights querying failed three times before returning data. Two causes are confirmed: `--subscription` had to be supplied even though the resource ID contains it; and resource-scoped queries silently need the **classic** schema (`dependencies`, `customMetrics`, `requests`, lowercase columns), not `AppDependencies`/`AppMetrics`. A third cause was originally recorded as "`first` is a reserved token" — see the correction note below. | Schema knowledge lived only in the engineer's memory file. |
-| **F5** | The `diagnostic` skill instructed use of `monitor_query_logs` / `monitor_query_metrics` / `monitor_search_activity_log` "from the bundled chaos-studio MCP server". **Those tools were not present in the session's tool list.** | A skill naming non-existent tools is a silent trap; the engineer substituted `az` by hand. |
-| **F6** | Chaos reported the Event Hubs entity status as `Disabled` — a control-plane assertion. `EventHubProducerClient.Send` was **60/60 successful** in the same window (58/0 in the prior run). The dependency was never disrupted. | **Both Event Hubs verdicts across two runs were unsound.** The originally recorded mechanism (`AmqpSender` caching `MaxMessageSize`) has been falsified — see the correction note below. The surviving, unfalsified part of the observation is that **an already-open AMQP producer link was not torn down by disabling the namespace**, which is exactly the class of SDK/service behaviour oracle that no code review catches. |
-| **F7** | In run `f7cf6241`, `scenarioRunSummary[].actionName` came back **null for all three actions**. The engineer could not tell which leg was which from `run show` and had to infer from per-resource-type ARM polls. Separately, `run start --no-wait` returns an empty 2xx **with no run id**, forcing a `run list` filtered on `startTime` after every start. | Service bugs that directly obstruct evidence collection. |
-| **F8** | Per-fault semantics are undocumented, `config validate` was unreachable from the agent's write allow-list, and exclusion-based leg starvation — the only way to isolate a single dependency — was undiscoverable. | Correct experiment design was not reachable from the tool surface. |
-| **F9** | Azure Advisor was an **anti-correlation**: 16 HighAvailability recommendations on the resource group, **zero** matched any finding. Its nearest item, "Enable automatic repair policy on VMSS", was already satisfied — and auto-repair is driven by the `/health/ready` probe that this very investigation proved blind. | Advisor reasons about configuration *shape*; chaos findings are about *behaviour under fault*. Acting on Advisor here would have been a no-op that increased false confidence. |
-| **F10** | Advisory A3's acceptance predicate (`dependency.ready → 0`) was formally valid and completely failed to detect that the new probe code was a no-op. Zero dependency spans from an "active" probe means it is not on the data plane. | A predicate can be valid and useless; the mechanism itself must be proven live. |
-| **F11** | Three advisories failed for the same reason with three different implementations: `IsClosed` flags → `$management` round-trip → cached batch creation. All three were "a probe answerable from local state." `attemptedFixes` recorded the fixes, not the class. | The no-repeat rule keyed on the wrong field. |
-| **F12** | `tmp/` was wiped twice. The second wipe also took `memories/sessionInsights/`; only `memories/synthesizedKnowledge/` survived. | Cost two runs, forced manual mode, and thereby lost the verify-mode rule that would have caught F10. |
-| **F13** | A3 was ranked last (score 6.0) as "changes no signal the platform consumes" — true only until A2 shipped a reader. A2 without A3 was *worse than no signal*: a confidently green dashboard during a total outage. | Probe-accuracy fixes must be ranked and shipped jointly with their consumer. |
-| **F14** | The `diagnostic` verify-mode rule was correct and load-bearing: A3 emitted zero dependency spans, so the correct verdict was `NOT EXERCISED` routed to an exercise-repair brief — not the `REFUTED` reached manually. | The loop already encoded the needed control; manual mode lost it. |
-| **F15** | Two facts lived only in the engineer's personal memory file: prove fault-landed from **ARM entity state, not the Activity Log**; and **re-poll the NSG leg**, because an empty first read is a false negative. | Undocumented tribal knowledge determining verdict soundness. |
+| **F1** | No build-identity attestation; the running build was identified behaviourally | Report must record *what was running*, with a rung and caveats — **DEFERRED to a report field, not a gate** |
+| **F2** | The same pre/during/post telemetry bundle was hand-assembled four times | One deterministic window-pack collector (FR-11) |
+| **F3** | "Did an alert fire inside the window" needed raw `az rest` with a hand-built `timeRange` | Alert-instance collection is first-class in the collector |
+| **F4** | App Insights resource-scoped queries need `--subscription` injected and the **classic** lowercase schema | Two verified normalisations only; the third ("`first` is reserved") was **falsified** and is not implemented |
+| **F5** | A skill named three MCP tools that were absent from the session | Tools are **optional** and probed, never assumed (D6) |
+| **F6** | Event Hubs reported `Disabled` while `EventHubProducerClient.Send` was 60/60 successful | Control-plane state is not disruption proof; findings say so (D8) |
+| **F7** | `scenarioRunSummary[].actionName` null on all actions; `run start --no-wait` returns an empty 2xx with no run id | Deterministic run-ID recovery and honest action labelling (FR-13) |
+| **F8** | Per-fault semantics undocumented; exclusion-based leg starvation undiscoverable | The fault guidance pack (EPIC-005) |
+| **F9** | Azure Advisor was an anti-correlation: 16 recommendations, zero matches | Advisor is not a grounding source (N7) |
+| **F10** | A formally valid predicate failed to detect that a probe was a no-op | Findings carry a "was the mechanism live?" caveat |
+| **F11** | Three advisories failed for one underlying reason recorded as three fixes | Findings are classed, not enumerated |
+| **F12** | `tmp/` was wiped twice, destroying two runs of evidence | The immutable dated study store (FR-14, EPIC-004) |
+| **F13** | A fix scored in isolation ranked last, then became the correctness blocker for a higher-ranked fix | Findings are prioritized with coupling noted |
+| **F14** | The verify-mode rule was correct and load-bearing; manual mode lost it | Limitations section of the report is mandatory |
+| **F15** | Prove landing from ARM entity state, not the Activity Log; re-poll empty first reads | Collector re-polls; Activity Log is context, never proof |
 
-#### Corrections to the field record (external verification)
+Two recorded *explanations* were falsified by later verification and are retained as rejected mechanisms so they are not re-derived: the `AmqpSender`/`MaxMessageSize` caching theory for F6 (`AmqpProducer.CreateLinkAndEnsureProducerStateAsync` refreshes it on every link open), and "`first` is a KQL reserved token" for F4 (`--first` is an Azure CLI/ARG paging parameter mapping to REST `$top`). The **observations** stand; the mechanisms do not.
 
-Field evidence is observational and was recorded under time pressure. Two of the *explanations* attached to it have since been falsified. The **observations** stand; the **mechanisms** do not, and this distinction matters because the plan turns mechanisms into normative documents.
+### PR #32 disposition
 
-| Item | Recorded explanation | Verification result | Consequence for this plan |
-|---|---|---|---|
-| **F4-c** | "`first` is a reserved token in KQL." | **Falsified.** `first` is not a KQL keyword or operator (KQL uses `take`/`limit`; `arg_min`/`arg_max` for first-row selection). `--first` is an **Azure CLI / Azure Resource Graph** paging parameter mapping to REST `$top`, with a documented maximum of 1000. The most probable real cause is CLI argument parsing, not KQL syntax. | **No escaping layer is built.** `monitor_query_appinsights` implements only the two verified fixes (subscription injection, classic resource-scoped schema). Re-deriving the third failure is **Q11**, and the regression test is renamed accordingly. |
-| **F6** | "`AmqpSender` caches `MaxMessageSize` after first attach." | **Falsified.** In `Azure.Messaging.EventHubs`, `AmqpProducer.CreateLinkAndEnsureProducerStateAsync` sets `MaximumMessageSize` on **every** link open, with the explicit source comment *"Update the known maximum message size each time a link is opened, as the configuration can be changed on-the-fly and may not match the previously cached value."* (`InitializedPartitionProperties` *is* cached once; `MaximumMessageSize` is not.) | The **observation** — namespace `Disabled` with 60/60 successful sends — is unaffected and remains the canonical motivating case for two-sided attestation. The **seed entry** of `fault-semantics.md` is rewritten to state only what is observed, with the candidate mechanism marked `mechanismConfidence: unverified`. |
-| **F6 (secondary)** | "Disabling a namespace does not force-detach an open AMQP producer link." | **Uncertain.** Plausible and consistent with the observation, but not documented by Microsoft. | Recorded in `fault-semantics.md` as `observed` with `mechanismConfidence: unverified`, and raised as **CS-5** for the Event Hubs/Chaos teams to confirm. |
+`[PR32]` / `renzopretto-microsoft-add-chaos-loop-plugin` introduced a single `chaos-loop` skill with internal `advisory`/`coding` phases, a monolithic `chaos_loop_state.py` state machine, repo-local `tmp/chaos-loop/` state, a hard-coded `scenario-catalog.v1.json`, and an all-or-nothing external gate.
 
-**Rule adopted from this exercise, and enforced in `fault-semantics.md`:** every entry separates `observedEffect` (what was measured, with citations) from `candidateMechanism` (why we think it happened) and carries a `mechanismConfidence` of `verified` \| `plausible` \| `unverified`. Only `observedEffect` may drive a verdict. A behaviour oracle seeded with a misattributed mechanism is worse than an empty one.
+**Decision: the PR is rescoped and replaced, not extended.** None of its paths exist on main, so nothing is deleted. Its state machine is not ported and is not the basis of any epic here. Four *patterns* are re-expressed in the new design and credited: atomic revisioned writes (already delivered in `[E2]`), the proposal/evaluate split (D9), the frozen-configuration drift gate (RETAINED from `[E3]`/`[MAIN]`), and the three-verdict vocabulary (RESHAPED into finding confidence, D8). The hard-coded catalog, the phase controller and the repo-local state are **REMOVED from the plan of record**.
 
 ---
 
 ## Problem Statement
 
-**P1 — `[PR32 PROTOTYPE]` monolithic control.** The never-merged prototype exposed one skill (`chaos-loop`) covering nine journey steps. This is prior-art evidence, not current-main behavior.
+**P1 — The plan outgrew the product.** Revision 5 specified eight new peer skills on top of five shipped ones — thirteen user-facing front doors for a workflow a user experiences as one question ("is my cluster resilient?"). Skill selection becomes ambiguous, and no single skill is the obvious place to start. **The honest arithmetic of the fix:** this design takes the count from thirteen to **ten**, not to five. The five shipped skills are the low-level verbs and stay unchanged in v0.4.x for backward compatibility (NFR-10, Q12); the five new ones are the workflow and are the only ones documented and marketed as the way in. Ten front doors is not the end state — Q12 owns the v0.5 decision — but ten with one obvious entry point is a different problem from thirteen with none.
 
-**P2 — `[PR32 PROTOTYPE]` fabricated scenario knowledge.** Its `scenario-catalog.v1.json` hard-coded eleven scenario families. It is not on main and must not be ported.
+**P2 — The prompt surface is growing instead of shrinking.** `setup-scenario/SKILL.md` reached 181 lines because EPIC-003 pushed blast-radius and consent narrative into a front door. Front doors that carry scenario-specific detail cannot stay principle-led, and every new fault type makes them worse.
 
-**P3 — Control-plane assertions masquerading as disruption proof.** Chaos reports what it *intended* to mutate. F6 proves that intent ≠ effect: an entity marked `Disabled` while its producer link kept succeeding 60/60. Nothing in the current or prototype design distinguishes control-plane mutation from data-plane disruption, so verdicts can be — and were — unsound.
+**P3 — There is no deliverable.** The suite produces JSON artifacts and a Markdown run report. Nobody schedules a reliability review around a JSON artifact. The unit a team actually consumes is a dated report with findings, evidence and remediation.
 
-**P4 — Build identity is unprovable.** F1: the gate demanded artifact → deployment → serving-revision proof with no defined fallback. In practice this is either unsatisfiable (making the gate a blocker) or silently skipped (making it theatre).
+**P4 — Results are not addressable over time.** `[E2]` made evidence *durable*, keyed by `runId`. It did not make results *immutable*, *dated*, or *enumerable as studies*. A new conversation cannot answer "what did we test last month, and did it get better?"
 
-**P5 — Telemetry assembly is manual and schema-fragile.** F2 and F4: the same pre/during/post bundle was hand-built four times, and App Insights schema quirks cost three failed calls per attempt. `monitor_query_logs` is a raw KQL passthrough that provides none of this.
+**P5 — MCP is on the critical path when it should not be.** `[E1]` made every skill declare `requiredTools` and fail fast when the host does not expose them. That was the correct fix for F5 in a plan where MCP owned the deterministic layer. In a product built over `az chaos`, it converts an optional accelerator into a hard dependency and a hard failure.
 
-**P6 — Core predicates lack tools.** F3: alert-instance queries required raw `az rest`. F7: run-ID recovery required a `run list` filtered on `startTime` after every start, and `actionName` was null so per-leg attribution required inference.
+**P6 — Kubernetes is unreachable from the shipped path.** The plugin drives v2 workspaces/scenarios; the v2 Scenarios catalog has no AKS templates; the eight AKS faults are classic-model and the classic CLI has been removed. A Kubernetes study today requires REST calls that the plugin explicitly forbids from skill prompt text.
 
-**P7 — Skills reference tools that may not exist.** F5: a skill named three MCP tools absent from the session. There is no declaration of required tools and no preflight reconciliation.
+**P7 — Fault knowledge has no home.** Per-fault semantics, safe parameter ranges, steady-state and impact signals, and abort conditions live in engineers' memory (F8, F15) or, worse, inside a `SKILL.md`. There is no versioned, discoverable, extensible structure.
 
-**P8 — Evidence durability gap.** F12 destroyed prototype/field `tmp/` evidence. `[MAIN]` improves this with configurable resumable `STARTCHAOS_STATE_PATH`, but has no default external evidence store and therefore still needs an additive mirror.
+**P8 — Control-plane assertions can masquerade as proof.** F6. The service reports what it intended to mutate. A report that presents intent as effect is worse than no report.
 
-**P9 — Grounding sources inverted.** F9: the prototype's `advisory` skill required "a directly matching Azure Advisor reliability recommendation, or one named WAF guideline when Advisor has no coverage." Advisor will nearly always have no coverage for behaviour-under-fault findings, so the exception clause is the default path. Meanwhile the genuinely valuable output — chaos evidence that a health probe is blind — has no path back into Advisor.
-
-**P10 — Weak no-repeat semantics.** F11: recording attempted *fixes* rather than failure *mechanism classes* let the same error class recur three times.
-
-**P11 — Ranking ignores consumer coupling.** F13: a fix scored in isolation was ranked last, then became the correctness blocker for a higher-ranked fix that shipped first.
+**P9 — The chaos-loop PR is a fork in the road that has not been closed.** Leaving it open invites someone to extend its state machine, which re-imports every problem above.
 
 ---
 
@@ -224,28 +217,30 @@ Field evidence is observational and was recorded under time pressure. Two of the
 
 ### Goals
 
-- **G1** — Eight independently invocable, user-facing skills, each owning exactly one journey step, each emitting a versioned JSON artifact and opinionated next-step guidance. No agent handoffs.
-- **G2** — Zero hard-coded runtime scenario catalogs. Scenario/action eligibility comes from service responses; the separate fault-semantics reference records observed effects/probes and never fabricates availability.
-- **G3** — Every recommendation carries evidence with provenance, freshness, and a confidence band; no recommendation may cite a scenario the service has not returned for that scope.
-- **G4** — Deterministic-by-default: discovery, eligibility joins, scoring, blast-radius computation, window arithmetic, fault-landed proof, work-starvation checks and verdict derivation are computed by code. The model produces only semantic analysis, hypotheses, and narrative.
-- **G5** — Fault-landed proof is **two-sided**: a control-plane attestation (ARM entity state, per F15 — not the Activity Log) *and* a per-leg data-plane disruption attestation. A run with control-plane-only proof yields `NOT EXERCISED` for that leg.
-- **G6** — Build identity is attested through a documented **fallback ladder** with the used rung recorded in the artifact (F1).
-- **G7** — A single `monitor_fault_window_pack` tool returns the complete pre/during/post evidence bundle for a run ID, on the correct App Insights schema, including fired alert instances (F2, F3, F4).
-- **G8** — Every skill declares its required MCP tools; a preflight reconciliation fails fast and names the missing tools (F5, F7-adjacent).
-- **G9** — Evidence is persisted to a durable, configurable store outside `tmp/`, mirrored after every phase, and re-openable by run ID in a later session (F12, P8).
-- **G10** — Verdicts are `CONFIRMED` / `REFUTED` / `NOT EXERCISED` only, computed by a deterministic matrix over numeric evidence.
-- **G11** — Chaos Studio product/service defects are tracked and reported separately from skill-instruction changes, with the plan degrading gracefully around each open defect.
+- **G1** — One obvious entry point. A user who says "run a chaos study on my AKS cluster" reaches `chaos-study` and needs to know nothing else.
+- **G2** — A small, coherent, composable suite: exactly five **study** skills, each independently useful, each invocable directly. The five shipped skills are unaffected and remain the low-level verbs (Q12), so v0.4.x ships ten user-facing skills in total — five marketed as the workflow, five retained for compatibility.
+- **G3** — Principle-led front doors. Every user-facing `SKILL.md` is under 200 lines, enforced mechanically rather than by review. Scenario- and fault-specific detail is reached by progressive discovery into `references/chaos/**`.
+- **G4** — Deterministic and safety-critical behaviour lives in reusable scripts under `copilot-cli-plugin/scripts/` and `skills/*/scripts/`, is unit-tested offline, and is never re-implemented in prompt text.
+- **G5** — Built directly over `az chaos` through the existing `Invoke-AzChaos.ps1` seam. No MCP server, no agent framework and no external service is required for the core workflow.
+- **G6** — A polished, self-contained HTML study report: tests run, dated evidence, prioritized findings, explicit limitations, and remediation guidance.
+- **G7** — Immutable, dated, enumerable study results outside repo-local and session-temporary state; a later chat can `list`, `compare` and `rerun`.
+- **G8** — Kubernetes reliability study is the first complete vertical slice, end to end, on real `az chaos` capabilities.
+- **G9** — An extensible fault/scenario guidance structure: a new fault is a new reference file plus a routing-table row.
+- **G10** — Every claim in a report carries provenance and freshness; missing data is `null` with a caveat, never a fabricated zero.
+- **G11** — Every mutation is disclosed; fault execution requires explicit human consent; broad permission grants require a separate, stronger consent.
+- **G12** — All delivered `[E1]`/`[E2]`/`[E3]` value is carried forward, with each asset explicitly classified RETAINED / RESHAPED / DEFERRED / REMOVED.
 
 ### Non-Goals
 
-- **N1** — Not a code-remediation agent. The prototype's `coding` phase and autonomous PR authoring are out of scope. `chaos-analyze` may describe a remediation; it does not implement one.
-- **N2** — No new Azure control-plane surface is designed here. Service-side gaps (§"Chaos Studio Product Issues") are filed, not built.
-- **N3** — Not a replacement for `chaos-impact`. Its schema, thresholds, KQL templates and offline-replay harness are retained and reused.
-- **N4** — No unattended, approval-free fault injection. Execution always crosses an explicit human approval boundary.
-- **N5** — No source-repository write access. Repositories are read-only inputs to analysis.
-- **N6** — Not an SLO management product. SLO/SLI definitions are consumed as inputs; the suite does not author them.
-- **N7** — No general Azure inventory tool. Inventory is scoped to what chaos targeting, telemetry correlation and blast-radius computation require.
-- **N8** — Advisor is not a grounding gate (F9). Advisor data is optional context and a *destination* for chaos findings, not a prerequisite.
+- **N1** — Not an SRE Agent feature. Nothing in the core workflow may depend on SRE Agent, its runtime, or its prompt conventions. The suite is a Copilot CLI plugin.
+- **N2** — Not an MCP product. The MCP server remains an **optional** adapter for hosts that prefer tool calls. It is never required.
+- **N3** — Not a controller or state machine. No `chaos-loop`, no phase engine, no monolithic run-state document.
+- **N4** — Not a code-remediation agent. Reports recommend; they do not open PRs or edit source.
+- **N5** — Not an SLO management product. SLOs are consumed as optional inputs.
+- **N6** — Not a general Azure inventory tool. Discovery is scoped to what targeting, blast radius and impact measurement need.
+- **N7** — Advisor is not a grounding gate (F9). Optional context at most.
+- **N8** — No unattended fault injection on the study path. Ever. No flag, variable or file grants execution consent to the five study skills. **Known exception, in shipped code:** `run-scenario` honours `$env:STARTCHAOS_NONINTERACTIVE=1`; closing it is E15-T8 (see §Detailed Design → Consent).
+- **N9** — Not a replacement for the Chaos Studio portal scenario report. The service's own run report is *linked and referenced* by our study report, not reimplemented.
 
 ---
 
@@ -253,1015 +248,618 @@ Field evidence is observational and was recorded under time pressure. Two of the
 
 ### Functional
 
-| ID | Requirement |
-|---|---|
-| **FR-1** | Accept an Azure scope (subscription, resource group, or explicit resource ID list) and discover an existing Chaos Workspace or plan/provision one, never mutating an existing workspace without explicit confirmation. |
-| **FR-2** | Inventory resources, inferred service dependencies, observability wiring (App Insights / LA workspace / diagnostic settings / alert rules), deployment topology, and candidate source/IaC repositories for that scope. |
-| **FR-3** | Return the scenarios and actions the service actually reports for the scope, with `recommendationStatus`, evaluation timestamp, required parameters, action URNs and target capability requirements. Permission blockers are returned **only when a probe validation has been authorised** (see FR-16), and their absence is reported as `permissionBlockers: null` with a caveat — never as "no blockers". |
-| **FR-4** | Analyse infrastructure and service code to produce ranked, falsifiable hypotheses, each grounded in cited code/IaC/resource evidence with an explicit correlation confidence. |
-| **FR-5** | Map each hypothesis to an *eligible* scenario, producing: proving fault (action URN), steady-state predicate, work/exercise predicate, confirm/refute telemetry predicate, blast radius (as `resourceTargeting`), safety guardrails, and expected changed code path. Hypotheses with no eligible scenario are reported as unmappable with the eligibility gap named. |
-| **FR-6** | Present ranked recommendations with evidence, confidence, eligibility gaps and remediation steps; never emit a scenario absent from the service response for that scope. |
-| **FR-7** | Configure and execute exactly one selected scenario behind an approval boundary, with `frozenValidation` drift detection, deterministic run-ID recovery, cancellation, and recovery guidance. |
-| **FR-8** | Monitor the exact run window across Azure Monitor metrics, App Insights, Log Analytics, Activity Log and alert instances; emit numeric evidence and a computed verdict. |
-| **FR-9** | Attest build identity via the fallback ladder and record which rung was used. |
-| **FR-10** | Attest fault landing per targeted leg, separating control-plane mutation from data-plane disruption, with re-poll on empty first reads. |
-| **FR-11** | Persist run identity and all phase evidence to a durable store; support `chaos-diagnose --run-id` and `chaos-evidence --run-id` in a fresh session with no prior conversational context. |
-| **FR-12** | Record attempted-fix **failure mechanism classes**, not just fix descriptions, and block a new proposal that falls in an already-failed class without new evidence. |
-| **FR-13** | Any hypothesis or advisory that changes an observability or health-probe signal must carry a second **mechanism-liveness predicate** asserting the mechanism executes (e.g. emits telemetry per invocation). |
-| **FR-14** | Each skill declares required MCP tools and reference files in its manifest; a preflight check reconciles the declaration against the **host-visible** tool inventory (the MCP host's `tools/list` result, which the agent already sees) and fails with the missing names. Reconciliation must not depend on a tool hosted by the server whose availability is in question. |
-| **FR-15** | Export a self-contained evidence bundle (JSON + rendered Markdown) suitable for review outside the tool. |
-| **FR-16** | Because `validations/latest` is configuration-scoped and unreachable without creating a `ScenarioConfiguration`, `chaos-availability` operates in two explicit tiers: **Tier A (non-destructive, default)** derives eligibility from the capability map, `recommendationStatus` and parameter satisfiability; **Tier B (probe validation, opt-in)** creates a disposable, non-executing `ScenarioConfiguration` per candidate scenario, POSTs `validate`, reads `validations/latest`, and deletes the configuration. Tier B creates and deletes customer-visible resources, requires explicit consent naming the scenarios and the configurations, and is never entered implicitly. |
-| **FR-17** | The failed-mechanism-class ledger is a first-class, schema-validated, durably-stored artifact (`mechanism-ledger.v1.json`) keyed on `scopeId`, appended by `chaos-diagnose` and read by `chaos-analyze`. |
-| **FR-18** | Execution approval is represented by a token that is issued outside the model's control, bound to the `frozenValidation` hash, single-use, and time-bounded. |
+| ID | Requirement | Trace |
+|---|---|---|
+| **FR-1** | `chaos-study` accepts a scope (subscription, resource group, or explicit resource IDs) and a plain-language reliability question, and drives the whole study: readiness → plan → consent → execute → measure → report. | G1 |
+| **FR-2** | Every user-facing skill is directly invocable with its own inputs and produces a useful result without any other skill having run first, degrading explicitly when a prerequisite artifact is absent. | G2 |
+| **FR-3** | Every user-facing `SKILL.md` — all ten in v0.4.x — is **under 200 lines**. A single CI test enforces the cap across the whole set, so a shipped skill cannot drift past it either. | G3, P2 |
+| **FR-4** | Scenario- and fault-specific guidance is reached by progressive discovery: the skill names a routing table (`references/chaos/faults/_index.md`), which names one guide per fault. Skills never inline fault parameters. | G3, G9 |
+| **FR-5** | All Chaos Studio control-plane interaction goes through `scripts/Invoke-AzChaos.ps1` (v2 `az chaos`) or, where the v2 CLI has no equivalent, `scripts/Invoke-AzChaosClassic.ps1` — a **new, thin, pinned REST wrapper**. No skill emits ad-hoc `az chaos` or `az rest`. | G5, P6 |
+| **FR-6** | A runtime **capability probe** determines, per subscription and per target type, which `faultPath` is available (`scenario` via v2 workspaces, `experiment` via classic REST), records the answer in the study manifest, and refuses to guess. | P6, Q1 |
+| **FR-7** | Kubernetes readiness preflight verifies, and reports individually: AKS cluster reachable; **Linux** node pool present; Chaos Mesh installed in the `chaos-testing` namespace (no other namespace is supported); target `Microsoft-AzureKubernetesServiceChaosMesh` enabled; capability version **2.2** enabled for the chosen fault; the workspace/experiment system-assigned managed identity holds `Azure Kubernetes Service Cluster Admin Role` on the cluster; a measurement source (Container Insights or managed Prometheus) present. Each of the seven checks returns pass / fail / unknown **with the exact remediation command**. | G8 |
+| **FR-7a** | **The single observability rule.** The absence of any one observability provider is `unknown`, never `fail`, and never blocks on its own. A plan is marked `blocked` if and only if **no available source can evaluate the plan's chosen steady-state predicate**. This rule is stated once here and referenced everywhere else. | G8, G10 |
+| **FR-8** | The study plan states, before any consent prompt: the hypothesis, the steady-state predicate, the fault and its parameters, the resolved blast radius, the duration, the abort conditions, and the signals that will be measured. | G6, G11 |
+| **FR-9** | Fault execution requires explicit human consent bound to the frozen configuration. Any drift between validation and execution aborts with a diff. Broad permission remediation requires a **separate** consent (retained from `[E3]`). | G11 |
+| **FR-10** | The strict validate → fix → revalidate gate is preserved exactly as delivered in `[E3]`; `--skip-validation` is only ever passed **after** that gate has succeeded. | G12 |
+| **FR-11** | A single deterministic collector returns the pre / during / post window pack for a study: AKS platform metrics, Container Insights tables, Prometheus (when present), Activity Log, and alert instances — with half-open `[start, end)` windows and per-source `null` + caveat on failure. | F2, F3, F4 |
+| **FR-12** | Findings are derived deterministically from numeric evidence against the captured baseline, carry a severity (`critical` / `high` / `medium` / `low`), a confidence, the evidence that produced them, and — where the mechanism was not proven — an explicit caveat. Control-plane state alone never produces a `confirmed` finding. | F6, F10, P8 |
+| **FR-13** | Run identity is recovered deterministically after an empty 2xx start (filter runs by `startTime ≥ requestSentAt`, matched on configuration name, bounded retry), and fails loudly rather than returning null. Null `actionName` is preserved and labelled by URN, never silently relabelled. | F7 |
+| **FR-14** | Study results are written to an **immutable dated store** outside the repository and outside session-temporary state: `$CHAOS_STUDY_ROOT/<scopeHash>/<studyId>/`, with `studyId = <UTC yyyyMMdd'T'HHmmss'Z'>-<8-hex>`. After sealing, writes are refused. | G7, F12, P4 |
+| **FR-15** | `chaos-study-history` can, with no prior conversational context: **list** studies for a scope, **show** one, **compare** two (same scope, same scenario family) reporting per-signal deltas and finding appearance/disappearance, and **rerun** a study — producing a *new* `studyId` carrying `derivedFrom`. | G7 |
+| **FR-16** | Every study produces `report.html`: a single file, no external network assets, no CDN, no JS framework, inline CSS and inline SVG. It contains an executive summary, tests run, dated evidence, prioritized findings, limitations, remediation guidance, and an appendix with the redacted command trail and api-versions used. | G6, P3 |
+| **FR-17** | Report rendering is deterministic: identical inputs produce byte-identical output except for a single `generatedAt` field, so two reports can be diffed. | G6 |
+| **FR-18** | The report's **Limitations** section is mandatory and non-empty. It states what was *not* proven, which checks returned `unknown`, which signals were absent, and — for Kubernetes — whether the fault was proven to have reached the data plane. | F14, P8 |
+| **FR-19** | Remediation guidance is per finding and actionable: the change to make, where, the expected observable effect, and how to re-verify (usually "rerun study `<studyId>`"). | G6 |
+| **FR-20** | MCP tools are **optional**. Skills declare `optionalTools`; the preflight probes the host inventory and, when a tool is absent, selects the script path and records the substitution in the manifest. Absence is never a hard failure for the core workflow. | N2, P5 |
+| **FR-21** | The fault guidance pack has a fixed, schema-validated front-matter contract so guides are machine-checkable and a new fault cannot be added half-specified. | G9, P7 |
+| **FR-22** | The study manifest records every `az` invocation made (command, exit code, duration, api-version) with arguments redacted, so a study is auditable and reproducible. | G10 |
 
 ### Non-Functional
 
 | ID | Requirement |
 |---|---|
-| **NFR-1** | Deterministic components are unit-testable offline via the existing `_TEST_TRANSPORT` MockTransport and recorded fixtures; no test requires Azure. |
+| **NFR-1** | Every deterministic component is unit-testable offline. No test requires Azure. Existing harnesses are reused: Pester (`Run.Path='./copilot-cli-plugin/skills'` unchanged), pytest with `_TEST_TRANSPORT`, ruff, and the `chaos-impact` offline replay. |
 | **NFR-2** | All timestamps ISO-8601 UTC with a `Z` suffix; all windows half-open `[start, end)`. |
-| **NFR-3** | Missing data is `null` with a caveat string. A cited `0` must be a measured zero. Null-vs-zero conflation is a contract violation. |
-| **NFR-4** | Least privilege: `Reader` for discovery/inventory/analysis. `chaos-availability` Tier A is **non-destructive but not strictly read-only** — when freshness requires it, it calls shipped `chaos_refresh_recommendations` (`POST …/refreshRecommendations`, then `GET …/evaluations/latest`); it creates no customer-visible resource and mutates no customer workload. Tier B additionally requires configuration create/delete on the workspace and is opt-in. Execution write scope is limited to the workspace and the explicitly targeted resources. |
-| **NFR-5** | Every artifact carries `schemaVersion`, `generatedAt`, `source` and `freshness`; consumers reject artifacts older than a configured staleness bound with an explicit refresh instruction. |
-| **NFR-6** | ARM/ARG calls use the existing backoff helpers; ARG paging respects the **documented** limits — 1,000 records per page and a maximum of three `join`/`union` operations per query. No per-query time limit is designed around, because none is documented in the public ARG reference; throttling is a documented per-5-second quota that the existing backoff helpers already handle. |
-| **NFR-7** | MCP tools carry accurate annotations. `outputSchema` is conditional: the source range `mcp>=1.2.0,<2` does not prove the installed version or host protocol capability. Epic 1 verifies the target runtime; otherwise contract tests enforce the existing envelope without claiming structured-output support. |
-| **NFR-8** | No secret, connection string, or token is written to any artifact; repository content is quoted only as file path + line range + a bounded excerpt. |
-| **NFR-9** | *Target state.* Pinned API versions live in one place per language — `scripts/Constants.ps1` for PowerShell, a new `chaos_mcp/apiversions.py` for Python. **This is not true today**: pins live in `azure.py` (3), `monitor.py` (2) and `server.py` (1). E1-T7 consolidates them and adds a lint test that fails on any `API_VERSION` literal outside the constants module. |
-| **NFR-10** | `[NEW]` changes are additive: retain the five current skill names/triggers, all 15 tool names/signatures/envelopes, `impactReportSchemaVersion: 1`, and existing `STARTCHAOS_STATE_PATH` files throughout the v0.x migration. |
-
-### Source + field gap-to-improvement matrix
-
-This is the minimum hardening backlog. It ties each improvement to current behavior and prevents a targeted skill from duplicating a capability `[MAIN]` already owns.
-
-| Evidence/source | Current behavior | Failure/pain | Minimal improvement | Target asset | Compatibility/migration |
-|---|---|---|---|---|---|
-| **F1** build attestation | `[MAIN]` run/report records run identity, not serving build identity | Artifact→deployment→serving proof was unavailable | Add version→digest→windowed behavioral ladder with rung/caveats | Extend `server.py` run retrieval/execution result plus `[NEW] proof.py` only for distinct attestation logic | Add fields; old consumers ignore them |
-| **F2** fault-window telemetry pack | `[MAIN]` `chaos-impact` collects a buffered window; MCP exposes raw metrics/logs/activity calls | Same pre/during/post pack hand-built repeatedly | Compose existing collectors into one normalized pack | Extend `copilot-cli-plugin/mcp/chaos_mcp/monitor.py`, add `server.py` wrapper and `copilot-cli-plugin/mcp/tests/test_monitor_tools.py`; reuse `Get-MonitorSignals.ps1` | Existing three monitor tools remain unchanged |
-| **F3** alert instances | `[MAIN]` PowerShell impact queries AlertsManagement; MCP does not | Agent used raw `az rest` for exact window | Reuse request/normalization knowledge in a new MCP wrapper | Extend `monitor.py` + `server.py` + `test_monitor_tools.py` | Additive tool; PowerShell output/schema retained |
-| **F4** App Insights classic schema + subscription | `[MAIN]` raw Log Analytics tool and KQL templates do not normalize resource-scoped classic queries | Repeated schema/subscription failures | Inject subscription and map classic lowercase tables/columns | Extend `monitor.py`; server wrapper; recorded test | Keep raw `monitor_query_logs` as escape hatch |
-| **F5** runtime availability | `[MAIN]` manifest registers server; skills name tools | A session may not expose registered tools | Host-visible preflight + CI manifest lint | Existing SKILL.md files, `plugin.json`, `.github/workflows/test.yml` | No server self-introspection tool; named failure only |
-| **F6/F15** per-leg disruption proof | `[MAIN]` impact correlates signals but does not require two planes; Activity Log is available | Control-plane state produced unsound verdicts | Per-leg ARM entity read + independent data-plane delta; re-poll empty reads | `[NEW] proof.py`, `server.py` wrapper; consume current impact/monitor outputs | Additive proof tool; no impact-schema break |
-| **F7** action identity/run-ID recovery | `[MAIN]` PowerShell and MCP recover IDs; MCP chooses newest matching configuration; action name may be null | Concurrent run ambiguity and leg mislabeling | Filter after `requestSentAt`, bounded retry, return raw + normalized identity source/confidence | Extend `server.py`; direct lifecycle tests | Same execute/get signatures; additive result fields |
-| **F8** fault semantics | `[MAIN]` service configuration/validation works but semantic effect is undocumented | Correct probe/starvation recipe unavailable | Versioned observed-effect oracle separated from candidate mechanism | `[NEW] references/chaos/fault-semantics.md`; consumed by proof | No runtime catalog replacement |
-| **F8** exclusions/config validation | `[MAIN]` setup/run already validate and can carry `resourceTargeting`; broad fix may run | Exclusion recipes and targeted blockers are hard to discover | Surface include/exclude preview, normalized errors, targeted remediation before broad fix | Refactor `setup-scenario`, `run-scenario`, `Validate-AndFix.ps1`; extend validation tool output | Preserve configuration body and broad fix behind consent |
-| **F12** durable evidence | `[MAIN]` configurable state defaults to `./startchaos-state.json`; reports live beside state/session | Repo/session cleanup destroyed evidence | Mirror current state/artifacts atomically to per-user configurable evidence root | Extend `State.ps1`; `[NEW] evidence.py` only if MCP access is required | Existing state remains source-compatible and importable |
-| **F10/F14** mechanism-liveness predicates | `[MAIN]` impact shows signals; no explicit predicate that the measuring mechanism ran | Dead probe can satisfy a formal predicate | Require liveness predicate before verify verdict | `[NEW] verdict.py` + evidence/verdict references; targeted diagnose skill | Additive artifact fields; no old path regression |
-| **F11** failure-mechanism classes | `[MAIN]` no durable class ledger | Same class repeated under different fixes | Append-only class + occurrence ledger | Durable evidence layer + `[NEW] analysis.py` pure function | New artifact; never rewrite old state |
-| **F9/F13** Advisor de-emphasis/reverse flow | `[MAIN]` does not need Advisor for execution | Advisor anti-correlated with behavioral findings | Keep Advisor optional; defer reverse export until a consumer exists | Docs/evidence transform only | No dependency or release gate |
-| Service issues | `[MAIN]` impact reports Service Health separately | Platform incidents can be mistaken for chaos effects | Preserve separate `platformEvent`/Service Health classification | Extend current impact report without merging verdict inputs | `impactReportSchemaVersion: 1` stays readable |
+| **NFR-3** | Missing data is `null` with a caveat string. A reported `0` must be a measured zero. Null-vs-zero conflation is a contract violation with a dedicated test. |
+| **NFR-4** | Least privilege. Readiness and discovery need `Reader`. Execution needs `Chaos Studio Experiment Contributor` scoped to the workspace (or experiment), plus — for AKS Chaos Mesh faults — **`Azure Kubernetes Service Cluster Admin Role`** on the cluster, assigned to the workspace/experiment system-assigned managed identity (documented prerequisite). Azure Chaos Studio has exactly four built-in roles — Experiment Contributor, Operator, Reader, Target Contributor. "Chaos Studio Owner"/"Contributor" do not exist. |
+| **NFR-5** | No secret, connection string, token or key material reaches any artifact, the report, the command trail, or a log line. The `[E2]` redaction denylist and the `$CHAOS_KEY_DIR` denylist are enforced on the study store unchanged. |
+| **NFR-6** | The study store is atomic and crash-safe: temp file + rename under an exclusive lock, then a seal step that writes `manifest.json` containing a SHA-256 over **every file in the study directory except `manifest.json` itself and the `SEALED` marker** (both are excluded because they are written after the hash is computed). `index.json` lives outside the study directory and is not covered. A partially written study is detectable and is never listed as complete. |
+| **NFR-7** | Report generation is offline and dependency-free — PowerShell 7 plus the repository template. No Node, no Python, no browser engine, no network. |
+| **NFR-8** | `report.html` renders correctly with JavaScript disabled and opens from `file://`. Total size target ≤ 2 MB for a typical study; raw evidence stays in sidecar JSON. |
+| **NFR-9** | API-version pins stay centralised **one file per language**. Python is already consolidated in `chaos_mcp/apiversions.py` (delivered by E1-T7). PowerShell is **not**: the only pin file today is `skills/chaos-impact/scripts/Constants.ps1`, scoped to one skill. E7-T1 promotes it to `copilot-cli-plugin/scripts/Constants.ps1` with a dot-source shim left at the old path for one minor version; the classic-REST pin is added there and the existing dead-pin lint test is extended to the PowerShell file. |
+| **NFR-10** | Backward compatibility through v0.4.x: `$env:STARTCHAOS_STATE_PATH` files still resume; `impactReportSchemaVersion: 1` is unchanged; the 15 original MCP tool names/signatures/envelopes are unchanged; the `[E2]` evidence store is readable. Skill-surface changes follow the two-release deprecation in §Migration. |
+| **NFR-11** | Studies are portable: a sealed study directory can be zipped, moved to another machine and read by `chaos-study-history` without the originating scope, subscription or credentials. |
+| **NFR-12** | Retention is explicit and configurable (`CHAOS_STUDY_RETENTION_DAYS`, default 365 — longer than evidence's 90 because a study is the durable record). Purge never deletes a sealed study without an explicit, confirmed command. |
 
 ---
 
 ## Proposed Design
 
-Unless a row is explicitly marked `[MAIN]` or `[PR32 PROTOTYPE]`, it describes `[NEW]` work. Every `[NEW]` entry names the current asset it composes or extends.
-
 ### Architecture Overview
 
 ```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│                         Copilot CLI — user-facing skills                      │
-│                                                                              │
-│  chaos-scope-setup → chaos-inventory → chaos-availability                    │
-│                                    ↘                    ↘                    │
-│                                     chaos-analyze → chaos-recommend          │
-│                                                            ↓                 │
-│                                        chaos-run → chaos-diagnose            │
-│                                                            ↓                 │
-│                                                     chaos-evidence           │
-│  (every arrow is *guidance*, not a handoff — each skill is entered directly) │
-└──────────────────────────────────────────────────────────────────────────────┘
-        │ reads/writes versioned artifacts by runId / scopeId
+┌───────────────────────────────────────────────────────────────────────────────┐
+│  Copilot CLI — the five study skills (one entry + four supporting)            │
+│                                                                               │
+│                          ┌──────────────────┐                                 │
+│                          │   chaos-study    │  ← the obvious entry point      │
+│                          │   (< 200 lines)  │     opinionated, end-to-end     │
+│                          └────────┬─────────┘                                 │
+│         ┌─────────────────┬───────┴────────┬──────────────────┐               │
+│         ▼                 ▼                ▼                  ▼               │
+│  chaos-study-scope  chaos-study-run  chaos-study-report  chaos-study-history  │
+│  discovery,         consent,         self-contained      list / show /        │
+│  readiness,         execution,       HTML report         compare / rerun      │
+│  hypothesis, plan   window capture                                            │
+│                                                                               │
+│  Each is directly invocable. Arrows are composition, never a hidden handoff.  │
+└───────────────────────────────────────────────────────────────────────────────┘
+        │ progressive discovery (read on demand, never inlined)
         ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  [NEW] Evidence Store  (durable, outside repo/session tmp/)                    │
-│  $CHAOS_EVIDENCE_ROOT/<scopeHash>/<runId>/{artifacts,raw,rendered}            │
-│  mirrors [MAIN] STARTCHAOS_STATE_PATH artifacts; never replaces them in v0.x  │
-└──────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│  references/chaos/**  — principle docs + fault/scenario guidance pack         │
+│  study-method.md · evidence-contract.md · blast-radius.md · verdict-matrix.md │
+│  report-contract.md · faults/_index.md → faults/aks-chaosmesh-*.md · …        │
+│  scenarios/_index.md → scenarios/kubernetes-*.md                              │
+└───────────────────────────────────────────────────────────────────────────────┘
         │
         ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  Deterministic layer                                                          │
-│                                                                              │
-│  [MAIN]+[NEW] chaos_mcp           │  [MAIN] PowerShell skill scripts          │
-│  ─ existing 15 tools stay stable │  ─ Invoke-ChaosImpact.ps1 (+helpers)      │
-│    discovery, capability map,     │  ─ Constants.ps1 (pinned API versions)    │
-│    eligibility, scoring, exec,    │  ─ Rbac.ps1, Invoke-AzRest.ps1,           │
-│    fault-landed proof, build      │    Wait-AzureLro.ps1, State.ps1           │
-│    attestation, evidence store    │  ─ templates/metrics/defaults.json        │
-│  ─ monitor_* : metrics, logs,     │  ─ tests/e2e/Run-OfflineReplay.ps1        │
-│    activity log, appinsights,     │                                           │
-│    alert instances, window pack   │                                           │
-└──────────────────────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  Azure  │ Chaos Studio v2 workspaces │ Chaos v1 targetTypes/capabilityTypes   │
-│         │ Resource Graph │ Azure Monitor │ App Insights │ Log Analytics       │
-│         │ Activity Log │ AlertsManagement │ Deployments history │ ACR/AKS/VMSS│
-└──────────────────────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────────────────┐
+│  Deterministic PowerShell layer — the product's real engine                   │
+│                                                                               │
+│  [MAIN] Invoke-AzChaos.ps1 · Ensure-AzLogin.ps1 · Invoke-AzRest.ps1           │
+│         Wait-AzureLro.ps1 · Constants.ps1                                     │
+│  [E1]   Preflight.ps1  (reshaped: optional-tool probe, non-blocking)          │
+│  [E2]   State.ps1  (evidence root, redaction, atomic writes, import)          │
+│  [E3]   Validate-AndFix.ps1 · Rbac.ps1 · Render.ps1 (blast radius, consent)   │
+│  [NEW]  Study.ps1 · Invoke-AzChaosClassic.ps1 · Resolve-FaultPath.ps1         │
+│         Get-K8sReadiness.ps1 · Get-StudySignals.ps1 · Build-StudyFindings.ps1 │
+│         New-StudyReport.ps1 · Compare-Study.ps1 · Constants.ps1 (promoted)    │
+└───────────────────────────────────────────────────────────────────────────────┘
+        │                                              │
+        ▼                                              ▼
+┌────────────────────────────────┐   ┌────────────────────────────────────────┐
+│ [NEW] Immutable dated study    │   │  Azure                                 │
+│ store — outside repo & tmp     │   │  az chaos (v2 workspace/scenario)      │
+│ $CHAOS_STUDY_ROOT/<scopeHash>/ │   │  classic experiments (REST, pinned)    │
+│   <studyId>/  … sealed         │   │  AKS + Container Insights + Prometheus │
+│   index.json  … append-only    │   │  Activity Log · AlertsManagement       │
+│ built on the [E2] evidence     │   └────────────────────────────────────────┘
+│ store's redaction/atomicity    │
+└────────────────────────────────┘
+        ▲
+        │  optional, never required
+┌───────┴───────────────────────────────────────────────────────────────────────┐
+│  [OPTIONAL] MCP adapter chaos_mcp — 18 tools. If the host exposes them the    │
+│  skills may use them; if not, the script path runs and records a substitution.│
+└───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-Two rules govern the whole architecture:
+Four rules govern the architecture:
 
-1. **The model never computes an outcome.** `[NEW]` deterministic code evaluates proposals; this is a pattern re-expressed from `[PR32 PROTOTYPE]`, not a port.
-2. **Compatibility comes first.** `[MAIN]` state at `STARTCHAOS_STATE_PATH` remains readable/writable. `[NEW]` durable evidence mirrors it by `scopeId` / `runId`; targeted skills do not require conversational memory (F12).
+1. **The scripts are the product; the skills are the interface.** If a behaviour must be correct every time, it is a script with a Pester test.
+2. **The front door stays a front door.** Fault detail is discovered, not inlined.
+3. **`az chaos` first.** REST is a fallback for capabilities the v2 CLI does not expose, and it is a wrapper, not prompt text.
+4. **A study is immutable once sealed.** Reruns create new studies.
 
 ### Key Components
 
-#### 1. The eight skills
+#### 1. The five skills
 
-All eight are proposed **additive user-facing entry points**. They compose the current five skills, scripts and 15 tools; none replaces a shipped skill in the initial release. Shared logic stays in the existing scripts/modules unless it is semantically distinct.
+| Skill | Role | Line budget | Directly useful for |
+|---|---|---|---|
+| **`chaos-study`** | **Entry.** Opinionated end-to-end reliability study. | < 200 | "Run a chaos study on this AKS cluster." |
+| **`chaos-study-scope`** | Discovery, readiness, hypothesis, study plan. | < 200 | "Is my cluster even ready for chaos, and what should I test?" |
+| **`chaos-study-run`** | Consent, execution, window capture. | < 200 | "Execute this plan and capture what happened." |
+| **`chaos-study-report`** | Findings + self-contained HTML report. | < 200 | "Give me the report for study `<id>`." |
+| **`chaos-study-history`** | List, show, compare, rerun. | < 200 | "What have we tested before, and did it improve?" |
 
-Every SKILL.md carries frontmatter extended with two new keys consumed by the preflight reconciler (FR-14):
+The budget is a hard cap on all five, and the same test applies it to the five shipped skills (FR-3, D3).
+
+---
+
+**1.1 `chaos-study`** — the entry skill
+
+| | |
+|---|---|
+| **Triggers** | "run a chaos study", "chaos test my AKS cluster", "is this resource group resilient", "reliability study for &lt;scope&gt;" |
+| **Inputs** | `-Scope` (subscription / RG / resource IDs), optional `-Question` (plain language), optional `-Vertical` (default `kubernetes`), optional `-DryRun` (default **true**) |
+| **Owned by scripts** | `skills/chaos-study/scripts/Invoke-ChaosStudy.ps1` — orchestrates readiness → plan → consent → execute → measure → seal → report by invoking the supporting skills' scripts in-process |
+| **Owned by the model** | Interpreting the user's question into a hypothesis; explaining the plan and the trade-offs; narrating the findings |
+| **Output** | A sealed study directory and `report.html`, plus a terminal summary card |
+| **Structure (the entire file, ~180 lines)** | frontmatter (~15) · what a study is and the four principles (~25) · the six steps with one paragraph each (~50) · safety and consent (~25) · progressive-discovery routing table (~20) · exit codes (~20) · worked example (~20) |
+| **Progressive discovery** | The routing table is the only place fault detail is referenced: *"Before proposing a fault, read `references/chaos/faults/_index.md` and then the single guide for the chosen fault. Do not restate fault parameters here."* |
+| **Safety** | `-DryRun` is the default. Producing a plan is free; executing requires consent. |
+
+**1.2 `chaos-study-scope`** — discovery, readiness, hypothesis, plan
+
+| | |
+|---|---|
+| **Triggers** | "what can I chaos test here", "is my cluster ready for chaos", "plan a chaos study", "why can't I run &lt;fault&gt;" |
+| **Inputs** | `-Scope` or `-StudyId`, optional `-Vertical`, optional `-Question` |
+| **Deterministic work** | `Get-K8sReadiness.ps1` (FR-7, every check individually pass/fail/unknown + remediation command) · `Resolve-FaultPath.ps1` capability probe (FR-6) · `az chaos workspace show-discovery` / `show-evaluation` / `az chaos discovered-resource list` · `az chaos scenario list` · blast-radius resolution via `[E3] Resolve-BlastRadius` · signal-availability check (Container Insights / Prometheus / alert rules) |
+| **Model work** | Turning the user's question into a falsifiable hypothesis and a steady-state predicate, using `references/chaos/study-method.md` |
+| **Output** | `study-plan.v1.json` (new schema; reuses the `[E2]` artifact envelope) written into an **unsealed** study directory |
+| **Rule** | Scenario and fault names come only from a service response or from the fault guidance pack's `faultUrn`. Nothing is invented. |
+| **Reuses** | `[MAIN] Invoke-AzChaos.ps1`, `[E2] State.ps1`, `[E3] Render.ps1` blast-radius card |
+
+**1.3 `chaos-study-run`** — consent, execution, window capture
+
+| | |
+|---|---|
+| **Triggers** | "execute the study plan", "run the experiment", "cancel my chaos run" |
+| **Inputs** | `-StudyId` (or an explicit plan), `-Confirm`, optional `-Cancel` |
+| **Deterministic work** | Freeze the configuration and hash it · `[E3]` validate → fix → revalidate gate · render blast radius and abort conditions · read typed consent · create/execute via `faultPath` · deterministic run-ID recovery (FR-13) · capture pre-window baseline before start and post-window after end · `Get-StudySignals.ps1` window pack (FR-11) · write `run-record.v1.json` and raw evidence |
+| **Model work** | Presenting the consent prompt and narrating recovery |
+| **Output** | `run-record.v1.json` + `evidence/{pre,during,post}/*.json` in the study directory |
+| **Abort** | Abort conditions are evaluated during the run; breach triggers `az chaos scenario run cancel` (or classic cancel) and records `abortedBy` |
+| **Reuses** | `[E3] Validate-AndFix.ps1`, `Rbac.ps1`, `Render.ps1`; the `[MAIN] Invoke-RunScenario.ps1` execution logic, **dot-sourced in place** — the shipped skill's entry point is not moved or renamed (NFR-10) |
+
+**1.4 `chaos-study-report`** — findings and the HTML report
+
+| | |
+|---|---|
+| **Triggers** | "generate the chaos report", "what did study &lt;id&gt; find", "give me the HTML report" |
+| **Inputs** | `-StudyId`, optional `-Open`, optional `-Format` (`html` default, `md` secondary) |
+| **Deterministic work** | `Build-StudyFindings.ps1` — deltas versus the captured baseline, threshold evaluation, severity assignment, confidence, and the mandatory limitations set · `New-StudyReport.ps1` — renders `skills/chaos-study-report/templates/study-report.html.tmpl` with inline CSS and inline SVG sparklines, following the token-substitution pattern already proved by `[MAIN] scripts/New-RunReport.ps1` and `skills/chaos-impact/templates/report.md.tmpl` · seals the study |
+| **Model work** | The executive summary paragraph and the human-readable remediation prose, both inserted into fixed slots and both marked as narrative in the report |
+| **Output** | `findings.v1.json` + `report.html`, then `SEALED` |
+| **Rule** | The model cannot alter a severity, a number, or the limitations list. Those slots are script-rendered. |
+
+**1.5 `chaos-study-history`** — list, show, compare, rerun
+
+| | |
+|---|---|
+| **Triggers** | "what chaos studies have we run", "compare my last two studies", "rerun study &lt;id&gt;", "did reliability improve" |
+| **Inputs** | `-Scope` or `-StudyId` (+ `-Against <studyId>` for compare), `-Rerun` |
+| **Deterministic work** | `Study.ps1` index read · `Compare-Study.ps1` — matches studies by scope + scenario family, computes per-signal deltas and finding appearance/disappearance/severity change · rerun materialises the recorded plan into a **new** unsealed study with `derivedFrom` |
+| **Output** | `comparison.v1.json` + a comparison HTML report; or a new `studyId` ready for `chaos-study-run` |
+| **Cold-start** | Requires only `$CHAOS_STUDY_ROOT` and a `studyId`. No conversational memory, no Azure call for `list`/`show`/`compare`. |
+
+#### 2. The reference layer (progressive discovery)
+
+```
+copilot-cli-plugin/references/chaos/
+  study-method.md         [NEW]  hypothesis, steady state, blast radius, abort, evidence
+  report-contract.md      [NEW]  report sections, severity scale, limitation taxonomy
+  evidence-contract.md    [E2]   RETAINED, extended with the study-store section
+  blast-radius.md         [E3]   RETAINED verbatim
+  verdict-matrix.md       [E2]   RESHAPED into finding severity/confidence
+  faults/
+    _index.md             [NEW]  routing table: faultUrn → guide, vertical, faultPath
+    aks-chaosmesh-pod.md          [NEW]  podChaos/2.2
+    aks-chaosmesh-network.md      [NEW]  networkChaos/2.2
+    aks-chaosmesh-stress.md       [NEW]  stressChaos/2.2
+    aks-chaosmesh-io.md           [NEW]  IOChaos/2.2
+    aks-chaosmesh-dns.md          [NEW]  dnsChaos/2.2
+    aks-chaosmesh-http.md         [NEW]  httpChaos/2.2
+    aks-chaosmesh-time.md         [NEW]  timeChaos/2.2
+    aks-chaosmesh-kernel.md       [NEW]  kernelChaos/2.2
+    aks-nodepool-vmss-shutdown.md [NEW]  VMSS shutdown against an AKS node pool
+    aks-nsg-rule.md               [NEW]  NSG security-rule fault around a cluster
+  scenarios/
+    _index.md                      [NEW]
+    kubernetes-pod-resilience.md   [NEW]
+    kubernetes-node-loss.md        [NEW]
+    kubernetes-dependency-latency.md [NEW]
+```
+
+Every fault guide carries the same YAML front matter, validated by `schemas/fault-guide.v1.schema.json` (FR-21):
 
 ```yaml
 ---
-name: chaos-diagnose
-description: >-
-  Diagnose a Chaos Studio scenario run: prove fault landing, check work
-  starvation, evaluate predicates, and emit a CONFIRMED / REFUTED /
-  NOT EXERCISED verdict with numeric evidence.
-requiredTools:
-  - chaos_get_scenario_run
-  - chaos_prove_fault_landed
-  - monitor_fault_window_pack
-  - evidence_put
-optionalTools:
-  - monitor_list_alert_instances
-  - chaos_attest_build_identity
-references:
-  - references/chaos/evidence-contract.md
-  - references/chaos/verdict-matrix.md
+guideSchemaVersion: 1
+faultUrn: "urn:csci:microsoft:azureKubernetesServiceChaosMesh:podChaos/2.2"
+displayName: "AKS Chaos Mesh Pod Chaos"
+vertical: kubernetes
+faultPath: experiment          # scenario | experiment — see D5 / Q1
+targetType: Microsoft-AzureKubernetesServiceChaosMesh
+resourceType: Microsoft.ContainerService/managedClusters
+capabilityName: PodChaos-2.2
+prerequisites:
+  - id: chaos-mesh-installed
+    check: "kubectl get deploy -n chaos-testing chaos-controller-manager"
+    remediation: "helm install chaos-mesh chaos-mesh/chaos-mesh --namespace=chaos-testing …"
+  - id: linux-nodepool
+  - id: target-enabled
+parameters:
+  jsonSpec:
+    shape: "Chaos Mesh PodChaos spec, minified, without metadata/kind"
+    actions: [pod-failure, pod-kill, container-kill]
+    example: '{"action":"pod-failure","mode":"one","selector":{"namespaces":["default"]}}'
+steadyStateSignals:
+  - { source: metrics,  name: kube_pod_status_ready }
+  - { source: prometheus, name: kube_deployment_status_replicas_available }
+impactSignals:
+  - { source: logs, table: KubePodInventory, kql: "…" }
+  - { source: logs, table: KubeEvents, filter: "Reason in ('BackOff','Evicted','NodeNotReady')" }
+  - { source: metrics, name: kube_pod_status_phase }
+blastRadiusControls:
+  - "selector.namespaces narrows to a namespace"
+  - "mode: one | fixed | fixed-percent | random-max-percent"
+abortConditions:
+  - "availableReplicas == 0 for any targeted Deployment for > 60s"
+knownLimitations:
+  - "Chaos Mesh is in-cluster; a cluster-wide outage stops the fault itself"
+dataPlaneProof:
+  signal: "KubePodInventory pod restart/phase transitions inside the window"
+  coverage: documented        # documented | heuristic | none
 ---
 ```
 
----
+`coverage` is surfaced in the plan **and** in the report's Limitations section. A `heuristic` probe is visibly weaker evidence than a `documented` one; a `none` guide cannot ship (schema-enforced).
 
-**1.1 `chaos-scope-setup`** *(user-facing)*
+#### 3. The immutable dated study store
 
-| | |
+```
+$CHAOS_STUDY_ROOT/                       default: per-user app data (see NFR-12/Q7)
+  <scopeHash>/
+    index.json                           append-only; one line-equivalent record per study
+    20260824T184213Z-9f2c1ab4/
+      manifest.json                      sealed; SHA-256 over every file below, excluding itself and SEALED
+      study-plan.v1.json
+      run-record.v1.json
+      findings.v1.json
+      report.html
+      commands.jsonl                     redacted command trail (FR-22)
+      evidence/pre/*.json
+      evidence/during/*.json
+      evidence/post/*.json
+      SEALED                             presence = immutable
+```
+
+| Property | Design |
 |---|---|
-| **Triggers** | "set up chaos for &lt;scope&gt;", "which chaos workspace covers this resource group", "create a chaos workspace", "prepare my subscription for chaos testing" |
-| **Inputs** | `scope` (subscription ID \| resource group ID \| resource ID list), optional `workspaceId`, optional `location`, optional `identity` (system/user-assigned), `dryRun` (default `true`) |
-| **Deterministic work** | `[NEW] chaos_resolve_scope`, `[NEW] chaos_list_workspaces`, `[NEW] chaos_plan_workspace`, shipped `chaos_create_workspace` / `chaos_get_workspace`, and shipped `chaos_refresh_recommendations` when discovery/recommendation freshness is requested; `Rbac.ps1` role-assignment preflight |
-| **Model work** | Explaining the plan and the safety trade-offs; nothing computed |
-| **Output** | `scope-setup.v1.json` — `{scopeId, scope, workspace:{id,state,identity,createdByThisRun}, discovery:{operationId,status,startedAt,completedAt}, rbac:{callerCanAssignRoles, missingAssignments[], remediation[]}, planOnly, warnings[]}` |
-| **Safety** | Reuses an existing workspace by default. Creating a workspace, assigning roles, or enabling targets requires explicit confirmation. `dryRun: true` emits `workspace-plan` only. |
-| **Reuses / extends** | Extends `[MAIN] create-workspace`, `start-chaos`, `Invoke-CreateWorkspace.ps1`, `State.ps1`, `Rbac.ps1`, `chaos_create_workspace`, and `chaos_get_workspace`; may become their preferred setup entry only after measured adoption. |
-| **RBAC** | `Reader` on scope to discover; **`Chaos Studio Experiment Contributor`** on the resource group (plus `Contributor` if the RG itself must be created) and `User Access Administrator` or `Role Based Access Control Administrator` only when provisioning. See §Least-privilege RBAC — Chaos Studio has exactly four built-in roles and "Chaos Studio Owner"/"Contributor" are not among them |
-| **Next step** | "Run `chaos-inventory` for this scope" — plus, if RBAC gaps exist, the exact `az role assignment create` commands from `Build-RoleAssignmentRemediation`. |
+| **Identity** | `studyId = <UTC yyyyMMdd'T'HHmmss'Z'>-<8 hex of scopeHash‖plan digest‖nonce>`. Sortable, human-dated, collision-resistant. |
+| **Immutability** | Once `SEALED` exists, `Save-StudyArtifact` refuses every write with `StudyAlreadySealed`. There is no force flag. |
+| **Location** | Resolution order: `$env:CHAOS_STUDY_ROOT` → `.chaos-plugins.yaml` `studyRoot` → per-user app data. **Never** the repository, never `$env:TEMP`, never next to `startchaos-state.json`. A test asserts the resolved root is not under the repository root and not under the system temp directory. |
+| **Relationship to `[E2]`** | Built on the `[E2]` primitives — the same atomic temp-file + rename under lock, the same canonicalization, the same redaction denylist, the same `$CHAOS_KEY_DIR` denial. The study store adds *sealing*, *dating* and *enumeration*; it does not fork the safety code. |
+| **Portability** | `manifest.json` is self-describing: schema versions, api-versions, tool/script versions, scope descriptor, `faultPath`, `derivedFrom`. A zipped study opens on another machine (NFR-11). |
+| **Retention** | `CHAOS_STUDY_RETENTION_DAYS`, default 365. Purge requires an explicit confirmed command and never runs implicitly. |
+| **Abandonment** | `CHAOS_STUDY_ABANDON_HOURS`, default 72. A `PLANNED` study older than this with no run record is reported as `ABANDONED` by `list` and may be sealed with `outcome: abandoned`. It is never deleted implicitly. |
+| **Environment** | `CHAOS_STUDY_ROOT`, `CHAOS_STUDY_RETENTION_DAYS`, `CHAOS_STUDY_ABANDON_HOURS`. The `[E2]` variables (`CHAOS_EVIDENCE_ROOT`, `CHAOS_KEY_DIR`, `CHAOS_EVIDENCE_RETENTION_DAYS`, `CHAOS_EVIDENCE_DISABLED`) keep their existing meaning and are not overloaded. |
 
-**1.2 `chaos-inventory`** *(user-facing)*
+#### 4. MCP as an optional adapter
 
-| | |
-|---|---|
-| **Triggers** | "what's in this scope", "inventory my resources for chaos", "what depends on what here", "which repos build this service" |
-| **Inputs** | `scopeId` or `scope`, optional `repoHints[]`, optional `includeCode` (default `false`), `topologySources[]` (default `["arg","appinsights","config"]`) |
-| **Deterministic work** | ARG resource enumeration (paged); zone/region/SKU/replica extraction; diagnostic-settings and alert-rule enumeration; App Insights & LA workspace resolution; `Microsoft.Resources/deployments` history read; App Insights `dependencies` aggregation for observed edges; tag and naming-convention correlation |
-| **Model work** | Naming-convention inference; repository identification from deployment metadata and tags; describing the topology in prose |
-| **Output** | `inventory.v1.json` (see §API Contracts) |
-| **Notes** | Dependency edges are **observed** (App Insights `dependencies`), **declared** (IaC `dependsOn`, app config), or **inferred** (naming/tags) — each edge carries `edgeSource` and `correlationConfidence`. ARG has no dependency-edge table; the Application Map has no public REST API, so observed edges come from `dependencies` rows whose `Target` is a hostname requiring a second lookup to reach an ARM ID (recorded as `targetResourceId: null` when unresolvable). |
-| **Reuses / extends** | Composes `[MAIN] create-workspace` state, `Invoke-AzRest.ps1`, `azure.py`, current workspace tools, and `chaos-impact` diagnostic-settings/monitor collection; adds inventory-only code where no owner exists. |
-| **Next step** | `chaos-availability` for the same scope. |
+`[E1]` introduced `requiredTools` + `Assert-RequiredTools` (fail fast on a missing tool). That remains the right answer to F5 **for a skill that genuinely cannot work without the tool**. In this product no skill is in that position.
 
-**1.3 `chaos-availability`** *(user-facing)*
+The reshape is small and surgical:
 
-| | |
-|---|---|
-| **Triggers** | "what chaos scenarios can I run here", "why isn't &lt;scenario&gt; available", "what do I need to enable for chaos" |
-| **Inputs** | `scopeId`, optional `forceEvaluate` (default `false`), optional `maxAgeMinutes` (default 1440), optional `probeValidation` (default `false`) with `probeScenarios[]` and `probeConsentToken` |
-| **Deterministic work — Tier A (non-destructive, default)** | Shipped `chaos_refresh_recommendations` (`POST …/refreshRecommendations` + `evaluations/latest` read, only when stale/forced); shipped `chaos_list_recommended_scenarios` with additive recommendation/freshness metadata; `[NEW] chaos_get_target_capability_map` joining verified v1 target/capability catalog reads; parameter-satisfiability check against `inventory.v1.json` |
-| **Deterministic work — Tier B (probe validation, opt-in write)** | `chaos_probe_validate_scenarios` — for each named candidate: create a disposable `ScenarioConfiguration` (`chaos-probe-<scenario>-<shortHash>`), `POST …/configurations/{c}/validate`, poll `…/configurations/{c}/validations/latest`, capture `validationErrors.permission[]`, then delete the configuration. Idempotent, bounded, and never executed. |
-| **Model work** | None on eligibility. Narrative only. |
-| **Output** | `availability.v1.json` — the **only** legitimate source of scenario names anywhere in the suite |
-| **Critical rule** | No downstream skill may name a scenario absent from this service-derived artifact. `[PR32 PROTOTYPE] scenario-catalog.v1.json` is **not ported**; it is not deleted from main because it never existed there. |
-| **Reuses / extends** | Extends `[MAIN] setup-scenario`, `Invoke-SetupScenario.ps1`, `chaos_refresh_recommendations`, `chaos_list_recommended_scenarios`, configuration create/validate, and `Validate-AndFix.ps1`. |
-| **Gap** | The service exposes `recommendationStatus` but **no `notRecommendedReason`**. `eligibility.gapReason` is therefore synthesised deterministically from observable sources: (a) capability-map misses (`targetType` not enabled on any in-scope resource), (b) parameter requirements unsatisfiable from inventory, and — **only in Tier B** — (c) `validations/latest` permission errors. Anything else is `gapReason: "unknown"` — never guessed. Tracked as **CS-4**. |
-| **Next step** | `chaos-analyze`, or the named remediation for each blocked scenario. |
-
-##### Permission-Blocker Acquisition (the `validations/latest` scoping constraint)
-
-It is tempting to treat `validations/latest` as a workspace polling artifact alongside `discoveries/latest` and `evaluations/latest` — the naming symmetry invites it — and to then specify `chaos-availability` as unconditionally read-only while requiring it to emit `validation.permissionErrors[]`. **That combination is not achievable**, and the reason is worth stating precisely because the API's shape actively suggests it.
-
-Verified against `Azure/azure-rest-api-specs` (`Microsoft.Chaos/Chaos/scenarioConfiguration.models.tsp`):
-
-- `WorkspaceDiscovery` is `@parentResource(Workspace)` `@singleton("latest")` → `/workspaces/{ws}/discoveries/latest` — **workspace-scoped, read-only after a `discover` POST.**
-- `WorkspaceEvaluation` is `@parentResource(Workspace)` `@singleton("latest")` → `/workspaces/{ws}/evaluations/latest` — **workspace-scoped**, and carries only aggregate template-evaluation counts plus a per-template `RecommendationStatus`. **No permission errors.**
-- `Validation` is `@parentResource(ScenarioConfiguration)` `@singleton("latest")` → `/workspaces/{ws}/scenarios/{s}/configurations/{c}/validations/latest`, populated by `POST …/configurations/{c}/validate`. `ValidationProperties.validationErrors` is a `ScenarioErrors` carrying `permission: PermissionError[]` (`requiredPermissions`, `missingPermissions`, `recommendedRoles`) and `resource: ResourceStateError[]`.
-- `fixResourcePermissions` is likewise a `ScenarioConfiguration` operation.
-
-**Consequence:** per-resource permission blockers are *unobtainable* without creating a `ScenarioConfiguration`. There is no read-only path. This is a real service constraint, not an implementation choice.
-
-**Resolution — the two-tier design:**
-
-| | Tier A — Eligibility (default) | Tier B — Probe validation (opt-in) |
+| Aspect | `[E1]` today | `[NEW]` |
 |---|---|---|
-| **Writes?** | **Not strictly read-only when refresh runs.** Shipped `chaos_list_recommended_scenarios` and `[NEW] chaos_get_target_capability_map` are GETs. Shipped `chaos_refresh_recommendations` performs `POST …/refreshRecommendations` and then reads `evaluations/latest`; the proposed contract annotates it `readOnlyHint: false, destructiveHint: false, idempotentHint: true` and does not auto-allow it. No distinct `/evaluate` tool or endpoint is assumed. | Yes — creates and deletes `ScenarioConfiguration` resources. |
-| **RBAC** | `Reader` on scope + workspace | Configuration write on the workspace (`Chaos Studio Experiment Contributor` scoped to the workspace) |
-| **Answers** | Is the target type enabled? Does the capability exist? Is `recommendationStatus` favourable and fresh? Are required parameters satisfiable? | Which exact resources are missing which exact permissions, and which roles the service recommends. |
-| **Cost** | One shipped recommendation refresh (optional) + catalog reads | One create + one validate LRO + one delete **per candidate scenario** |
-| **Consent** | Implicit | Explicit, naming every scenario and every configuration name to be created and deleted |
-| **Output field** | `permissionBlockers: null`, `permissionBlockersReason: "tier-a-read-only"` | `permissionBlockers: [...]`, `permissionBlockersReason: null` |
+| Front matter | `requiredTools:` | `optionalTools:` (`requiredTools:` still parsed and honoured if present) |
+| Behaviour on absence | `Assert-RequiredTools` throws with a named prefix | `Resolve-ToolPath` returns `Script` and records `toolSubstitutions[]` in the manifest |
+| F5 protection | Fail fast | **Preserved**: a skill may still not *silently* substitute. The substitution is written into the manifest and shown in the report appendix. |
+| Tests | `Preflight.Tests.ps1`, `test_tool_manifest.py` | Extended, not replaced; the fail-fast tests move to a `requiredTools` fixture so the capability is still covered |
 
-**Downstream effects, all now consistent:**
-
-- `DQ-PERMISSION-BLOCKED` fires **only** when Tier B data exists. In Tier A it is not evaluated, and the recommendation carries `permissionCheck: "not-performed"` rather than an implied pass. A recommendation validated only at Tier A is capped at `eligibilityConfidence: 0.6`.
-- **D13** (targeted least-privilege remediation from `recommendedRoles`) requires Tier B; without it the skill offers the generic `Reader` + target-enablement guidance from `Rbac.ps1` instead, and says so.
-- `chaos-run` always performs a real `validate` on the real configuration before executing (D12), so **execution is never blind to permission errors** even when availability ran at Tier A. Tier B exists to move that discovery *earlier*, not to make it possible.
-- Tier B is bounded: it validates only the scenarios the user names, defaults to the top-N candidates from Tier A, and cleans up on both success and failure paths.
-
-**Alternative rejected:** running Tier B automatically for every catalogued scenario. That is O(scenarios) write operations against a customer workspace, before any hypothesis exists, purely to populate an advisory field. See ALT-9.
-
-**1.4 `chaos-analyze`** *(user-facing)*
-
-| | |
-|---|---|
-| **Triggers** | "where are my single points of failure", "analyse resilience risk for this scope", "what could break here" |
-| **Inputs** | `scopeId`, `inventory.v1.json`, optional repository paths / IaC roots, optional SLO document, `analysisDepth` (`resources` \| `iac` \| `code`) |
-| **Deterministic work** | IaC parsing and normalisation (see §Code and IaC Analysis); resource-shape rules (single-zone, single-replica, no-retry-configured, single-region dependency, no health probe, probe-not-wired); ARM-ID correlation via deployment history → tags → naming; evidence citation assembly with file/line ranges; hypothesis schema validation; `learningScore = likelihood × blastRadius × falsifiability` (integers 1–5) |
-| **Model work** | **This is the model's primary domain.** Reading service code and IaC to identify failure modes a rule cannot see; writing falsifiable hypotheses; naming the expected changed code path; classifying failure mechanisms. |
-| **Output** | `hypotheses.v1.json` — ranked, each with `evidence[]`, `correlationConfidence`, `expectedChangedCodePath`, `mechanismClass`, and `requiresMechanismLiveness` |
-| **F10/F13 rules** | Any hypothesis whose subject is an observability or health-probe signal **must** carry `mechanismLivenessPredicate` (FR-13) and must declare `consumerCoupling` naming the component that reads the signal. A probe-accuracy item is ranked jointly with its consumer, never independently (F13). |
-| **F11 rule** | Each hypothesis declares `mechanismClass` (e.g. `probe-answerable-from-local-state`). The `check_mechanism_class()` library function (D15) rejects a hypothesis whose class already appears in the durable mechanism ledger with a failed outcome unless `newEvidence[]` is supplied. |
-| **Reuses / extends** | Consumes `[MAIN] state, impact schema/report, monitor evidence, workspace/scenario payloads`; adds `[NEW]` analysis and ledger contracts. It does not replace a current skill. |
-| **Next step** | `chaos-recommend`. |
-
-**1.5 `chaos-recommend`** *(user-facing)*
-
-| | |
-|---|---|
-| **Triggers** | "which chaos experiment should I run", "rank my chaos options", "map my hypotheses to scenarios" |
-| **Inputs** | `hypotheses.v1.json`, `availability.v1.json`, `inventory.v1.json`, optional `riskBudget`, optional `environmentClass` (`dev` \| `test` \| `prod`) |
-| **Deterministic work** | The hypothesis × scenario join; disqualification rules; scoring and ranking; blast-radius computation into a concrete `resourceTargeting` include/exclude document; predicate template instantiation; telemetry-contract sufficiency check |
-| **Model work** | The recommendation *narrative* — why this experiment answers this hypothesis, in the user's own domain terms |
-| **Output** | `recommendations.v1.json` — ranked entries each carrying `scenarioId` (from `availability.v1.json` only), `actionUrn`, `steadyStatePredicate`, `workPredicate`, `confirmRefutePredicate`, `mechanismLivenessPredicate?`, `resourceTargeting`, `guardrails`, `expectedChangedCodePath`, `score`, `scoreBreakdown`, `disqualifications[]` |
-| **Reuses / extends** | Composes `[MAIN] setup-scenario` service output and validation payloads plus `[NEW]` pure scoring functions. It does not rename current recommendation tools. |
-| **Next step** | `chaos-run` with a selected `recommendationId`. |
-
-Kept **separate from `chaos-analyze`** deliberately — see §Alternatives, ALT-2.
-
-**1.6 `chaos-run`** *(user-facing)*
-
-| | |
-|---|---|
-| **Triggers** | "run this scenario", "execute the recommended experiment", "cancel my chaos run" |
-| **Inputs** | `recommendationId` or explicit `{scenarioId, parameters, resourceTargeting, duration}`, `approvalToken`, optional `cancel: true`, optional `runId` |
-| **Deterministic work** | `chaos_create_scenario_configuration`; `chaos_validate_scenario_configuration` (never `--skip-validation`); `frozenValidation` hash over exactly `scenarioName, configurationName, faultType, parameters, targetResources, blastRadius, duration` and byte-for-byte drift comparison at execute time; `chaos_execute_scenario` with **deterministic run-ID recovery** (F7: `run start --no-wait` returns an empty 2xx, so the tool falls back to a `run list` filtered on `startTime ≥ requestSentAt` and matched on configuration name, retrying with backoff, and fails loudly rather than returning null); pre-flight steady-state capture; build attestation; `chaos_cancel_scenario_run`; recovery guidance from `ResourceStateError` / `OperationError` |
-| **Model work** | Presenting the approval prompt and the recovery narrative |
-| **Output** | `run-record.v1.json` — `{runId, scenarioId, configurationId, frozenValidation, buildAttestation, steadyStateBaseline, window:{plannedStart,plannedEnd,actualStart,actualEnd}, targeting, approval:{approvedBy, approvedAt, token}, status}` |
-| **Approval boundary** | Fault execution is the highest-risk write and always requires explicit confirmation. Workspace/configuration/evaluation writes remain separately disclosed. `dryRun` produces configuration + targeting and stops. |
-| **Reuses / extends** | Extends `[MAIN] setup-scenario`, `run-scenario`, `Invoke-SetupScenario.ps1`, `Invoke-RunScenario.ps1`, `Validate-AndFix.ps1`, and the existing create/validate/fix/execute/get/cancel tools. Initial release preserves their names and triggers. |
-| **Next step** | `chaos-diagnose --run-id <runId>`. |
-
-**1.7 `chaos-diagnose`** *(user-facing, entry point in its own right)*
-
-| | |
-|---|---|
-| **Triggers** | "diagnose run &lt;id&gt;", "what happened during my chaos run", "did the fault land", "was the hypothesis confirmed" |
-| **Inputs** | `runId` (sufficient on its own — no prior conversation required), optional `mode` (`explore` \| `verify`), optional predicate overrides |
-| **Deterministic work** | `chaos_get_scenario_run` → exact window; `monitor_fault_window_pack` (pre/during/post buckets); `chaos_prove_fault_landed` (two-sided, per leg); work-starvation check; predicate evaluation; verdict matrix; evidence persistence after each step |
-| **Model work** | Explanation and the exercise-repair brief |
-| **Output** | `diagnosis.v1.json` with a per-leg verdict and an overall verdict |
-| **Reuses / extends** | Composes `[MAIN] chaos-impact` scripts/schema/templates/replay and all three monitor tools; adds distinct proof/verdict logic and may later become the preferred diagnostic entry after compatibility evidence. |
-| **Verify-mode rule (F14, retained verbatim in spirit)** | In `verify` mode the changed-code-path execution must be proven separately. Without that proof the verdict is `NOT EXERCISED` and the skill emits an exercise-repair brief — it may **not** emit `REFUTED`. |
-| **Next step** | `chaos-evidence --run-id`, or `chaos-analyze` with the new evidence. |
-
-**1.8 `chaos-evidence`** *(user-facing)*
-
-| | |
-|---|---|
-| **Triggers** | "export the evidence for run &lt;id&gt;", "give me the chaos report", "what runs do I have" |
-| **Inputs** | `runId` or `scopeId`, optional `format` (`json` \| `markdown` \| `both`), optional `redact` (default `true`) |
-| **Deterministic work** | `evidence_list` / `evidence_get`; bundle assembly; schema validation; Markdown rendering via the existing `Render.ps1`; optional `chaos-impact` report attachment |
-| **Model work** | Executive summary prose only |
-| **Output** | `evidence-bundle.v1.json` + `report.md` |
-| **Reuses / extends** | Extends `[MAIN] State.ps1`, `Render.ps1`, `New-RunReport.ps1`, impact schema/report and offline fixtures; mirrors rather than replaces existing state/report files. |
-| **Next step** | File the finding; optionally emit an Advisor-candidate record (see §Reverse Advisor Flow). |
-
-#### 2. Shared reference documents (not skills)
-
-| File | Contents |
-|---|---|
-| `references/chaos/evidence-contract.md` | The universal invariants, extended. Carried from the prototype's `shared-contract.md`: absence of failure ≠ exercise; check work-starvation *before* interpreting low counts; `null` + caveat, never a fabricated zero; ISO-8601 UTC `Z`; build/test success ≠ resilience proof; frozen workspace during a run. **New:** control-plane state is not data-plane disruption (F6); a predicate over a signal must be paired with a predicate that the signal's mechanism is live (F10); an empty first read of a fault-landed probe is a false negative and must be re-polled (F15); prove fault landing from ARM entity state, not the Activity Log (F15). |
-| `references/chaos/verdict-matrix.md` | The deterministic verdict table (§Run Monitoring). |
-| `references/chaos/fault-semantics.md` | Per-fault data-plane semantics. **Every entry separates what was seen from why it might have happened**, because a behaviour oracle seeded with a misattributed mechanism is worse than an empty one. Fields: `controlPlaneMutation`, `observedEffect`, `candidateMechanism`, `mechanismConfidence` (`verified` \| `plausible` \| `unverified`), `dataPlaneProbe`, `starvationRecipe` (`resourceTargeting.exclude`, F8), `coverage`. Seed entry (F6), stated exactly as the evidence supports: `controlPlaneMutation:` Event Hubs namespace status set to `Disabled`; `observedEffect:` `EventHubProducerClient.Send` succeeded 60/60 (58/0 in the prior run) from an already-connected producer throughout the window; `candidateMechanism:` an already-open AMQP producer link is not force-detached by namespace disable, `mechanismConfidence: unverified`; `rejectedMechanisms:` *"`AmqpSender` caches `MaxMessageSize` after first attach"* — **falsified**, `AmqpProducer.CreateLinkAndEnsureProducerStateAsync` refreshes it on every link open (recorded so it is not re-derived). Only `observedEffect` and `dataPlaneProbe` may influence a verdict; `candidateMechanism` is narrative only. |
-| `references/chaos/telemetry-contract.md` | The minimum telemetry/SLO contract required before execution (§Open Questions Q5), plus the App Insights schema rules from F4. |
-| `references/chaos/blast-radius.md` | `resourceTargeting` semantics: include is AND across dimensions, exclude is OR, exclude wins; `physicalZones` format `{region}-az{N}`; `types` supports trailing wildcard. |
-
-#### 3. MCP tool additions
-
-The initial implementation extends `server.py`, `azure.py`, and `monitor.py` before adding semantically distinct modules. Every new tool preserves the current `{"ok": true, "result": ...}` / `{"ok": false, "errorType": ..., "error": ...}` envelope. Annotation shorthand below is `R/W/D/I` = `readOnlyHint` / performs writes / `destructiveHint` / `idempotentHint`.
-
-| `[NEW]` tool | Parameters | `result` contract | R/W/D/I | Owner; consumers; tests | Name status |
-|---|---|---|---|---|---|
-| `chaos_resolve_scope` | `scope` (subscription/RG/resource IDs) | `{scopeId, canonicalScope, subscriptionIds, resourceIds, warnings}` | T/F/F/T | `[NEW] scope.py` + `server.py`; scope/inventory; `test_scope.py` | Final |
-| `chaos_list_workspaces` | `subscription_id`, optional `resource_group` | `{value[], continuationToken?, source}` with paging/provenance | T/F/F/T | Extend `azure.py` + `server.py`; scope setup; lifecycle tests | Final |
-| `chaos_plan_workspace` | `scope`, optional `workspace_id`, `location`, `identity_type` | `{reuseCandidate?, createPlan?, rbacPlan, mutations[]}`; performs no mutation | T/F/F/T | `[NEW] scope.py` + current RBAC helpers; scope setup; `test_scope.py` | Final |
-| `chaos_get_target_capability_map` | `subscription_id`, `location`, `resource_ids[]` | `{targetTypes[], capabilityTypes[], resourceMatches[], source}` | T/F/F/T | Extend `azure.py` + `server.py`; inventory/availability; lifecycle fixtures | Final after v1 catalog contract fixture |
-| `chaos_probe_validate_scenarios` | workspace identity fields, `scenario_names[]`, `configuration_inputs`, `consent_token` | `{validations[], cleanup:{deleted[],failed[]}, warnings}`; never executes faults | F/T/F/T for same inputs after cleanup | Compose current create/validate APIs in `[NEW] availability.py`; availability; cleanup/consent tests | Final; opt-in only |
-| `chaos_attest_build_identity` | `run_id`, `resource_ids[]`, `window`, optional `version_endpoint` | `{rung, identity, confidence, evidence[], caveats[]}` | T/F/F/T | `[NEW] proof.py` + `server.py`; run/diagnose; `test_proof.py` | Final |
-| `chaos_prove_fault_landed` | run identity fields, `legs[]`, `fault_semantics_version` | `{legs:[{controlPlane,dataPlane,proven,caveats[]}]}`; no candidate mechanism affects `proven` | T/F/F/T | `[NEW] proof.py` + current Monitor/ARM helpers; diagnose; `test_proof.py` | Final, gated by semantics coverage |
-| `evidence_put` | `scope_id`, optional `run_id`, `artifact_type`, `artifact`, optional `expected_revision` | `{path, revision, digest, redactions[]}` | F/T/F/F | `[NEW] evidence.py` + `server.py`; all targeted skills; traversal/redaction/concurrency tests | Final |
-| `evidence_get` | `scope_id` or `run_id`, `artifact_type` | `{artifact, revision, digest, path}` or named not-found error | T/F/F/T | `[NEW] evidence.py`; diagnose/evidence; denylist/path tests | Final |
-| `evidence_list` | optional `scope_id`, `run_id`, `artifact_type`, paging inputs | `{items[], continuationToken?}` | T/F/F/T | `[NEW] evidence.py`; evidence; paging/path tests | Final |
-| `monitor_query_appinsights` | `subscription_id`, `component_resource_id`, `kql`, optional `timespan` | normalized `{tables[], schema:"classic", query}` | T/F/F/T | Extend `monitor.py` + `server.py`; inventory/diagnose; `test_monitor_tools.py` | Final |
-| `monitor_list_alert_instances` | `subscription_id`, `start_time`, `end_time`, optional `resource_id` | `{count, alerts[], apiVersionUsed, filter}` | T/F/F/T | Extend `monitor.py` + `server.py`; diagnose/pack; PowerShell-parity fixtures | Final; pin migration spike-gated |
-| `monitor_fault_window_pack` | run identity fields, `pre_buffer`, `post_buffer`, optional resource/workspace/component IDs | `{window, pre, during, post, sources, caveats[]}` | T/F/F/T | Extend `monitor.py` + existing collectors; diagnose; pack/replay tests | Final |
-| `monitor_check_work_starvation` | `pack`, `work_predicate` | `{exercised, measured, threshold, reason, evidence[]}` | T/F/F/T | `[NEW] verdict.py` wrapper in `server.py`; diagnose; verdict tests | Final |
-
-Earlier draft aliases for discovery, evaluation, and scenario listing are **removed before implementation**. Discovery/recommendation refresh uses shipped `chaos_refresh_recommendations`; scenario listing uses shipped `chaos_list_recommended_scenarios`. The plan assumes no distinct `/evaluate` endpoint. If a future service operation is needed, Epic 1 must first prove its endpoint, API version, request/response shape, and runtime availability, then add a separately named `[NEW]` contract.
-
-Pure scoring, correlation, and verdict functions remain in `[NEW] scoring.py`, `analysis.py`, and `verdict.py`; they are not model-callable tools except for the bounded `monitor_check_work_starvation` contract above.
-
-`chaos_execute_scenario` already has MCP fallback logic, and `Invoke-RunScenario.ps1` already validates then recovers/polls a run. `[NEW]` work hardens those paths; it does not introduce recovery from scratch. Rung-3 behavioral build attestation is windowed and requires a sample floor.
-
-Annotations reflect real HTTP side effects. `outputSchema` remains conditional on the resolved MCP SDK capability. No `chaos_list_tools` is added: if the server is absent, its introspection tool is absent too. Skills declare requirements, compare them with the **host-visible** inventory, and CI checks names against the 15 existing plus any additive registrations.
+The 18 MCP tools are RETAINED unchanged. `chaos_evidence_*` gains three study siblings only if a host actually needs cross-process study access — otherwise DEFERRED (Q6).
 
 ### Data Flow
 
-**Flow A — full journey (happy path)**
+**Flow A — a Kubernetes study, happy path**
 
-1. `chaos-scope-setup(scope)` → resolves scope, finds or plans a workspace, triggers `discover`, checks RBAC → `scope-setup.v1.json` → `evidence_put`.
-2. `chaos-inventory(scopeId)` → ARG enumeration + observability wiring + deployment history + observed dependency edges → `inventory.v1.json`.
-3. `chaos-availability(scopeId)` → shipped recommendation refresh (when stale/forced) + shipped recommended-scenario list + capability map (+ optional Tier B probe validation) → `availability.v1.json`.
-4. `chaos-analyze(scopeId)` → deterministic resource rules + model-driven IaC/code reading + `correlate_iac_to_resources()` + `check_mechanism_class()` → `hypotheses.v1.json`.
-5. `chaos-recommend(...)` → deterministic join, disqualification, scoring, blast-radius computation; model narrative → `recommendations.v1.json`.
-6. `chaos-run(recommendationId, approvalToken)` → configure → validate → freeze → attest build → capture steady state → execute → recover run ID → `run-record.v1.json`.
-7. `chaos-diagnose(runId)` → window from the run → `monitor_fault_window_pack` → `chaos_prove_fault_landed` per leg → starvation check → predicate evaluation → verdict matrix → `diagnosis.v1.json` (+ ledger append on failure).
-8. `chaos-evidence(runId)` → bundle + Markdown.
+1. `chaos-study -Scope <rg> -Question "does the checkout service survive losing a pod?"`
+2. → `chaos-study-scope`: `Ensure-AzLogin` → `Resolve-FaultPath` (capability probe, FR-6) → `Get-K8sReadiness` (FR-7) → `az chaos workspace show-discovery` / `discovered-resource list` → read `faults/_index.md` → read `faults/aks-chaosmesh-pod.md` → model forms the hypothesis → `Resolve-BlastRadius` → `study-plan.v1.json` written to a **new unsealed** `studyId`.
+3. Plan card rendered: hypothesis, steady state, fault + `jsonSpec`, resolved blast radius, duration, abort conditions, signals. **Stop if `-DryRun`.**
+4. → `chaos-study-run`: freeze + hash → validate/fix/revalidate `[E3]` → typed consent → capture `evidence/pre` baseline → execute via `faultPath` → recover run id (FR-13) → poll and evaluate abort conditions → capture `evidence/during` → wait post-buffer → capture `evidence/post` → `run-record.v1.json`.
+5. → `chaos-study-report`: `Build-StudyFindings` → `findings.v1.json` → `New-StudyReport` → `report.html` → `manifest.json` + `SEALED` → `index.json` appended.
+6. Terminal card: verdict banner, top findings, path to `report.html`.
 
-**Flow B — cold entry after a session ends (the F12 scenario)**
+**Flow B — cold entry, weeks later, new conversation**
 
-`chaos-diagnose --run-id f7cf6241` with an empty conversation: the skill calls `evidence_get(runId)` for the run record (frozen validation, baseline, predicates, build attestation) and `chaos_get_scenario_run` for the authoritative window, then proceeds.
+1. `chaos-study-history -Scope <rg>` → reads `index.json` → table of studies with date, scenario, top severity. **No Azure call.**
+2. `chaos-study-history -StudyId A -Against B` → `Compare-Study` → per-signal deltas, findings appeared/resolved/changed → `comparison.v1.json` + comparison HTML.
+3. `chaos-study-history -StudyId A -Rerun` → new unsealed `studyId` with `derivedFrom: A` and the identical plan → hand off to `chaos-study-run`.
 
-**If no evidence record exists, the degraded mode is strictly bounded.** A `CONFIRMED` verdict against a `null` `steadyStateBaseline` is incoherent, because `CONFIRMED` is defined as degradation past a threshold *relative to a baseline*. There are exactly two coherent options and this design takes both, explicitly labelled:
+**Flow C — not ready**
 
-| Degraded sub-mode | Precondition | Permitted verdicts |
-|---|---|---|
-| **Absolute-threshold mode** | The recommendation's `confirmRefutePredicate` carries an **absolute** threshold (e.g. `successRate < 0.95`) rather than a relative one (`successRate < baseline − 2σ`), **and** a historical baseline is recoverable from the `pre` bucket of the same run | `CONFIRMED`, `REFUTED`, `NOT EXERCISED`, with `baselineSource: "pre-bucket"` or `"absolute-threshold"` recorded |
-| **No-baseline mode** | Neither an absolute threshold nor a usable `pre` bucket exists | **`NOT EXERCISED` only.** The diagnosis states `verdictReason: "no-baseline-and-no-absolute-threshold"` and routes to a re-run with predicates captured up front. |
-
-Predicates are therefore required to declare `thresholdKind: "absolute" | "relative"` at recommendation time, so the cold path can tell which sub-mode applies without guessing. Fault-landed attestation and window computation work identically in both sub-modes — they do not depend on a baseline.
-
-**Flow C — targeted entry**
-
-`chaos-availability` alone answers "what can I run here"; `chaos-analyze` alone answers "where are my SPOFs"; `chaos-evidence` alone lists prior runs. None require the others.
+`chaos-study-scope` finds Chaos Mesh absent. It emits a readiness card where every check is pass/fail/unknown with its exact remediation command, writes an unsealed plan marked `blocked`, and stops. **It does not install anything.**
 
 ### API Contracts
 
-All artifacts share an envelope:
+#### New artifact schemas (same envelope as the nine `[E2]` schemas)
 
-```jsonc
-{
-  "schemaVersion": "1",
-  "artifactType": "inventory",
-  "generatedAt": "2025-01-01T00:00:00Z",
-  "scopeId": "scope:sub-0a1b2c3d:rg-payments:v1",
-  "scopeFingerprint": "sha256:9f2c…",
-  "runId": null,
-  "source": { "tool": "chaos_resolve_scope", "apiVersion": "<from chaos_mcp.apiversions>" },
-  "freshness": { "collectedAt": "…Z", "maxAgeMinutes": 1440, "stale": false },
-  "warnings": [],
-  "result": { }
-}
-```
+| Schema | Payload key | Purpose |
+|---|---|---|
+| `study-plan.v1.schema.json` | `plan` | `{studyId, vertical, question, hypothesis, steadyState, fault:{urn,faultPath,parameters}, targeting, duration, abortConditions[], signals[], readiness{}, blocked}` |
+| `findings.v1.schema.json` | `findings` | `[{id, title, severity, confidence, evidence[], signalDeltas[], mechanismProven, remediation{change,where,expectedEffect,reverify}}]` plus a required `limitations[]` |
+| `study-manifest.v1.schema.json` | `manifest` | `{studyId, createdAt, sealedAt, scope, scopeHash, derivedFrom?, faultPath, apiVersions{}, toolSubstitutions[], files:[{path,sha256,bytes}], schemaVersions{}}` |
+| `comparison.v1.schema.json` | `comparison` | `{baseStudyId, againstStudyId, signalDeltas[], findingsAppeared[], findingsResolved[], findingsChanged[], comparable, incomparableReason?}` |
+| `fault-guide.v1.schema.json` | *(front matter)* | Validates every `references/chaos/faults/*.md` header (FR-21) |
 
-**`scopeId` versus `scopeFingerprint` — identity and change detection.** A single undifferentiated scope hash is ambiguous in exactly the way that matters: if the hash covers the *resolved resource set*, adding one resource orphans every cached artifact; if it covers only the *scope string*, cached artifacts silently misrepresent a changed scope. This design splits the two concerns:
+#### New PowerShell contracts
 
-- **`scopeId`** is derived **only** from the user-supplied scope declaration (subscription ID + resource-group name, or a canonicalised sorted resource-ID list, plus a schema-version suffix). It is stable across resource churn and is the **storage key** for the evidence store. It is human-legible on purpose.
-- **`scopeFingerprint`** is `sha256` over the *resolved* resource set (sorted ARM IDs + type + location + a small set of chaos-relevant properties). It is **never** a storage key; it is a **change detector**. When a consumer loads an artifact whose `scopeFingerprint` differs from a freshly computed one, it does not discard the artifact — it emits `scopeDrift: {added[], removed[], changed[]}` as a warning and marks affected findings stale, so the user sees *what* changed rather than losing their history.
+| Script | Key functions | Notes |
+|---|---|---|
+| `scripts/Study.ps1` | `New-Study`, `Get-StudyRoot`, `Resolve-StudyPath`, `Save-StudyArtifact`, `Complete-Study`, `Get-Study`, `Get-StudyIndex`, `Add-StudyIndexEntry`, `Add-CommandTrailEntry` | Sealing is one-way. `Save-StudyArtifact` on a sealed study throws `StudyAlreadySealed`. `Complete-Study` is the seal operation; it uses the approved `Complete` verb so the module passes `Get-Verb` linting, with `Seal-Study` registered as an alias for readability. |
+| `scripts/Invoke-AzChaosClassic.ps1` | `Invoke-AzChaosClassic -Method -Path -Body` | Thin wrapper over `Invoke-AzRest.ps1`, api-version pinned in the promoted `scripts/Constants.ps1` (NFR-9). Exists only because the classic CLI was removed. Enable target, enable capability, create/start/cancel experiment, get execution details. |
+| `scripts/Resolve-FaultPath.ps1` | `Resolve-FaultPath -SubscriptionId -TargetType` | Probes the v2 scenario catalog and the classic target-type catalog; returns `scenario` \| `experiment` \| `none` with the evidence for the answer. Never guesses. |
+| `scripts/Get-K8sReadiness.ps1` | `Get-K8sReadiness -ClusterResourceId` | Seven checks, each `pass`/`fail`/`unknown` + remediation. `kubectl` is optional; its absence yields `unknown`, never `fail`. |
+| `scripts/Get-StudySignals.ps1` | `Get-StudySignals -Window -Sources` | The FR-11 window pack. Composes the `[MAIN] chaos-impact` collectors; adds AKS metrics, Container Insights KQL and Prometheus. |
+| `scripts/Build-StudyFindings.ps1` | `Build-StudyFindings -Plan -RunRecord -Signals` | **Pure.** No I/O, no `az`. Fully unit-testable. Produces findings **and** the mandatory limitations list. |
+| `scripts/New-StudyReport.ps1` | `New-StudyReport -StudyPath` | Deterministic renderer over `skills/chaos-study-report/templates/study-report.html.tmpl`. HTML-escapes every injected value. |
+| `scripts/Compare-Study.ps1` | `Compare-Study -Base -Against` | **Pure.** Refuses to compare across scopes or scenario families, with a stated `incomparableReason`. |
+| `scripts/Preflight.ps1` `[E1]` | `+ Resolve-ToolPath` | Reshaped to optional-tool resolution; existing functions retained. |
 
-Consequences: adding a resource never orphans cached artifacts (fixing the first failure mode); and no artifact can silently describe a scope it no longer matches (fixing the second). `chaos-analyze` and `chaos-recommend` refuse to rank a hypothesis whose cited resource appears in `scopeDrift.removed`.
+#### Retained MCP contracts
 
-**API version in `source`.** `source.apiVersion` is populated at runtime from the single constants module (NFR-9 / E1-T7), never hard-coded in a schema, example or fixture. Fixtures record whatever version the constants module held when they were captured, and the fixture-refresh task is a one-line constant change plus a re-record.
-
-**`inventory.v1.json` → `result`**
-
-```jsonc
-{
-  "resources": [{
-    "id": "/subscriptions/…/providers/Microsoft.Compute/virtualMachineScaleSets/vmss1",
-    "type": "Microsoft.Compute/virtualMachineScaleSets",
-    "location": "eastus",
-    "zones": ["1"],
-    "physicalZones": ["eastus-az1"],
-    "sku": { "name": "Standard_D2s_v3", "capacity": 3 },
-    "tags": {},
-    "chaosTargets": ["Microsoft-VirtualMachineScaleSet"],
-    "singlePoints": ["single-zone"]
-  }],
-  "observability": {
-    "appInsights": [{ "id": "…", "connectedResources": ["…"], "schema": "classic" }],
-    "logAnalytics": [{ "id": "…" }],
-    "diagnosticSettings": [{ "resourceId": "…", "destinations": ["…"] }],
-    "alertRules": [{ "id": "…", "targetResourceIds": ["…"], "severity": 2 }]
-  },
-  "deployments": [{ "name": "main-20250101", "timestamp": "…Z", "resourceIds": ["…"], "templateHash": "…" }],
-  "dependencies": [{
-    "fromResourceId": "…", "toResourceId": null, "toTargetHost": "sb-prod.servicebus.windows.net",
-    "edgeSource": "observed-appinsights", "correlationConfidence": "medium",
-    "callCount7d": 41233, "caveat": "Target is a hostname; no ARM ID resolution available."
-  }],
-  "repositories": [{ "url": "…", "evidence": "deployment tag azd-service-name", "confidence": "medium" }],
-  "slo": null
-}
-```
-
-**`availability.v1.json` → `result`**
-
-```jsonc
-{
-  "workspaceId": "…",
-  "evaluation": { "operationId": "…", "runAt": "…Z", "status": "Succeeded" },
-  "scenarios": [{
-    "id": "/…/workspaces/ws1/scenarios/vmss-zone-down",
-    "name": "vmss-zone-down",
-    "version": "1.0.0",
-    "recommendationStatus": "Recommended",
-    "evaluationRunAt": "…Z",
-    "parameters": [{ "name": "duration", "type": "string", "required": true, "default": "PT10M" }],
-    "actions": [{ "name": "shutdown", "actionId": "urn:csci:microsoft:compute:shutdown/1.0.0",
-                  "duration": "%%{parameters.duration}%%", "runAfter": [] }],
-    "eligibility": {
-      "eligible": true,
-      "matchedResources": ["/…/vmss1"],
-      "prerequisites": [],
-      "blockers": [],
-      "gapReason": null
-    }
-  }],
-  "capabilityMap": [{ "resourceId": "…", "targetType": "Microsoft-VirtualMachineScaleSet",
-                      "targetEnabled": true, "capabilities": ["Shutdown-2.0"], "missingCapabilities": [] }],
-  "tier": "A",
-  "permissionBlockers": null,
-  "permissionBlockersReason": "tier-a-read-only: validations/latest is scoped to a ScenarioConfiguration and requires probeValidation consent"
-}
-```
-
-Under Tier B the last three fields become:
-
-```jsonc
-  "tier": "B",
-  "permissionBlockers": [{
-    "scenarioId": "/…/scenarios/vmss-zone-down",
-    "probeConfigurationName": "chaos-probe-vmss-zone-down-9f2c",
-    "probeConfigurationDeleted": true,
-    "validationStatus": "RequiresAttention",
-    "errors": [{ "resourceId": "…", "requiredPermissions": ["…"],
-                 "missingPermissions": ["…"], "recommendedRoles": ["Chaos Studio Experiment Contributor"] }]
-  }],
-  "permissionBlockersReason": null
-```
-
-**`mechanism-ledger.v1.json` → `result`** *(FR-17; the store for F11)*
-
-```jsonc
-{
-  "scopeId": "scope:sub-0a1b2c3d:rg-payments:v1",
-  "entries": [{
-    "mechanismClass": "probe-answerable-from-local-state",
-    "description": "A health probe whose result is computable without touching the dependency it claims to check.",
-    "firstObservedAt": "…Z",
-    "occurrences": [
-      { "hypothesisId": "H7", "runId": "a1…", "implementation": "IsClosed flag check",       "outcome": "failed", "diagnosisRunId": "a1…" },
-      { "hypothesisId": "H9", "runId": "b2…", "implementation": "$management round-trip",     "outcome": "failed", "diagnosisRunId": "b2…" },
-      { "hypothesisId": "H12","runId": "c3…", "implementation": "cached batch creation",      "outcome": "failed", "diagnosisRunId": "c3…" }
-    ],
-    "status": "failed",
-    "requiresNewEvidenceToRetry": true,
-    "newEvidenceAccepted": []
-  }]
-}
-```
-
-The ledger is appended **only** by `chaos-diagnose` (which alone has a computed verdict) and read by `chaos-analyze` via `check_mechanism_class()`. Three distinct implementations of one class are one ledger entry with three `occurrences`, which is precisely the distinction the prototype's `attemptedFixes` list could not make. It is stored through `evidence_put` under the `scopeId` key, not the `runId` key, because it must outlive any single run.
-
-**`hypotheses.v1.json` → `result.hypotheses[]`**
-
-```jsonc
-{
-  "id": "H1",
-  "statement": "If AZ1 is lost, the order API loses all healthy replicas because the VMSS is single-zone.",
-  "failureMode": "zonal-loss",
-  "mechanismClass": "single-zone-compute",
-  "targetResourceIds": ["/…/vmss1"],
-  "evidence": [{
-    "kind": "iac", "uri": "infra/main.bicep", "lines": [42, 47],
-    "excerpt": "zones: ['1']", "correlationConfidence": "high",
-    "correlationMethod": "deployments-history"
-  }],
-  "expectedChangedCodePath": "src/Api/Startup.cs:ConfigureHealth",
-  "requiresMechanismLiveness": false,
-  "mechanismLivenessPredicate": null,
-  "consumerCoupling": null,
-  "likelihood": 4, "blastRadius": 5, "falsifiability": 5, "learningScore": 100
-}
-```
-
-An observability/probe hypothesis instead carries:
-
-```jsonc
-{
-  "id": "H7",
-  "mechanismClass": "probe-answerable-from-local-state",
-  "requiresMechanismLiveness": true,
-  "mechanismLivenessPredicate": {
-    "description": "Readiness probe emits one dependency span per invocation.",
-    "query": "dependencies | where name == 'health.ready.eventhub' | summarize c=count()",
-    "expect": { "op": ">=", "value": 1, "per": "probeInterval" },
-    "rationale": "Zero dependency spans from an active probe means it is not on the data plane (F10)."
-  },
-  "consumerCoupling": { "consumer": "VMSS automatic repair policy", "shipTogether": true }
-}
-```
-
-**`recommendations.v1.json` → `result.recommendations[]`**
-
-```jsonc
-{
-  "id": "R1",
-  "hypothesisId": "H1",
-  "scenarioId": "/…/scenarios/vmss-zone-down",
-  "actionUrn": "urn:csci:microsoft:compute:shutdown/1.0.0",
-  "provingFault": "Shut down all VMSS instances in eastus-az1 for 10 minutes.",
-  "steadyStatePredicate": { "signal": "requests/successRate", "op": ">=", "value": 0.995, "window": "PT30M", "thresholdKind": "absolute" },
-  "workPredicate":        { "signal": "requests/count",       "op": ">=", "value": 500,   "window": "PT10M", "thresholdKind": "absolute" },
-  "confirmRefutePredicate": {
-    "thresholdKind": "absolute",
-    "confirmIf": { "signal": "requests/successRate", "op": "<", "value": 0.95 },
-    "refuteIf":  { "signal": "requests/successRate", "op": ">=", "value": 0.995 }
-  },
-  "mechanismLivenessPredicate": null,
-  "resourceTargeting": {
-    "include": { "types": ["Microsoft.Compute/virtualMachineScaleSets"], "physicalZones": ["eastus-az1"] },
-    "exclude": { "tags": { "chaos-exempt": "true" } }
-  },
-  "guardrails": { "maxDuration": "PT10M", "environmentClass": "test", "abortIf": [{ "signal": "requests/successRate", "op": "<", "value": 0.5 }] },
-  "expectedChangedCodePath": "src/Api/Startup.cs:ConfigureHealth",
-  "telemetryContract": { "sufficient": true, "missing": [] },
-  "permissionCheck": "not-performed",
-  "dataPlaneProbe": { "faultSemanticsEntry": "urn:csci:microsoft:compute:shutdown/1.0.0",
-                      "coverage": "documented", "probe": "requests/count against az1 instances" },
-  "score": 0.82,
-  "scoreBreakdown": { "learning": 0.34, "eligibility": 0.20, "evidence": 0.18, "safety": 0.10, "telemetry": 0.00, "coupling": 0.00 },
-  "disqualifications": []
-}
-```
-
-`thresholdKind` is mandatory on every predicate: it is what lets the cold-entry path (Flow B) decide between absolute-threshold mode and no-baseline mode without guessing. `permissionCheck` is `"not-performed"` under Tier A and `"passed"` / `"blocked"` under Tier B. `dataPlaneProbe.coverage` is `documented` \| `heuristic` \| `none`, propagated from `fault-semantics.md`; `none` triggers `DQ-NO-DATAPLANE-PROBE` (§Disqualification).
-
-**`diagnosis.v1.json` → `result`**
-
-```jsonc
-{
-  "runId": "f7cf6241",
-  "window": { "start": "…Z", "end": "…Z", "source": "chaos_get_scenario_run" },
-  "buildAttestation": { "rung": 3, "confidence": "medium", "identity": "build-inferred-A3",
-                        "window": { "pre": ["…Z","…Z"], "during": ["…Z","…Z"] },
-                        "samples": { "pre": 412, "during": 388 },
-                        "evidence": ["ServiceBusReceiver.Peek spans present in pre-bucket (412), absent in during-bucket (0)"],
-                        "caveats": ["No /version endpoint; ACR tags are timestamps; VMSS customData null."] },
-  "legs": [{
-    "actionUrn": "urn:csci:microsoft:eventhub:disable/1.0.0",
-    "actionName": null,
-    "actionNameSource": "unavailable-service-returned-null",
-    "inferredLegIdentity": { "method": "resource-type-poll", "confidence": "medium" },
-    "controlPlane": { "proven": true, "evidence": { "entityStatus": "Disabled", "readAt": "…Z", "repolled": true, "reads": 2 } },
-    "dataPlane":    { "proven": false, "probe": "dependency EventHubProducerClient.Send failure rate",
-                      "probeCoverage": "documented",
-                      "evidence": { "pre": { "success": 58, "failure": 0 },
-                                    "during": { "success": 60, "failure": 0, "failureRate": 0.0 },
-                                    "deltaVsPre": 0.0 },
-                      "caveat": "Observed: sends continued to succeed while the namespace reported Disabled. Candidate mechanism (an already-open AMQP producer link is not force-detached by namespace disable) is UNVERIFIED — see fault-semantics.md and CS-5. Verdict rests on the observation, not the mechanism." },
-    "verdict": "NOT EXERCISED"
-  }],
-  "workStarvation": { "workObserved": 612, "threshold": 500, "starved": false },
-  "predicates": [{ "id": "steadyState", "evaluated": true, "value": 0.998, "pass": true }],
-  "verdict": "NOT EXERCISED",
-  "verdictReason": "Data-plane disruption not proven for any targeted leg.",
-  "baselineSource": "pre-bucket",
-  "degradedMode": null,
-  "ledgerAppend": { "mechanismClass": "control-plane-only-disruption", "occurrenceRecorded": true },
-  "nextAction": "exercise-repair-brief"
-}
-```
+All 18 tools keep their names, signatures and `{"ok": …}` / `{"ok": false, "errorType": …}` envelopes. No tool is removed or renamed in v0.4.x.
 
 ### Design Decisions
 
 | # | Decision | Rationale |
 |---|---|---|
-| **D1** | Eight additive peer entry skills, no internal skill handoffs | P1/F14. They compose the shipped five; no current skill is replaced in the initial release. |
-| **D2** | Do not port `[PR32 PROTOTYPE] scenario-catalog.v1.json`; scenario names come only from service-derived availability | P2/G2. The prototype file never existed on main, so this is not a deletion. |
-| **D3** | Fault-landed proof is two-sided and per leg | F6. Control-plane state is intent; data-plane disruption is effect. Verdicts built on intent are unsound. |
-| **D4** | Build identity uses a rung ladder, and records the rung | F1. A gate that cannot be satisfied is either a blocker or theatre. Recording the rung preserves rigour without blocking. |
-| **D5** | One `monitor_fault_window_pack` tool, not N raw queries | F2/F4. The bundle is the unit of evidence; assembling it by hand four times is both toil and a correctness risk. |
-| **D6** | Skills declare `requiredTools`, reconciled at preflight | F5. A skill naming absent tools is a silent trap. |
-| **D7** | Evidence store outside `tmp/`, mirrored per phase | F12. Durability is a functional requirement of the journey, not a convenience. |
-| **D8** | `mechanismClass` ledger, not `attemptedFixes` list | F11. Three implementations of the same error class are one failure, not three. |
-| **D9** | Mechanism-liveness predicate mandatory for probe/observability changes | F10. A formally valid predicate over a dead mechanism proves nothing. |
-| **D10** | Advisor is optional context and a downstream destination, not a grounding gate | F9. Advisor reasons about configuration shape; chaos findings are about behaviour under fault. Requiring Advisor grounding makes the exception clause the default path. |
-| **D11** | Probe-accuracy items are scored jointly with their consumer | F13. A2-without-A3 was worse than no signal. |
-| **D12** | Preserve the strict pre-execute validation gate | `[MAIN] run-scenario` already validates/fixes/revalidates before invoking CLI start with `--skip-validation`; `[NEW] chaos-run` must preserve that gate and may remove the CLI flag only if behavior/tests prove it is redundant. |
-| **D13** | Least-privilege via `validations/latest` remediation rather than `chaos_fix_resource_permissions` by default | `fixResourcePermissions` grants broadly; the validation payload names `missingPermissions` and `recommendedRoles` per resource, enabling a targeted grant. **This decision only applies where validation data exists** — i.e. inside `chaos-run` (always), or in `chaos-availability` under Tier B (opt-in). Under Tier A no per-resource remediation is offered; the skill states that permissions are unchecked. `fixResourcePermissions` remains available behind explicit consent. |
-| **D14** | The model proposes, code evaluates | Carried from the prototype's `evaluate`/`apply` split — the single most valuable pattern on that branch. |
-| **D15** | Pure decision functions stay **library functions**, not MCP tools | Correlation, mechanism-class lookup, scoring and blast-radius are pure. Purity — not MCP exposure — is what makes them testable. Exposing them would let the model invoke the scorer with fabricated inputs and present the output as a deterministic result, which is strictly worse than not exposing them. They are called only from within `chaos_*` tools that own the real inputs. |
-| **D16** | `scopeId` (declaration-derived, stable) is separate from `scopeFingerprint` (resolution-derived, change detector) | A single hash either orphans cached artifacts on any resource churn or silently misrepresents a changed scope. Splitting them gives stable storage keys *and* honest drift reporting. |
-| **D17** | Predicates declare `thresholdKind` | Without it the cold-entry path cannot tell whether a verdict is computable from absolute thresholds or requires a baseline it does not have; a `CONFIRMED` verdict against a null baseline is incoherent, because `CONFIRMED` is defined relative to that baseline. |
-| **D18** | `approvalToken` is issued outside model control | An approval the model can mint is not an approval. See §Execution Guardrails. |
-
-**Compatibility decision spanning D1–D18:** v0.x retains the current five skill names/triggers, all 15 MCP names/signatures/envelopes, current state-file compatibility, `impactReportSchemaVersion: 1`, and offline replay. New names are additive; an alias exists for at least one minor release before any removal.
+| **D1** | **A study, not a loop, is the product unit.** | P3/P4. A dated, sealed, reportable artifact is what a team schedules a review around. A controller is not. |
+| **D2** | **Five study skills: one entry + four supporting.** | G1/G2. One skill hides four genuinely independent jobs — "am I ready", "run it", "report it", "compare it" — that people ask for separately. Thirteen skills makes selection ambiguous. Five is the smallest set where each front door answers a question a user actually asks. The five shipped skills are not folded in or renamed in v0.4.x (NFR-10); collapsing the total from ten to five is a v0.5 question owned by Q12, decided with usage data rather than now. |
+| **D3** | **Hard 200-line cap on every user-facing `SKILL.md`, enforced in CI.** | P2. `setup-scenario` reached 181 lines by accretion. Without a mechanical limit the fault pack would be re-inlined within two epics. |
+| **D4** | **`az chaos` is the primary control plane; REST is a wrapped fallback.** | G5. `Invoke-AzChaos.ps1` already exists and already carries the retry/error contract. A second wrapper, not prompt-level `az rest`, preserves the "no ad-hoc calls" invariant. |
+| **D5** | **`faultPath` is discovered at runtime, not assumed.** | The v2 CLI has no AKS scenarios and the classic CLI is gone. Hard-coding either path guarantees breakage when the catalog changes. The probe result is recorded in the manifest so a study is reproducible even after the catalog moves. |
+| **D6** | **MCP is optional; absence selects the script path and is recorded.** | N2/P5. F5's real lesson is "never silently substitute", not "always hard-fail". Recording the substitution in the manifest and the report satisfies F5 without making an accelerator a dependency. |
+| **D7** | **Immutable sealed studies; rerun creates a new study.** | F12/P4. Mutable results cannot be compared and cannot be trusted. Seal-then-append is also the cheapest correct concurrency model. |
+| **D8** | **Findings carry severity + confidence + `mechanismProven`, replacing the three-verdict vocabulary as a user-facing concept.** | F6/F10. `CONFIRMED`/`REFUTED`/`NOT EXERCISED` is precise but unreadable in a report. The information is preserved: `mechanismProven: false` is exactly `NOT EXERCISED`, and it forces a Limitations entry. `verdict-matrix.md` is retained as the internal derivation table. |
+| **D9** | **The model proposes; scripts compute.** | The one pattern worth keeping from `[PR32]`. The model writes the hypothesis and the prose; it cannot set a severity, a number, or a limitation. |
+| **D10** | **Fault knowledge lives in a schema-validated guidance pack, one file per fault.** | P7/G9. Front matter makes guides machine-checkable; one file per fault makes a new fault a new file. |
+| **D11** | **The HTML report is a single file with no external assets and no JavaScript requirement.** | NFR-7/NFR-8. Reports get emailed, attached to tickets and opened from `file://` on locked-down machines. A CDN dependency breaks all three. |
+| **D12** | **Report rendering is deterministic except `generatedAt`.** | FR-17. Two reports must be diffable; a non-deterministic renderer makes comparison worthless. |
+| **D13** | **Limitations are mandatory and script-generated.** | F14/P8. The most valuable sentence in a chaos report is "here is what we did *not* prove". Left optional, it is the first thing dropped. |
+| **D14** | **Kubernetes is the first and only vertical in v0.4.0.** | G8. One complete vertical beats five shallow ones, and it is the only way to discover whether the `faultPath` split actually holds. |
+| **D15** | **The `[E3]` validate/fix/revalidate gate and the two consent levels are preserved unchanged.** | G12/FR-9/FR-10. They are correct, tested, and the highest-risk code in the repository. Rewriting them for cosmetic consistency would be reckless. |
+| **D16** | **The study store is built on the `[E2]` evidence primitives, not beside them.** | NFR-5/NFR-6. Redaction, canonicalization and the key denylist are the hardest-won code in `[E2]`. Forking them would double the audit surface. |
+| **D17** | **PR #32 is closed and replaced, not extended.** | P9. Its state machine is the thing being removed; extending it would reintroduce P1–P4. |
+| **D18** | **The eight `[E1]`-frozen contracts stay frozen through v0.4.x.** | NFR-10. Skill *surface* is changing; tool signatures, state files and impact schema v1 are not. The freeze tests remain the merge gate. |
+| **D19** | **Speculative deterministic modules are deferred, not built.** | Revision 5 planned `scoring.py`, `analysis.py`, `verdict.py`, `proof.py`, `scope.py`, `availability.py`, a 30-case nDCG golden set and a mechanism-class ledger. None has a consumer in a study-shaped product. They are DEFERRED with a named revisit trigger, not silently dropped. |
+| **D20** | **`chaos-study-history` needs no Azure call for `list`/`show`/`compare`.** | FR-15/NFR-11. Historical analysis must work offline, on a plane, after the subscription has been deleted. |
 
 ---
-
 ## Detailed Design
 
-The sections below are the detailed half of the Proposed Design: the analysis, scoring, guardrail, monitoring, evidence, testing and migration contracts that the eight skills and the MCP tool set depend on. They are grouped here so the top-level document skeleton stays legible.
+### 1. Study lifecycle and state
 
-### Code and IaC Analysis
+A study has exactly four states. There is no controller, no phase engine and no run-state document — the state **is** the presence of files on disk, which is why a cold conversation can resume without memory (N3, D1).
 
-#### Parsing strategy
-
-| Stack | Approach | ARM-ID recoverability |
+| State | Determined by | Permitted transitions |
 |---|---|---|
-| **ARM JSON** | Parse directly: `resources[].type`, `dependsOn`, `copy`, nested deployments | Types and dependency edges are reliable; **names are not** when built from `uniqueString()`/`concat()` |
-| **Bicep** | `bicep build` → ARM JSON, then as above; module graph from `module` declarations | Same limitation; `uniqueString()` is not invertible |
-| **Terraform** | Prefer `terraform show -json` (state) — contains **real ARM IDs**; fall back to `terraform show -json <plan>`; last resort, HCL parse | State gives high-confidence IDs; plan/HCL gives medium/low |
-| **Kubernetes / Helm / Kustomize** | `helm template` / `kustomize build` to static YAML; extract Deployments, replica counts, PDBs, topology-spread constraints, probes, HPA, Services, and `image` references (digest pinning is a build-identity rung-2 input) | Cluster-internal; correlate to the AKS resource ID via kubeconfig context / cluster name |
-| **App code (.NET, Java, Node, Python, Go)** | Model-driven read of client construction, retry/timeout/circuit-breaker configuration, connection-string/endpoint configuration keys, health-probe handlers, and telemetry emission | Endpoints in config → hostname → medium-confidence ARM ID resolution |
+| `PLANNED` | `study-plan.v1.json` exists, `SEALED` absent | → `EXECUTED`, → `SEALED` (blocked or abandoned plan) |
+| `EXECUTED` | `run-record.v1.json` exists, `SEALED` absent | → `SEALED` |
+| `SEALED` | `SEALED` marker + `manifest.json` exist | terminal |
+| `ABANDONED` | `PLANNED` older than `CHAOS_STUDY_ABANDON_HOURS` (default 72) with no run record | → `SEALED` with `outcome: abandoned` |
 
-#### Correlating to ARM resource IDs without overclaiming
+`Get-Study` derives the state from the directory; it never reads a status field, because a status field can disagree with reality. A study that crashed mid-execution is `PLANNED` with a partial `evidence/` tree, and `chaos-study-run -StudyId <id> -Resume` re-enters at the first missing artifact.
 
-The `correlate_iac_to_resources()` library function (D15 — a pure function in `chaos_mcp/analysis.py`, not a model-callable MCP tool) applies a strict ladder and records both the method and a confidence:
+Sealing is a three-step commit, in this order, so a crash at any point leaves a detectably incomplete study rather than a lying one:
 
-1. **`Microsoft.Resources/deployments` history** (`high`) — the deployment record links a template/`templateHash` to the resource IDs it actually produced. Most authoritative available signal.
-2. **Tags** (`high` when a convention tag such as `azd-env-name` / `azd-service-name` / a repo tag is present and unique; `medium` otherwise).
-3. **Naming convention** (`low`) — regex-derived, always `low`, and always accompanied by a caveat.
-4. **Unresolvable** → `targetResourceId: null` with `caveat`. **Never** a guessed ID (NFR-3).
+1. Render `report.html` into a temp file, `fsync`, rename into place.
+2. Compute SHA-256 over every file in the directory **except `manifest.json` and `SEALED`** (neither exists yet), write `manifest.json` atomically.
+3. Create the `SEALED` marker, then append one record to `<scopeHash>/index.json`.
 
-Rules that prevent overclaim:
+`index.json` is a **rebuildable cache, not a source of truth**. `Get-StudyIndex -Rebuild` reconstructs it by scanning sealed directories, so a lost or corrupt index costs a scan, never a study (NFR-6).
 
-- An evidence item without an ARM ID may still support a hypothesis, but caps that hypothesis's `correlationConfidence` at `low` and disqualifies it from automatic top-3 ranking.
-- App Insights `dependencies.Target` is a **hostname**, not an ARM ID (F4-adjacent). A hostname → ARM ID resolution attempt is recorded as its own evidence item with its own confidence; failure is `null`, not omission.
-- IaC that is not demonstrably deployed to the scope under analysis is labelled `deployedState: unknown` and cannot alone justify a `high`-confidence hypothesis.
+### 2. Consent, safety and abort
 
----
+Three gates, each with a distinct trigger and a distinct exit code. The **broad permission consent** is `[E3]` code retained verbatim (D15); the other two are new in EPIC-010 and reuse the `[E3]` prompt mechanics.
 
-### Recommendation Scoring and Disqualification
+| Gate | Trigger | Mechanism | Exit code | Owner |
+|---|---|---|---|---|
+| **Execution consent** | Any fault execution | Typed confirmation bound to `frozenConfigHash`; the plan card must have been rendered in the same invocation | `11` — declined | **New**, EPIC-010 |
+| **Broad permission consent** | `Validate-AndFix` proposes a grant wider than the targeted proposal from `Build-TargetedGrantProposal` | `$env:STARTCHAOS_CONSENT_BROAD_PERMISSION_FIX`, retained verbatim from `[E3]` | `4` — unconsented | `[E3]`, retained |
+| **Drift abort** | `frozenConfigHash` at execute ≠ at validate | Abort with a rendered diff; no re-prompt, no auto-refreeze | `12` — drift | **New**, EPIC-010 |
 
-#### Disqualification (applied first, deterministically)
+**Abort conditions** are declared in the plan (FR-8) and evaluated by the poller, not the model. Each is a predicate over one collected signal with a threshold and a dwell time, e.g. `availableReplicas == 0 for any targeted Deployment for > 60s`. On breach, `chaos-study-run` issues `az chaos scenario run cancel` (v2) or the classic cancel (experiment path), records `abortedBy`, `abortedAtUtc` and the breaching predicate, and **still completes the post-window capture** — an aborted study is a valid study with a finding, not a discarded one.
 
-A hypothesis × scenario pair is **disqualified** — never ranked, always explained — if any of the following holds:
+`-DryRun` defaults to **true** on `chaos-study` (N8, Q4). A dry run performs **no Azure mutation** — it does write a local unsealed `study-plan.v1.json`, which is a local file, not a change to the user's cloud estate. To execute, the user must pass `-DryRun:$false` **and** type the consent string.
 
-| Code | Rule |
-|---|---|
-| `DQ-NOT-IN-CATALOG` | The scenario does not appear in `availability.v1.json` for this scope. |
-| `DQ-NOT-RECOMMENDED` | `recommendationStatus` ∈ `{NotApplicable, EvaluationFailed, EvaluationCancelled}`. |
-| `DQ-STALE-EVALUATION` | `evaluationRunAt` older than `maxAgeMinutes`; remediation is "re-run `chaos-availability --forceEvaluate`". |
-| `DQ-CAPABILITY-MISSING` | The action URN's target type/capability is not enabled on any in-scope resource. |
-| `DQ-PERMISSION-BLOCKED` | Validation reports `missingPermissions` for a targeted resource. **Only reachable when validation data exists** — Tier B availability or inside `chaos-run`. Under Tier A this rule never fires and `permissionCheck` is `"not-performed"` (see §Permission-Blocker Acquisition). |
-| `DQ-NO-TELEMETRY` | The confirm/refute predicate's signal has no source in `inventory.observability` — the experiment cannot produce evidence. |
-| `DQ-NO-WORK` | Historical work volume in the proposed window is below the work predicate threshold; the run would be starved by construction. |
-| `DQ-MECHANISM-CLASS-REPEAT` | The hypothesis's `mechanismClass` is in the failed ledger without `newEvidence[]` (F11). |
-| `DQ-LIVENESS-MISSING` | `requiresMechanismLiveness` is true but no `mechanismLivenessPredicate` is present (F10). |
-| `DQ-NO-DATAPLANE-PROBE` | The scenario's fault type has **no** `fault-semantics.md` entry and no heuristic probe, so a data-plane attestation is impossible by construction and the run could only ever return `NOT EXERCISED`. **Warn-only until the coverage bar in Epic 7a is met** (see the launch-usability analysis there); disqualifying from day one would eliminate most of the catalog. |
-| `DQ-BLAST-RADIUS` | The computed `resourceTargeting` exceeds the guardrail (e.g. matches production resources when `environmentClass != prod`, or matches more than the configured fraction of replicas). |
-| `DQ-UNSAFE-DURATION` | Requested duration exceeds the guardrail or the 12-hour platform ceiling. |
+**N8 has one known exception, and it is in shipped code, not in this design.** `skills/run-scenario/SKILL.md:68` documents `$env:STARTCHAOS_NONINTERACTIVE=1`, and `Invoke-RunScenario.ps1:48` honours it to skip the confirmation prompt. The five new study skills **ignore that variable entirely** — there is no environment variable, flag or file that grants execution consent on the study path, and a test asserts it (E10-T6). Closing the legacy path is E15-T8; until it lands, N8 is a guarantee of the study suite, not of the whole plugin, and the release notes must say so.
 
-#### Scoring (only for qualified pairs)
+### 3. The signal window pack (FR-11)
 
-```
-score = 0.35 · learningNorm
-      + 0.20 · eligibilityConfidence
-      + 0.20 · evidenceConfidence
-      + 0.15 · safetyHeadroom
-      + 0.10 · telemetrySufficiency
-      +        couplingAdjustment
-```
+`Get-StudySignals` is the single answer to F2/F3/F4. It composes the shipped `[MAIN]` collectors rather than replacing them: `skills/chaos-impact/scripts/Get-MonitorSignals.ps1` and `Get-DiagnosticSettings.ps1` already implement metric, resource-log, Activity Log and alert-instance collection with the AlertsManagement `timeRange=custom` + `customTimeRange` contract and the `2023-05-01-preview` → `2018-05-05` fallback. That contract is **RETAINED unchanged**; the Kubernetes sources are added beside it.
 
-- `learningNorm` = `(likelihood × blastRadius × falsifiability) / 125`, each factor an integer 1–5 (carried from the prototype).
-- `eligibilityConfidence` — 1.0 for `Recommended` with a fresh evaluation and a full capability match; 0.6 for `NotEvaluated` with a capability match; 0.0 otherwise (already disqualified).
-- `evidenceConfidence` — mean of evidence-item confidences (`high`=1.0, `medium`=0.6, `low`=0.3), penalised 0.2 if any item lacks an ARM ID.
-- `safetyHeadroom` — 1.0 when the blast radius is a strict subset of a redundancy group (e.g. one of three zones), decreasing toward 0 as it approaches total.
-- `telemetrySufficiency` — fraction of the predicate signals with a confirmed source, including a live alert rule for alert-based predicates.
-- `couplingAdjustment` (**F13**) — if `consumerCoupling.shipTogether` is true and the consumer is not part of the same recommendation, apply **−0.25 and emit a `COUPLING-SPLIT` warning**; if the pair is bundled, apply **+0.10**. This directly prevents the A2-without-A3 ordering that produced a confidently green dashboard during a total outage.
-
-Ties break on: higher `evidenceConfidence`, then smaller blast radius, then shorter duration.
-
-Every score is emitted with its `scoreBreakdown` so a user can see exactly why an item ranked where it did. `score_recommendations()` is a **pure library function** over the three input artifacts (`chaos_mcp/scoring.py`), not an MCP tool — see D15. It is called from the `chaos-recommend` entry script, which owns the real artifact inputs; making it a tool would let the model invoke the scorer with fabricated inputs and present the result as deterministic. Reproducibility and unit-testability come from purity, not from MCP exposure.
-
----
-
-### Execution Guardrails, Approval and RBAC
-
-#### Approval boundary
-
-`chaos-run` is the only targeted entry that executes a fault. Other setup/availability entries may perform disclosed ARM writes, but fault execution requires the stronger approval turn carrying:
-
-- the frozen configuration (`scenarioName`, `configurationName`, `faultType`, `parameters`, `targetResources`, `blastRadius`, `duration`);
-- the resolved target list with counts (e.g. "3 of 9 VMSS instances, all in `eastus-az1`");
-- the abort predicates;
-- the environment class and any `prod` acknowledgement.
-
-`frozenValidation` is hashed at validate time and compared **byte-for-byte** at execute time. Any drift aborts with `FROZEN-DRIFT` and the diff. This is retained unchanged from the prototype.
-
-##### `approvalToken` — issuance and verification (FR-18)
-
-Passing an `approvalToken` into `chaos-run` without saying who issues it leaves the whole security question open: **an approval the model can mint is not an approval.** The token is therefore never produced by, visible to, or derivable by the model.
-
-| Property | Design |
-|---|---|
-| **Issuer** | The `chaos-run` *entry script* (`Request-ChaosApproval.ps1`), invoked by the CLI host as a distinct, non-model step. It renders the frozen configuration to the terminal and reads a typed confirmation from the human on stdin. |
-| **Binding** | `token = HMAC-SHA256(k_session, frozenValidationHash ‖ scenarioConfigurationId ‖ resourceTargetingHash ‖ notAfter)`. |
-| **Key transport** | `k_session` is generated by the entry script and handed to the MCP server process **out of band of any model-visible channel**. It is *not* stored in the evidence store, because the evidence store is fronted by the model-callable `evidence_get` and anything reachable through that tool is reachable by the model. Preference order: (1) an **OS keyring** entry (`Windows Credential Manager` / `libsecret` / macOS Keychain) named `chaos-approval-<sessionId>`, read once at server start; (2) a file at `$CHAOS_KEY_DIR/session.key` created with user-only ACL, whose directory is on an explicit `evidence_*` **path denylist** and is outside `$CHAOS_EVIDENCE_ROOT`; (3) an environment variable on the server process, which is acceptable only because tool code cannot enumerate the host's environment back to the model. In all three cases the key never appears in a tool argument, a tool result, an artifact, or a log line. |
-| **Enforcement** | `evidence_get`/`evidence_put`/`evidence_list` resolve every requested path against `$CHAOS_EVIDENCE_ROOT` after symlink resolution and reject anything outside it, and additionally reject any path under `$CHAOS_KEY_DIR`. `test_evidence_get_cannot_reach_key_material` asserts this for a direct path, a traversal (`../`), a symlink, and an absolute path — and asserts that no `evidence_*` result ever contains the key bytes. If this test fails, the approval boundary is void and CI blocks the build. |
-| **Scope** | Bound to one configuration and one resolved target set. Re-targeting, re-parameterising or a changed duration changes `frozenValidationHash` or `resourceTargetingHash` and invalidates the token. |
-| **Lifetime** | `notAfter` defaults to **15 minutes** after issuance. Expiry forces re-approval, so a stale approval cannot be replayed against a scope that has drifted. |
-| **Single use** | The token's HMAC is recorded in the evidence store on first successful `chaos_execute_scenario`. A second presentation is rejected with `APPROVAL-REPLAY`. |
-| **Verification** | Performed inside `chaos_execute_scenario` (server side), not in prompt text. A missing, malformed, expired, replayed or mis-bound token fails closed with no execution attempt. |
-| **Audit** | `run-record.v1.json` stores `approval: { hash, issuedAt, notAfter, confirmedBy, frozenValidationHash }` — the hash, never the token. |
-
-The consequence that matters: the model can *ask* for approval and can *present* the configuration, but the only path from "recommended" to "executing" runs through a human keystroke into a process the model does not control.
-
-#### Tool allowlists
-
-| Phase | Allowed tools |
-|---|---|
-| Setup / inventory / analyse / recommend | Read-only tools only (`readOnlyHint: true`), plus `chaos_create_workspace` and role assignment behind explicit consent in `chaos-scope-setup` |
-| Availability — **Tier A** (default, non-destructive) | Shipped `chaos_refresh_recommendations`, shipped `chaos_list_recommended_scenarios`, `[NEW] chaos_get_target_capability_map`. The list/map calls are read-only; refresh performs a disclosed, non-destructive POST (see below). |
-| Availability — **Tier B** (opt-in) | Tier A plus `chaos_probe_validate_scenarios`, which internally creates, validates and deletes a disposable `ScenarioConfiguration`. Requires an explicit `--probe-validation` flag **and** a consent turn naming the configurations it will create and delete. Not covered by the `chaos-run` approval token; it has its own, weaker consent because it never executes a fault. |
-| Run | `chaos_create_scenario_configuration`, `chaos_validate_scenario_configuration`, `chaos_execute_scenario`, `chaos_cancel_scenario_run`, `evidence_put` |
-| Diagnose / evidence | Read-only + `evidence_put` |
-
-**F8 fix:** `chaos_validate_scenario_configuration` is explicitly present in the run-phase allowlist. The engagement found `config validate` unreachable from the agent's write allow-list, which forced `--skip-validation` and forfeited the permission-blocker data. This is the reason `chaos-run` can always obtain authoritative blockers even when availability ran at Tier A.
-
-#### Least-privilege RBAC
-
-Azure Chaos Studio ships exactly four built-in roles — **Chaos Studio Experiment Contributor**, **Chaos Studio Operator**, **Chaos Studio Reader** and **Chaos Studio Target Contributor**. "Chaos Studio Contributor" and "Chaos Studio Owner" do **not** exist; a plan that instructs an operator to grant either fails at the first `az role assignment create`.
-
-| Operation | Minimum role |
-|---|---|
-| Scope resolution, inventory, analysis | `Reader` on the scope |
-| Telemetry reads | `Monitoring Reader` (+ App Insights component reader) |
-| Workspace read, scenario/configuration read | **`Chaos Studio Reader`** on the workspace |
-| Availability Tier A (optional recommendation refresh + list + capability map) | Verify the caller can invoke shipped `refreshRecommendations`; otherwise use cached scenario/evaluation data with a staleness warning or require `Chaos Studio Experiment Contributor` for refresh |
-| Availability **Tier B** (create/validate/delete a probe configuration) | **`Chaos Studio Experiment Contributor`** on the workspace — this is the concrete privilege cost of Tier B and must be stated in the consent turn |
-| Workspace create / resource-group-level Chaos resource creation | **`Chaos Studio Experiment Contributor`** on the resource group (plus `Contributor` if the RG itself must be created) |
-| Target enablement | **`Chaos Studio Target Contributor`** on the targeted resources |
-| Role assignment for the workspace identity | `User Access Administrator` or `Role Based Access Control Administrator`, scoped to the targeted resources only |
-| Execute / cancel a run | **`Chaos Studio Operator`** on the workspace; separately, the *workspace identity* holds only the roles named in `validations/latest → recommendedRoles`, scoped per resource |
-
-Role assignments are proposed as concrete `az role assignment create` commands via `Build-RoleAssignmentRemediation` and never applied silently. `chaos_fix_resource_permissions` is retained but demoted: it is offered only after the targeted remediation is declined, and its broader grant is stated explicitly (D13).
-
-#### No-impact and no-exercise handling
-
-Three distinct outcomes, never conflated:
-
-| Situation | Verdict | Next action |
+| Window | Definition | Why |
 |---|---|---|
-| Fault landed on both planes, work present, steady state degraded past the confirm threshold | `CONFIRMED` | Remediation brief |
-| Fault landed on both planes, work present, steady state held above the refute threshold | `REFUTED` | Record the resilience proof; consider a larger blast radius |
-| Fault landed on control plane only (F6), **or** work starved, **or** changed-code-path execution unproven in verify mode (F14), **or** build attestation failed at all rungs | `NOT EXERCISED` | Exercise-repair brief naming the exact missing proof and the leg-starvation recipe from `fault-semantics.md` |
+| `pre` | `[runStart − baselineMinutes, runStart)` | Captured **before** execution starts, never reconstructed afterwards (F15) |
+| `during` | `[runStart, runEnd)` | Half-open; the fault's own window |
+| `post` | `[runEnd, runEnd + recoveryMinutes)` | Recovery evidence, and the only place "did it come back" can be answered |
 
-`NOT EXERCISED` is never downgraded to `REFUTED`. This single rule would have prevented the unsound Event Hubs verdicts (F6) and the manual `REFUTED` on A3 (F14).
+`baselineMinutes` defaults to the run duration, floor 15, cap 120. `recoveryMinutes` defaults to `max(10, duration/2)`.
+
+| Source | Path | Failure behaviour |
+|---|---|---|
+| AKS platform metrics | `Microsoft.Insights/metrics` on the cluster resource | `null` + caveat |
+| Container Insights | Log Analytics query API — `KubePodInventory`, `KubeEvents`, `KubeNodeInventory`, `ContainerLog` (bounded) | `null` + caveat naming the missing table |
+| Managed Prometheus | Azure Monitor workspace query, when the cluster has a Prometheus data-collection rule | Absent is `unknown`, never `fail` |
+| Activity Log | Existing `[MAIN]` collector | Context only — **never** fault-landed proof (F15) |
+| Alert instances | Existing `[MAIN]` AlertsManagement collector | `null` + caveat |
+| Chaos run detail | `az chaos scenario run show` / classic execution details | Re-polled once on an empty first read (F15) |
+
+Every source returns `{ source, window, requestedAt, values | null, caveat | null, queryDigest }`. A `null` with a caveat is a first-class result; a fabricated `0` is a contract violation with a dedicated test (NFR-3).
+
+### 4. Findings derivation and the limitations taxonomy
+
+`Build-StudyFindings` is a **pure function**: `(plan, runRecord, signals) → (findings[], limitations[])`. No `az`, no filesystem, no clock. That is what makes the most opinionated part of the product exhaustively testable offline (NFR-1, D9).
+
+**Severity** is assigned from the measured delta against the plan's steady-state predicate — never by the model (D9):
+
+| Severity | Rule |
+|---|---|
+| `critical` | Steady state breached and **not** recovered inside the `post` window |
+| `high` | Steady state breached, recovered inside `post`, recovery longer than the declared objective |
+| `medium` | Steady state breached and recovered within the declared objective |
+| `low` | Steady state held, but a secondary signal degraded beyond its threshold |
+
+**Confidence** is orthogonal to severity and is derived from `mechanismProven` plus source coverage. This is where the `[E2]` `verdict-matrix.md` survives as the internal derivation table (D8):
+
+| `verdict-matrix.md` verdict | Study representation |
+|---|---|
+| `CONFIRMED` | `mechanismProven: true`, `confidence: high` |
+| `REFUTED` | `mechanismProven: true`, finding with `severity: low` or none, `confidence: high` |
+| `NOT EXERCISED` | `mechanismProven: false`, `confidence: low`, **and a mandatory limitation entry** |
+
+`mechanismProven` is true only when a data-plane signal moved inside the `during` window in the direction the fault guide's `dataPlaneProof` predicts. Control-plane state — a run reporting `Succeeded`, a resource reporting `Disabled` — can never set it (F6, P8, FR-12).
+
+**Limitations taxonomy** (FR-18, D13). `Build-StudyFindings` emits one entry per applicable class; the list is never empty because `L1` always applies:
+
+| Class | Emitted when |
+|---|---|
+| `L1 scope` | Always — states exactly which resources were in the affected set and which were not |
+| `L2 unknown-check` | Any readiness check returned `unknown` |
+| `L3 absent-signal` | Any planned signal returned `null` |
+| `L4 unproven-mechanism` | Any finding has `mechanismProven: false` |
+| `L5 heuristic-proof` | The fault guide's `dataPlaneProof.coverage` is `heuristic` |
+| `L6 advisory-targeting` | `resourceTargeting` was advisory only and was not transmitted to the service (`blast-radius.md`) |
+| `L7 substituted-tool` | The manifest records a `toolSubstitutions[]` entry (FR-20) |
+| `L8 aborted` | The run was cancelled by an abort condition |
+| `L9 build-identity` | Build identity was established below rung 1 (F1) — recorded, never a gate |
+
+### 5. Report contract (FR-16 – FR-19)
+
+`report.html` is one file. Fixed section order, each mapped to a template region:
+
+1. **Header** — study id, scope, date, `faultPath`, verdict banner.
+2. **Executive summary** — the only model-authored prose block, visually marked `narrative`.
+3. **What we tested** — hypothesis, steady-state predicate, fault URN and parameters, resolved blast radius, duration, abort conditions.
+4. **What happened** — per-signal pre/during/post table with inline SVG sparklines, and a link to the Chaos Studio portal scenario report (N9 — linked, not reimplemented).
+5. **Findings** — ordered by severity then confidence; each carries evidence references, `mechanismProven`, and coupling notes (F13).
+6. **Limitations** — script-generated, mandatory, non-empty (D13).
+7. **Remediation** — per finding: the change, where, expected observable effect, how to re-verify (FR-19).
+8. **Appendix** — redacted command trail, api-versions, schema versions, tool substitutions, environment.
+
+Determinism (D12, FR-17): the renderer sorts every collection by an explicit key, formats every number with an invariant culture and a fixed precision, emits no timestamps other than the single `generatedAt` slot, and derives nothing from a hash-set iteration order. The determinism test renders the same study twice, masks `generatedAt`, and asserts byte equality — plus a third render on a different OS in the Pester matrix.
+
+Injection safety: `New-StudyReport` HTML-escapes every value drawn from Azure or from the model. The template contains no `<script>` and no `style` attribute sink; a Pester test asserts no rendered output contains `<script` or `javascript:` (NFR-8).
+
+### 6. Comparison and rerun semantics (FR-15)
+
+`Compare-Study` is pure and refuses to produce a misleading comparison. Two studies are **comparable** only when all of the following hold; otherwise `comparable: false` with a stated `incomparableReason` and no deltas:
+
+- identical `scopeHash`;
+- identical fault URN **and** capability version;
+- identical `faultPath`;
+- steady-state predicate identical after normalisation;
+- window lengths within ±20%.
+
+When comparable, the output carries per-signal deltas (`base`, `against`, `delta`, `direction`), `findingsAppeared[]`, `findingsResolved[]`, `findingsChanged[]` (severity or confidence moved), and an overall `improved | regressed | mixed | unchanged`. Findings are matched on a stable `findingKey` = hash of (fault URN, signal, predicate) — **not** on the title, which is model-influenced.
+
+`-Rerun` copies the plan verbatim into a new `PLANNED` study with `derivedFrom: <baseStudyId>`, refreshes nothing except the resolved blast radius (resources may have changed) and surfaces any drift in the plan card before consent.
+
+### 7. Progressive discovery mechanics
+
+The mechanism is deliberately dumb, because clever routing is what makes prompts grow (P2, D3). **Steps 1–3 are prompt instruction; step 4 is the test-enforced guarantee.** We cannot test that a model read exactly one guide; we can and do test that the pack is well-formed, complete and additive, which is what makes the instruction followable.
+
+1. Every `SKILL.md` contains one routing instruction and no fault parameters. *(prompt)*
+2. `references/chaos/faults/_index.md` is a single table: `faultUrn | vertical | faultPath | guide | dataPlaneProof.coverage`. *(artifact)*
+3. The model reads `_index.md`, picks one row, and reads exactly one guide. *(prompt)*
+4. `Test-FaultGuideIndex` (Pester) asserts the index and the guide files are in bijection, that every guide validates against `fault-guide.v1.schema.json`, and that no `SKILL.md` contains a `faultUrn` or a `jsonSpec` literal. A guide with `dataPlaneProof.coverage: none` fails the schema and cannot ship. *(enforced)*
+
+A new fault is therefore: one new guide file, one new index row, one schema-validated front matter block. No script change, no skill change, no test change (G9).
+
+### 8. Error and exit-code contract
+
+Exit codes are **additive, never reassigned**. The shipped skills already use `0`–`4`, verified in `skills/setup-scenario/scripts/Invoke-SetupScenario.ps1` (lines 34, 39, 139, 175, 313) and pinned by `SetupExitContract.Tests.ps1`. The study suite therefore starts a **new block at 10** rather than colliding with them.
+
+| Code | Meaning | Owner |
+|---|---|---|
+| `0` | Success | `[MAIN]`, all skills |
+| `1` | Unexpected error, or caller targeting starves the blast radius | `[MAIN]`/`[E3]` |
+| `2` | `setup-scenario`: scenario selection required | `[MAIN]` — **not reused** |
+| `3` | `setup-scenario`: parameter mode required | `[MAIN]` — **not reused** |
+| `4` | Broad permission fix unconsented | `[E3]`, retained verbatim; propagated unchanged by `chaos-study-run` |
+| `10` | Readiness/preflight failed — remediation printed | New |
+| `11` | Execution consent declined | New |
+| `12` | Configuration drift between validate and execute | New |
+| `13` | `StudyAlreadySealed` — write attempted on a sealed study | New |
+| `14` | `FaultPathUnavailable` — the capability probe returned `none` | New |
+| `15` | `StudyIncomparable` — compare refused, reason printed | New |
+
+### 9. Testing strategy
+
+No new harness is introduced. Every suite lands under a path the existing CI already scans: Pester at `Run.Path = './copilot-cli-plugin/skills'` (so shared-script tests live under `skills/*/tests/`, as `[E1]`/`[E2]` already do), pytest with `_TEST_TRANSPORT`, and `ruff check chaos_mcp tests`.
+
+| Layer | What is tested | How |
+|---|---|---|
+| Pure functions | `Build-StudyFindings`, `Compare-Study`, `Resolve-BlastRadius`, `Build-TargetedGrantProposal` | Table-driven Pester over JSON fixtures. No mocks needed — they take data and return data. |
+| Study store | Sealing, immutability, atomicity, index rebuild, path canonicalization, redaction, root-location assertions | Pester against a temp `CHAOS_STUDY_ROOT`, mirroring `[E2] State.Tests.ps1` |
+| Collectors | `Get-StudySignals`, `Get-K8sReadiness`, `Resolve-FaultPath` | Recorded-response replay, extending the `[MAIN] chaos-impact` offline-replay harness pattern (`tests/e2e/Run-OfflineReplay.ps1`) |
+| Renderer | Determinism, HTML escaping, no external assets, no `<script>`, size bound | Golden-file Pester with a masked `generatedAt` |
+| Contracts | Skill line caps, `optionalTools` front matter, fault-guide index bijection, schema validity, api-version pin liveness | Lint-style Pester + the existing pytest manifest tests |
+| Regression freeze | 15 original MCP tool names/signatures/envelopes, `FROZEN_SKILLS`, `impactReportSchemaVersion: 1`, state-file compatibility | `[E1]`/`[E2]` freeze tests, extended not replaced (D18) |
+
+**No test requires Azure.** Live verification is a separate, manually invoked Phase-2 exercise against a disposable subscription, and its results are recorded in this document, not in CI.
+
+Three golden studies are committed as fixtures and drive the report and comparison tests: a clean pass, a `critical` finding with proven mechanism, and a `NOT EXERCISED` study with an aborted run.
 
 ---
 
-### Run Monitoring Contracts
+## Chaos Studio Product Issues
 
-#### Window derivation
+Service and product gaps, not plugin work. The suite degrades explicitly around each; each should be filed with the Chaos Studio service team. **Nothing in the Implementation Plan is blocked on these being fixed.**
 
-The authoritative window comes from `chaos_get_scenario_run` (`properties.startTime`, `properties.endTime`), never from wall-clock estimation. Per-leg windows come from `scenarioRunSummary[]` (`startedAt`, `completedAt`).
-
-Buckets are half-open and symmetric by default:
-
-```
-pre    = [start - D, start)
-during = [start, end)
-post   = [end, end + D)      where D = end - start
-```
-
-`monitor_fault_window_pack` returns all three buckets in a single call with per-bucket counts, rates, p50/p95/p99, and `null` (never `0`) where a source is missing.
-
-#### Baseline continuity
-
-The `pre` bucket must satisfy a continuity check before it may serve as a baseline:
-
-| Check | Source | Default | Configurable |
+| ID | Issue | Evidence | Behaviour in this plan |
 |---|---|---|---|
-| Same build identity in `pre` and `during` | `chaos_attest_build_identity` at both boundaries | required at rung ≥ 3 | no |
-| No deployment event inside the `pre` window | Activity Log, `Microsoft.Resources/deployments/write` and equivalents | required | no |
-| Work-volume ratio `workDuring / workPre` | `monitor_fault_window_pack` counts | within **[0.5, 2.0]** | yes — `baselineContinuity.workRatioBounds` |
+| **CS-1** | `scenarioRunSummary[].actionName` returns `null` | F7 — null on all three actions of run `f7cf6241` | Label by `actionUrn`; record `actionNameSource`; never invent a name (FR-13) |
+| **CS-2** | `run start --no-wait` returns an empty 2xx with no run id | F7 — every run required a `run list` filtered on `startTime` | Deterministic run-id recovery, failing loudly rather than returning null (FR-13) |
+| **CS-3** | No per-leg data-plane disruption attestation; the service reports intended mutation only | F6 — Event Hubs `Disabled` while sends were 60/60 successful | `mechanismProven: false` unless an independent data-plane signal moved; forces limitation `L4` |
+| **CS-4** | `RecommendationStatus` carries no `notRecommendedReason` | Eligibility gaps are otherwise unexplainable | Readiness synthesises a reason from capability-map misses; otherwise `unknown` |
+| **CS-5** | Permission blockers are readable only through a **configuration-scoped** `validations/latest`; there is no workspace- or scenario-scoped "would this be permitted?" read | TypeSpec: `Validation` is `@parentResource(ScenarioConfiguration)` `@singleton("latest")` | `chaos-study-scope` reports `permissionBlockers: null` with a reason; authoritative blockers come from `chaos-study-run`, which creates a configuration anyway |
+| **CS-6** | Per-fault data-plane semantics are undocumented | F6, F8 | The fault guidance pack (EPIC-005) with `dataPlaneProof.coverage` surfaced in the plan **and** the report |
+| **CS-7** | Exclusion-based leg starvation is undiscoverable, and `resourceTargeting` include/exclude is **not accepted by `az chaos scenario config create`** | `[E3] blast-radius.md` | Targeting is labelled advisory in the plan card and forces limitation `L6` |
+| **CS-8** | No published v2 service limits, run-history retention, or cancel semantics | API research | Configurable safety caps; the study store is the retention answer, not the service |
+| **CS-9** | The v2 Scenarios catalog contains **no AKS scenario templates** | Catalog review | `faultPath` probe falls back to the classic experiment path (D5) |
+| **CS-10** | The classic CLI surface (`az chaos experiment`/`target`/`capability`/`target-type`) was **removed** without a v2 equivalent for Kubernetes — a capability regression for AKS users | Learn pages 404; extension reference lists only the v2 verbs | `Invoke-AzChaosClassic.ps1`, a pinned REST wrapper (FR-5). This is the single highest-value product fix on this list. |
+| **CS-11** | Every AKS fault requires in-cluster Chaos Mesh in the `chaos-testing` namespace — no other namespace is supported, Linux node pools only, and the fault's own control plane shares the failure domain it is testing | Fault library prerequisites | Readiness reports it as a check; the guides carry it as a `knownLimitation` |
+| **CS-12** | The v2 surface is preview-only with no documented deprecation window, and two preview versions (`2026-05-01-preview`, `2026-08-01-preview`) are in play with no published difference | Repo pins vs external spec research | Stay on the shipped `2026-05-01-preview`; single pin per language (NFR-9); contract tests fail loudly on shape change; a bump is evidence-gated (E15-T7) |
 
-**Why ±50% and why it is configurable.** The bound exists to reject baselines drawn from a materially different traffic regime — comparing a 10 a.m. `pre` bucket against a 3 a.m. `during` bucket makes a rate comparison meaningless even though both buckets are "successful queries". The specific factor-of-two is a **heuristic, not a derived value**: it is roughly the diurnal swing of a steadily-loaded service over a window of tens of minutes, and it is wide enough not to reject well-behaved runs while narrow enough to catch a shift-change or a batch job. It is *not* defensible as a universal constant — a service with a nightly ETL spike or a bursty consumer will legitimately exceed it — so it is exposed as `baselineContinuity.workRatioBounds` in the run record, defaulted to `[0.5, 2.0]`, recorded in every diagnosis so a reader can see which bound was applied, and overridable per scope after a rejected-baseline warning. A tighter bound is the right choice for a steady request/response API; a looser one for anything batch-shaped.
-
-Rate-based predicates (success *rate*, failure *rate*) are the reason this is a warning rather than a hard failure: a ratio outside bounds inflates variance but does not invalidate a rate comparison the way it invalidates a count comparison. Count-based predicates therefore hard-fail continuity; rate-based predicates degrade to `baselineQuality: "low"` and cap the diagnosis at `confidence: medium`.
-
-Failing continuity, the baseline is marked `usable: false` and the steady-state predicate is evaluated against a stored historical baseline instead — or, absent that, the no-baseline rules of Flow B apply (`NOT EXERCISED` unless the predicate carries `thresholdKind: "absolute"`).
-
-#### Work-starvation check (runs first)
-
-`monitor_check_work_starvation` runs **before** any low-count signal is interpreted. If `workObserved < threshold`, every failure-count-based predicate is reported as `null` with `starved: true`, and the run verdict is `NOT EXERCISED`. This ordering is a hard invariant carried from the prototype's shared contract.
-
-#### Fault-landed proof
-
-Per leg, `chaos_prove_fault_landed` produces:
-
-- **Control plane** — an ARM read of the targeted entity's state (e.g. Event Hubs namespace/entity `status`, VMSS instance `powerState`, NSG rule presence), taken from **ARM entity state, not the Activity Log** (F15), with a **mandatory re-poll** after a bounded delay when the first read is empty — an empty first read is a known false negative, observed on the NSG leg (F15).
-- **Data plane** — a per-leg disruption probe defined in `fault-semantics.md`: dependency-span failure rate for the specific `Target` host, connection reset/retry counts, resource-specific throttling or error metrics. The probe must show a **change relative to `pre`**, not merely a nonzero value.
-
-`controlPlane.proven && !dataPlane.proven` → leg verdict `NOT EXERCISED` with the fault-semantics caveat attached (F6).
-
-Leg identity: `scenarioRunSummary[].actionName` is used when non-null. When the service returns null (F7, observed on all three actions of run `f7cf6241`), the tool falls back to `actionUrn` and then to a per-resource-type ARM poll, recording `actionNameSource` and `inferredLegIdentity.confidence`. The fallback never silently mislabels a leg.
-
-#### Alert-instance predicate
-
-`monitor_list_alert_instances` answers "did an alert instance fire inside the window" by matching shipped PowerShell behavior first. `[MAIN] Get-MonitorSignals.ps1` sends **both** `timeRange=custom` and `customTimeRange=<start>/<end>`, and `[MAIN] Constants.ps1` pins AlertsManagement `2023-05-01-preview` with `2018-05-05` fallback. The Python helper uses the same paired parameters and pin/fallback, records `apiVersionUsed`, and has parity fixtures for preview success and fallback. Any future change to parameter pairing or API versions requires verified service evidence and a migration spike; this plan does not assert that the parameters are mutually exclusive.
-
-The tool extends `[MAIN] chaos_mcp/monitor.py`, is wrapped in `server.py`, and is tested in `mcp/tests/test_monitor_tools.py`. AlertsManagement remains a distinct helper/function inside that module, but reuses its current envelope, retry, filtering and time-window conventions.
-
-An alert-based confirm predicate is disqualified at recommendation time (`DQ-NO-TELEMETRY`) unless a matching alert rule exists in `inventory.observability.alertRules`.
-
-#### Durable state
-
-After each phase, the skill calls `evidence_put`. The store root is `$CHAOS_EVIDENCE_ROOT` (default: a per-user application-data directory), explicitly **not** a repository `tmp/` path (F12). Writes are atomic with a revision counter, mirroring the prototype's locked-state semantics. `chaos-diagnose --run-id` and `chaos-evidence --run-id` are the recovery entry points.
-
----
-
-### Evidence Provenance, Confidence and Freshness
-
-| Rule | Statement |
-|---|---|
-| **Provenance** | Every evidence item carries `source` (tool + API version), `collectedAt`, and `query` where applicable. An item without provenance is invalid and rejected by schema validation. |
-| **Confidence** | `high` \| `medium` \| `low`, defined per evidence kind (see the correlation ladder). Confidence is assigned by code from the collection method, never chosen by the model. |
-| **Freshness** | `collectedAt` + `maxAgeMinutes` + computed `stale`. A stale artifact is usable only with an explicit warning and never for a `CONFIRMED` verdict. |
-| **Missing data** | Represented as `null` plus a `caveat` string naming why. Omitting the field entirely is a contract violation. |
-| **Null vs zero** | A cited `0` means "measured zero from a successful query". Absence, failure, or an unqueryable source is `null`. Conflation is the single most common source of unsound verdicts. |
-| **Absence of failure** | Never evidence of resilience on its own — it must be paired with a satisfied work predicate and a proven data-plane disruption. |
-| **Control vs data plane** | Control-plane state is evidence about the platform's intent only. It may never satisfy a disruption predicate (F6). |
-| **Mechanism liveness** | A predicate over a signal is invalid unless the signal's producing mechanism is separately proven to execute (F10). |
-| **Build/test success** | Not evidence of resilience (carried from the prototype). |
-| **Timestamps** | ISO-8601 UTC with `Z`. Windows are half-open. |
-
----
-
-### Testing Strategy
-
-#### Layers
-
-| Layer | Scope | Tooling | Runs in CI |
-|---|---|---|---|
-| **Schema/contract tests** | Every artifact schema validates its fixtures; every MCP tool's returned envelope matches its declared contract — asserted against `outputSchema` where E1-T5 confirms SDK support, and against a checked-in envelope schema otherwise, so the layer is not blocked on the spike | pytest + `jsonschema`; Pester for PowerShell artifacts | Yes |
-| **Deterministic policy tests** | Disqualification rules, scoring, tie-breaks, verdict matrix, window arithmetic, null-vs-zero, freshness, blast-radius computation | pytest, pure functions, no I/O | Yes |
-| **Recorded integration tests** | MCP tools against `_TEST_TRANSPORT` MockTransport with recorded ARM/Monitor payloads | pytest + existing hook | Yes |
-| **Offline replay E2E** | Full journey over recorded fixtures — split into two harnesses sharing one fixture corpus (see below) | Pester (PowerShell skills) + pytest (Python journey) | Yes |
-| **Live smoke** | A single low-blast-radius scenario in a dedicated test subscription | Manual/nightly, gated | No (opt-in) |
-| **Recommendation quality eval** | nDCG@3 over a golden set | pytest + a scoring script | Yes (threshold-gated) |
-
-**Note on CI dependencies.** The schema/contract layer needs `jsonschema`, which the current workflow does **not** install (`.github/workflows/test.yml` installs only `pytest pytest-cov httpx` after `pip install -e .`). Adding `jsonschema` to a `test` extra in `copilot-cli-plugin/mcp/pyproject.toml` and installing `.[test]` in CI is a prerequisite for Epic 1, not an afterthought — without it the schema tests would be collected and skipped, which is worse than not having them.
-
-##### The cross-language E2E problem, and why it is two harnesses rather than a bridge
-
-The suite spans two runtimes: the existing skills are PowerShell (with a Pester harness and seven `recorded-*.json` fixtures), and the new deterministic core is Python (`chaos_mcp`, with the `_TEST_TRANSPORT` MockTransport hook). Asserting a single "full journey E2E" is not enough — it must be said how one harness would drive the other. The two candidate designs:
-
-| Option | Mechanism | Assessment |
-|---|---|---|
-| **Single Pester harness driving Python** | Pester shells out to the `chaos-mcp` console script (declared in `pyproject.toml`) with `_TEST_TRANSPORT` pointed at a fixture directory, parsing stdout artifacts | Superficially attractive — one green/red signal. But it makes every Python assertion failure surface as an opaque non-zero exit inside a PowerShell test, requires marshalling structured failures through stdout, and puts a Python dependency on the PowerShell CI job. Debugging cost is high and grows with the Python surface. |
-| **Two harnesses, one fixture corpus** ✅ | `tests/e2e/Run-OfflineReplay.ps1` (Pester) covers the PowerShell skill scripts; `tests/e2e/test_journey_replay.py` (pytest) covers the Python journey end to end via `_TEST_TRANSPORT`. Both read the **same** `fixtures/` tree and both validate their outputs against the **same** artifact JSON schemas. | Chosen. Each failure surfaces in its native runtime with a native stack trace. The shared fixture corpus and shared schemas are what make the two halves compose — the integration risk is "do the artifacts match the contract", and that is exactly what both halves assert. |
-
-The integration seam is therefore the **artifact contract**, not a process boundary: the Pester harness asserts that the PowerShell skills *produce and consume* schema-valid artifacts, and the pytest harness asserts the Python journey does the same over identical inputs. A **golden-artifact test** pins one complete journey's artifact set (byte-comparable after timestamp normalisation) so a change in either runtime that alters the shared shape fails loudly on both sides.
-
-**Acceptance criterion (revised).** *Not* "one E2E harness runs the full journey". Instead: (a) `Run-OfflineReplay.ps1` exercises every PowerShell skill script against the shared corpus and validates outputs against the artifact schemas; (b) `test_journey_replay.py` exercises scope → inventory → availability → analyze → recommend → run → diagnose → evidence against the same corpus with no network access; (c) a golden-artifact set is committed and compared in both harnesses; (d) both are wired into `.github/workflows/test.yml` as separate jobs.
-
-#### Fixtures to add
-
-| Fixture | Purpose |
-|---|---|
-| `fixtures/arm/scenarios-list.json` | Scenario list with mixed `recommendationStatus` values including `NotApplicable` and `EvaluationFailed` |
-| `fixtures/arm/capability-map.json` | v1 `targetTypes` + `capabilityTypes` join, with a deliberate missing capability |
-| `fixtures/arm/validations-latest-permission-errors.json` | `RequiresAttention` with `missingPermissions`/`recommendedRoles` — **Tier B / `chaos-run` only** |
-| `fixtures/arm/probe-validation-lifecycle.json` | **Tier B fixture** — create → validate → delete sequence, plus a variant where `validate` fails so cleanup must still run |
-| `fixtures/arm/run-null-actionname.json` | **F7 regression fixture** — `scenarioRunSummary[].actionName` null on all actions |
-| `fixtures/arm/run-start-empty-2xx.json` | **F7 regression fixture** — empty 2xx on start, exercising run-ID recovery |
-| `fixtures/appinsights/classic-schema.json` | **F4 regression fixture** — lowercase `dependencies`/`customMetrics` columns, resource-scoped, no subscription in the request |
-| `fixtures/appinsights/eventhub-send-60-0.json` | **F6 regression fixture** — 60 successes / 0 failures during a "landed" fault |
-| `fixtures/alerts/instances-custom-time-range.json` | **F3 fixture** — alert instances inside and outside an exact window; asserts `timeRange=custom` and `customTimeRange=<start>/<end>` are both sent, with preview success and fallback variants |
-| `fixtures/arm/nsg-empty-then-populated.json` | **F15 regression fixture** — empty first read, populated on re-poll |
-| `fixtures/build/no-version-endpoint.json` | **F1 fixture** — forces the ladder to rung 3 |
-| `fixtures/ledger/mechanism-class-three-implementations.json` | **F11 fixture** — one class, three occurrences, three distinct implementations |
-| `fixtures/iac/{bicep,terraform-state,helm}/…` | Correlation-ladder fixtures with high/medium/low/unresolvable cases |
-
-#### Named regression tests (each traceable to field evidence)
-
-| Test | Asserts |
-|---|---|
-| `test_control_plane_only_yields_not_exercised` | F6 — entity `Disabled` + 60/0 sends → `NOT EXERCISED`, never `REFUTED` |
-| `test_run_id_recovered_from_empty_start` | F7 — empty 2xx → run ID recovered by `startTime` filter; failure raises, never returns null |
-| `test_null_action_name_falls_back_to_urn` | F7 — `actionNameSource` recorded, leg not mislabelled |
-| `test_appinsights_subscription_injection_and_classic_schema` | F4 — the two *verified* causes only: the subscription ID is injected into the resource-scoped query path, and lowercase classic column names are handled. **No assertion about escaping `first`** — that cause was not reproducible and the claim that `first` is a reserved token is unsupported (see §Corrections to the field record). |
-| `test_alert_instance_custom_time_range` | F3 — paired `timeRange=custom` + `customTimeRange=<start>/<end>` carry the exact window, `apiVersionUsed` records preview or fallback, and half-open boundary behaviour holds |
-| `test_nsg_empty_first_read_repolled` | F15 — one empty read does not produce `proven: false` |
-| `test_build_ladder_records_rung` | F1 — rung 3 fingerprint accepted with `confidence: medium`, `minSamples` enforced, caveats present |
-| `test_liveness_predicate_required_for_probe_hypothesis` | F10 — `DQ-LIVENESS-MISSING` fires |
-| `test_mechanism_class_repeat_blocked` | F11 — three distinct implementations of one class are blocked as one |
-| `test_mechanism_ledger_schema_and_append_only` | FR-17 — the ledger validates against `mechanism-ledger.v1.schema.json`; only `chaos-diagnose` may append; occurrences accumulate rather than replacing |
-| `test_coupling_split_penalty` | F13 — probe fix without its consumer is penalised and warned |
-| `test_required_tools_preflight_fails_named` | F5 — a `requiredTools` entry absent from the host's `tools/list` produces a named failure, not a substitution |
-| `test_evidence_survives_tmp_wipe` | F12 — artifacts resolve from `$CHAOS_EVIDENCE_ROOT` with `tmp/` deleted |
-| `test_null_vs_zero` | NFR-3 — unqueryable source yields `null` + caveat, not `0` |
-| `test_work_starvation_precedes_interpretation` | Invariant ordering |
-| `test_tier_a_never_claims_no_blockers` | FR-3 — with no validation data, `permissionBlockers` is `null` with a reason, `DQ-PERMISSION-BLOCKED` does not fire, and `eligibilityConfidence` is capped at 0.6 |
-| `test_tier_b_probe_validation_always_cleans_up` | Tier B — the disposable `ScenarioConfiguration` is deleted on the success path **and** on the validate-failure and exception paths; the test asserts the DELETE was issued in a `finally`-equivalent |
-| `test_approval_token_binding` | FR-18/D18 — a token minted for configuration A is rejected for configuration B; an expired token is rejected; a replayed token is rejected with `APPROVAL-REPLAY`; execution is not attempted in any rejection case |
-| `test_cold_entry_without_baseline_is_not_exercised_only` | D17 — with `steadyStateBaseline: null` and `thresholdKind: "relative"`, only `NOT EXERCISED` is reachable; with `thresholdKind: "absolute"`, `CONFIRMED`/`REFUTED` become reachable and `baselineSource` is recorded |
-| `test_scope_drift_marks_stale_not_orphaned` | D16 — a changed `scopeFingerprint` yields `scopeDrift` warnings and stale marks, and the artifact is still loadable under the same `scopeId` |
-| `test_baseline_work_ratio_bounds_configurable` | Baseline continuity — the default `[0.5, 2.0]` is applied and recorded; an override is honoured; count-based predicates hard-fail while rate-based degrade to `baselineQuality: "low"` |
-| `test_api_versions_centralised` | NFR-9/E1-T7 — a lint test asserts no api-version string literal appears outside `chaos_mcp/apiversions.py` |
-
-#### Recommendation-quality evaluation
-
-No public benchmark for chaos-scenario recommendation exists, so the plan defines its own. A golden set of **30 cases** (scope fixture + hypotheses + availability + a human-graded relevance label per candidate on a 0/1/2 scale) lives in `evals/recommendation/`. Primary metric **nDCG@3**; secondary precision@3 and MRR. CI gates on a regression threshold (nDCG@3 must not drop more than 0.05 below the recorded baseline). Grading rubric and inter-grader process are documented alongside the set; the initial grading is by two reviewers with disagreements resolved in writing.
-
----
-
-### Migration and Reuse
-
-| Source asset | Initial disposition | Reuse/migration contract |
-|---|---|---|
-| `[MAIN] skills/start-chaos`, `create-workspace`, `setup-scenario`, `run-scenario`, `chaos-impact` | **EXTEND/REFACTOR, not replace** | Keep names, trigger phrases, entry scripts and exit behavior. Targeted skills call/compose their scripts and tools. |
-| `[MAIN] State.ps1` and `STARTCHAOS_STATE_PATH` files | **EXTEND** | Existing JSON remains readable/writable. Durable evidence mirrors/imports it; no forced move. |
-| `[MAIN] chaos-impact` schema/templates/scripts/tests/replay | **EXTEND** | Preserve schema v1 and PowerShell replay; consume report as a diagnosis source and add fixtures rather than a parallel collector. |
-| `[MAIN] all 15 MCP tools` | **EXTEND** | Names, positional/optional parameters and envelope stay. Add fields or new semantically distinct tools only. |
-| `[MAIN] monitor.py` and `test_monitor_tools.py` | **EXTEND** | Own App Insights normalization, alert instances and the pack so transport/retry/envelope logic is not duplicated. |
-| `[MAIN] chaos_fix_resource_permissions` | **RETAIN behind explicit consent** | Targeted remediation is preferred. Do not deprecate until usage/service data supports it. |
-| `[PR32 PROTOTYPE] state engine and shared contract` | **Pattern reuse only** | Re-express atomic write, proposal/evaluate, invariants and verdict vocabulary in current modules. Do not copy the monolith. |
-| `[PR32 PROTOTYPE] run-state/external-gate schemas` | **NOT PORTED** | New focused artifacts and the build ladder supersede their ideas; they never existed on main. |
-| `[PR32 PROTOTYPE] scenario catalog` | **NOT PORTED** | Service response is authoritative. No main deletion. |
-| `[PR32 PROTOTYPE] chaos-loop/advisory/coding skills` | **NOT PORTED** | Current shipped workflow remains; remediation coding stays out of scope. |
-
-**Version/deprecation strategy.** Ship backward-compatible hardening as additive v0.x minors (first target 0.4.0 only after all three version files are updated together). Retain current skill names/triggers, 15 tool names/signatures/envelopes, state files and impact schema. If a future name is preferred, keep an alias for **at least one minor release** and publish telemetry/rollback criteria before removal. Broad permission fix remains available behind explicit consent until a separately approved deprecation.
-
-**Measurable compatibility gate.** Before each phase merges: (1) `/start-chaos` completes the existing recorded path; (2) each of the five skills remains directly invocable; (3) the registry still lists all 15 tools with unchanged callable signatures and envelopes; (4) current `startchaos-state.json` fixtures resume; (5) `OfflineReplayE2E.Tests.ps1` / `Run-OfflineReplay.ps1` stay green; and (6) Pester ubuntu/windows/macos, pytest Python 3.10–3.13, and ruff all pass.
-
----
-
-## Chaos Studio Product Issues (separate from this plan)
-
-These are **service/product defects and gaps**, not skill-instruction changes. This plan degrades gracefully around each, but each should be filed with the Chaos Studio service team. The workaround column is what the suite implements in the meantime.
-
-| ID | Issue | Evidence | Workaround in this plan |
-|---|---|---|---|
-| **CS-1** | `scenarioRunSummary[].actionName` returns `null` | F7, run `f7cf6241`, null on all three actions | Fall back to `actionUrn`, then per-resource-type ARM poll; record `actionNameSource` and confidence |
-| **CS-2** | `run start --no-wait` returns an empty 2xx with no run ID | F7, every run required a `run list` filtered on `startTime` | Deterministic run-ID recovery inside `chaos_execute_scenario`, failing loudly rather than returning null |
-| **CS-3** | No per-leg data-plane disruption attestation. The service reports intended mutation only | F6, Event Hubs `Disabled` with `EventHubProducerClient.Send` 60/60 successful | Independent data-plane probes per leg from `fault-semantics.md`; `NOT EXERCISED` when only the control plane is proven |
-| **CS-4** | `RecommendationStatus` has no `notRecommendedReason` / ineligibility-reason field | Availability design; eligibility gaps are otherwise unexplainable | Synthesise `gapReason` from capability-map misses and unsatisfiable parameters (Tier A), plus validation permission errors where available (Tier B / run); otherwise `"unknown"` |
-| **CS-4b** | Permission blockers are only obtainable through a **configuration-scoped** `validations/latest`; there is no workspace- or scenario-scoped "would this be permitted?" read. `WorkspaceEvaluation` returns aggregate counts and per-template `RecommendationStatus` only | TypeSpec: `Validation` is `@parentResource(ScenarioConfiguration)` `@singleton("latest")`; `fixResourcePermissions` is likewise configuration-scoped | A read-only permission-preflight at workspace or scenario scope would remove the need for Tier B entirely. Until then: Tier A reports `permissionBlockers: null` with a reason; Tier B creates and deletes a disposable configuration behind explicit consent |
-| **CS-5** | Per-fault data-plane semantics are undocumented, and the observed behaviour contradicts the documented control-plane state | F6: an Event Hubs namespace reported `Disabled` while `EventHubProducerClient.Send` continued to succeed 60/60 from an already-connected producer. **The mechanism is unverified** — the originally-hypothesised cause (`AmqpSender` caching `MaxMessageSize` after first attach) is *falsified*: `CreateLinkAndEnsureProducerStateAsync` refreshes it on every link open, with an explicit source comment that the value "can be changed on-the-fly". The surviving candidate — that namespace disable does not force-detach already-open AMQP links — is plausible but undocumented | Maintain `references/chaos/fault-semantics.md` as a living document with `observedEffect` separated from `candidateMechanism` + `mechanismConfidence`. Only `observedEffect` drives verdicts. Ask the Event Hubs team to document link-detach behaviour on namespace disable; ask the Chaos team to publish per-fault data-plane semantics |
-| **CS-6** | `config validate` unreachable from the agent write allow-list | F8 | Explicitly allowlist `chaos_validate_scenario_configuration` in the run phase (D12) |
-| **CS-7** | Exclusion-based leg starvation is undiscoverable | F8 | Document `resourceTargeting.exclude` recipes per fault in `fault-semantics.md`; `compute_blast_radius()` emits them |
-| **CS-8** | No repo-proved v2 service limits, retention, or cancel semantics; workspace-era Chaos types are not confirmed in ARG's `ChaosResources` | API research | Phase 0 verifies target runtime behavior; use configurable safety caps, do not assume history retention, and avoid ARG dependence for Chaos resources |
-| **CS-9** | Application Map has no public REST API | API research | Reconstruct observed edges from `dependencies` rows; accept hostname-only targets with `targetResourceId: null` |
-| **CS-10** | The repository pins `2026-05-01-preview`; external spec research confirmed that version exists, correcting an earlier claim that it was invalid. This does **not** prove every preview operation is deployed in a target runtime. | Repo pin + external spec check; runtime unverified | Keep the current pin initially; Phase 0 exercises required operations. A move to `2026-08-01-preview` remains Q6. |
-
-### Reverse Advisor flow (proposal, not a dependency)
-
-F9 shows Advisor is an anti-correlation source for chaos findings: 16 HighAvailability recommendations on the resource group, zero matched, and the nearest one was already satisfied while depending on the very probe proven blind. Advisor reasons about configuration shape; chaos findings are about behaviour under fault.
-
-The useful direction is therefore **reversed**. `chaos-evidence` optionally emits an `advisor-candidate.v1.json` record — a chaos-proven finding (e.g. "readiness probe returned 200 throughout a total dependency outage") in a shape an Advisor recommendation generator could consume. This is proposed as a partner-team conversation, not built here (N2, N8).
+**Reverse Advisor flow (proposal, not a dependency).** F9 showed Advisor is anti-correlated with behaviour-under-fault findings. The useful direction is reversed: a sealed study could optionally emit a chaos-proven finding in an Advisor-candidate shape. This is a partner-team conversation, not scheduled work (N7, Q13).
 
 ---
 
 ## Alternatives Considered
 
-**ALT-1 — Keep the monolithic `chaos-loop` skill and add entry points.**
-*Pros:* less refactoring; a single place for the invariants. *Cons:* F14 shows the failure mode directly — when the loop was interrupted, work degraded to manual mode and the invariants were lost. Entry points into a monolith still share one state document and one failure domain. **Rejected.**
+**ALT-1 — One monolithic `chaos-study` skill.**
+*Pros:* one front door, zero selection ambiguity, no cross-skill contracts. *Cons:* the file cannot stay under 200 lines while covering readiness, execution, reporting and comparison, so D3 fails immediately; and it forecloses the four questions users genuinely ask separately ("am I ready", "run it", "report it", "did it improve"). **Rejected** — but this is the closest alternative, and it is the reason the entry skill is *opinionated and end-to-end* rather than a menu. Revisit is Q8.
 
-**ALT-2 — Merge `chaos-analyze` and `chaos-recommend` into one skill.**
-*Pros:* one fewer skill; hypotheses and recommendations are tightly related; avoids a redundant artifact hop. *Cons:* the two have different determinism profiles — analysis is model-heavy, recommendation is almost entirely deterministic — and different input freshness requirements (analysis can run without a workspace; recommendation cannot run without `availability.v1.json`). Merging them makes the deterministic scoring untestable in isolation and re-couples hypothesis generation to workspace availability. **Kept separate**, but this is a genuine trade-off and is listed as Open Question Q1.
+**ALT-2 — Keep the Revision 5 eight-peer-skill design.**
+*Pros:* already specified in detail; each skill is small. *Cons:* thirteen user-facing front doors (P1); no obvious entry point (G1 fails); and five of the eight had no consumer for their output. **Rejected.** The deterministic modules underneath are DEFERRED, not deleted (D19).
 
-**ALT-3 — Hard-code a curated scenario catalog for offline/air-gapped use.**
-*Pros:* works without a workspace; faster. *Cons:* exactly the failure the prototype demonstrated — fabrication and drift. **Rejected**, except as a *test fixture* (never a runtime source).
+**ALT-3 — Extend the `[PR32]` chaos-loop controller.**
+*Pros:* a working state machine exists; less new code. *Cons:* a single state document is one failure domain (F14 showed the degradation-to-manual failure directly), repo-local `tmp/` state is exactly F12, and the hard-coded catalog is exactly the fabrication risk. **Rejected** (D17, P9). Four patterns are re-expressed and credited; the controller is not.
 
-**ALT-4 — Use Azure Advisor as the grounding source for findings.**
-*Pros:* first-party, already in the portal, familiar to users. *Cons:* F9 — anti-correlated with behaviour-under-fault findings; the "no coverage" exception fires as the default path. **Rejected as a gate**; retained as optional context and as a downstream destination.
+**ALT-4 — Markdown-only report.**
+*Pros:* trivially diffable; renders in every tool; the `[MAIN] chaos-impact` renderer already produces Markdown. *Cons:* no sparklines, no severity colour, no collapsible evidence; P3 is a *presentation* problem as much as a content one, and a Markdown file does not survive being forwarded to a stakeholder. **Rejected as the primary**, retained as `-Format md` (Q5).
 
-**ALT-5 — Derive dependency topology solely from Azure Resource Graph.**
-*Pros:* single query surface, fast, no telemetry dependency. *Cons:* ARG has no dependency-edge table; edges must be inferred from resource properties, and its 3-join and 1,000-record-per-page constraints bite (there is no documented per-query time limit; throttling is a per-5-second quota). **Rejected as sole source**; used as one of three sources with `edgeSource` recorded (Open Question Q3).
+**ALT-5 — HTML report using a JS charting library from a CDN.**
+*Pros:* interactive charts for little effort. *Cons:* breaks `file://` opening, breaks air-gapped and locked-down machines, breaks email attachment, and introduces a supply-chain dependency into an artifact that is meant to be evidence. **Rejected** (D11, NFR-7/8). Inline SVG sparklines rendered by the script cover the actual need.
 
-**ALT-6 — Require a `/version` endpoint as a hard precondition for execution.**
-*Pros:* clean, unambiguous build identity. *Cons:* F1 — unobtainable in the observed environment; would have blocked the entire engagement. **Rejected** in favour of the rung ladder with the rung recorded.
+**ALT-6 — Store studies in the `[E2]` evidence store with no separate immutable layer.**
+*Pros:* one store, no new code, redaction and atomicity already proved. *Cons:* the evidence store is keyed by `runId`, is mutable by design, and has a 90-day retention default — it answers "what did this run see", not "what did we learn in March". Overloading it would either make evidence immutable (breaking its callers) or make studies mutable (breaking D7/FR-14). **Rejected**; the study store is *built on* the `[E2]` primitives instead (D16).
 
-**ALT-7 — Keep evidence in the repository working tree (`tmp/`).**
-*Pros:* zero configuration; visible to the user. *Cons:* F12 — wiped twice, destroying two runs. **Rejected**; `$CHAOS_EVIDENCE_ROOT` outside the tree, with an optional repo-local export via `chaos-evidence`.
+**ALT-7 — Keep `requiredTools` and hard-fail when MCP tools are absent.**
+*Pros:* the `[E1]` behaviour, already shipped and tested; the strongest possible answer to F5. *Cons:* it makes an optional accelerator a hard dependency of a product that is supposed to run on `az chaos` alone (P5, N2). **Rejected as the default**; the capability is retained under a `requiredTools` fixture so nothing is lost, and F5's real invariant — never substitute *silently* — is preserved through `toolSubstitutions[]` in the manifest and the report appendix (D6).
 
-**ALT-8 — Put the pre/during/post assembly in the skill prompt rather than a tool.**
-*Pros:* no new tool; flexible. *Cons:* F2/F4 — four hand-assemblies and three schema failures per attempt. Prompt-side assembly is not testable and not reproducible. **Rejected.**
+**ALT-8 — Wait for v2 AKS scenario templates instead of building a classic REST fallback.**
+*Pros:* no second control-plane path, no REST wrapper, no api-version to maintain. *Cons:* the timeline is unknown and unowned (CS-9, Q2), and G8 — Kubernetes as the first vertical — is the whole point of the release. **Rejected**, but deliberately hedged: `faultPath` is probed at runtime (D5), so the day v2 gains AKS scenarios the probe selects them and the wrapper becomes dead code deleted in one commit.
 
-**ALT-9 — Run probe-validation (Tier B) automatically for every candidate scenario, so permission blockers are always available.**
-*Pros:* uniform, complete eligibility data; no two-tier complexity; `DQ-PERMISSION-BLOCKED` always usable. *Cons:* the cost is not proportional to the benefit. A read-only-feeling "what could I run here?" question would (a) create and delete one `ScenarioConfiguration` per candidate — tens of ARM writes on a real scope; (b) require `Chaos Studio Experiment Contributor` merely to *look*, which many users exploring the tool will not have and should not need; (c) leave orphaned probe configurations if the process dies mid-loop; (d) make an advertised read-only skill perform writes, which is a genuine trust violation regardless of how benign the writes are. **Rejected as the default.** Tier B is opt-in per invocation with a consent turn that names the configurations and the role requirement, and `chaos-run` — which legitimately creates a configuration anyway — always validates, so nothing is ever *executed* without authoritative blocker data.
-
-**ALT-10 — Add a `monitor_metrics_batch` tool in v1 for multi-resource metric fan-out.**
-*Pros:* one call for N resources; the Metrics Batch API (`2023-10-01`) exists and is regional. *Cons:* it introduces a second metrics auth audience (`https://metrics.monitor.azure.com/.default`) and a regional endpoint-construction rule, both of which are new failure modes, for a latency win on a path that is not currently the bottleneck — `monitor_fault_window_pack` already collapses the per-run round trips that actually hurt (F2). **Deferred**, not rejected: revisit when a scope with >20 metric-bearing resources demonstrates the fan-out cost, and land it behind the same pack interface so no caller changes.
+**ALT-9 — Inline fault parameters into the skills instead of a guidance pack.**
+*Pros:* fewer files; no routing indirection; the model does not need a second read. *Cons:* this is precisely how `setup-scenario` reached 181 lines, and it makes every new fault a prompt edit and a regression risk across all five skills. **Rejected** (D10, P7).
 
 ---
 
@@ -1269,47 +867,67 @@ The useful direction is therefore **reversed**. `chaos-evidence` optionally emit
 
 **External**
 
-- Chaos Studio v2 workspace APIs proved by pinned main (`workspaces`, `scenarios`, `configurations`, `runs`, `refreshRecommendations`, `evaluations/latest`, and the **configuration-scoped** `validations/latest`) — API-version pin tracked in Q6. Additional discovery/evaluate operations are not assumed and remain spike-gated.
-- Chaos Studio v1 GA `2025-01-01` catalog APIs (`/subscriptions/{sub}/providers/Microsoft.Chaos/locations/{loc}/targetTypes` and `/subscriptions/{sub}/providers/Microsoft.Chaos/locations/{loc}/targetTypes/{tt}/capabilityTypes/{ct}`) for capability grounding. The `locations/{loc}` segment is mandatory — there is no location-free form.
-- Azure Resource Graph — paging, max 3 joins, 1,000 records per page; throttling is a documented **15 queries per 5-second window** per user. No per-query time limit is documented, so none is designed around.
-- Azure Monitor metrics, Log Analytics query API, Application Insights (classic resource-scoped schema). The Metrics Batch API is **not** a v1 dependency (ALT-10).
-- `Microsoft.AlertsManagement` alert instances API using shipped `2023-05-01-preview` with `2018-05-05` fallback and the paired query `timeRange=custom&customTimeRange=<start>/<end>`.
-- Azure Activity Log (deployment events for baseline continuity only — **not** for fault-landed proof, F15).
-- Azure CLI + `chaos` extension; required command/version availability is verified in Phase 0 rather than inferred from repository wrappers.
-- `bicep` CLI, `terraform` CLI, `helm`/`kustomize` — all **optional**; absence degrades `analysisDepth` and is reported, not fatal.
-- Python `mcp` — source pins `>=1.2.0,<2`; the installed version and host protocol capability are runtime facts verified in Epic 1. Do not infer `outputSchema` support from the range.
-- Python `httpx`; **`jsonschema`** (new — required by the schema/contract test layer and *not* currently installed in CI); PowerShell `Az` modules; Pester ≥ 5.5.
+| Dependency | Version / pin | Notes |
+|---|---|---|
+| Azure CLI | ≥ 2.75.0 | Hard floor for the `chaos` extension |
+| `chaos` CLI extension | v2 surface, preview (`1.0.0b*`) | `az chaos setup` / `show-discovery` / `show-evaluation` / `workspace wait` are GA; the rest is preview |
+| Chaos Studio v2 ARM | **`2026-05-01-preview`** — the shipped pin, unchanged in v0.4.0 | `2026-08-01-preview` exists but is not adopted without runtime evidence (CS-12, E15-T7) |
+| Chaos Studio classic ARM | `2025-01-01` (GA) | Targets, capabilities, experiments — reached only via `Invoke-AzChaosClassic.ps1` (CS-10) |
+| Azure Monitor metrics + Log Analytics query API | Existing `[MAIN]` pins | Reused unchanged |
+| `Microsoft.AlertsManagement` | `2023-05-01-preview` → `2018-05-05` fallback | Shipped contract, RETAINED verbatim |
+| Chaos Mesh in-cluster | ≥ the version the fault library requires, namespace `chaos-testing` | User-installed; the suite checks, it does not install (Q3) |
+| Container Insights / managed Prometheus | — | **Optional providers.** Absence of either is `unknown` and never blocks; a plan blocks only under FR-7a |
+| PowerShell | 7.x | Report rendering is PowerShell-only — no Node, no Python, no browser (NFR-7) |
+| Pester | ≥ 5.5.0 | Existing CI pin |
+| Python + `mcp`, `httpx`, `jsonschema` | `mcp>=1.2.0,<2`; `jsonschema` promoted to a hard test dep by `[E1]` | **Optional at runtime**, required for the MCP test matrix |
+| `kubectl` / `helm` | — | **Optional.** Absence yields `unknown` on the Chaos Mesh checks, never `fail` |
 
 **Internal**
 
-- Synchronized additive minor versioning across `plugin.json`, `mcp/pyproject.toml`, and marketplace metadata; no removal release is scheduled.
-- The existing `_TEST_TRANSPORT` MockTransport hook (all new MCP tests depend on it).
-- The `chaos-impact` schema and offline-replay harness.
-- CI workflow paths in `.github/workflows/test.yml`.
+- The `[MAIN]` `Invoke-AzChaos.ps1` / `Invoke-AzRest.ps1` / `Ensure-AzLogin.ps1` / `Wait-AzureLro.ps1` seam. Everything routes through it (FR-5).
+- The `[E2]` evidence primitives — canonicalization, redaction denylist, `$CHAOS_KEY_DIR` denial, atomic revisioned write. The study store depends on these directly (D16).
+- The `[E3]` validate/fix/revalidate gate and both consent gates (D15).
+- The `[MAIN] chaos-impact` collectors and offline-replay harness.
+- Synchronised versioning across `plugin.json`, `mcp/pyproject.toml`, `.github/plugin/marketplace.json`.
+- CI paths in `.github/workflows/test.yml` — unchanged; new tests land under paths it already scans.
 
 **Sequencing**
 
-Evidence store and schemas must land before any skill that persists artifacts. `chaos-availability` must land before `chaos-recommend` (it is the only legitimate scenario source). `monitor_fault_window_pack` and `chaos_prove_fault_landed` must land before `chaos-diagnose`.
+`EPIC-003` must land before anything (it was uncommitted; landed at `283cb61`). The study store (EPIC-004) must land before any skill that persists. The fault pack (EPIC-005) must land before `chaos-study-scope` can propose a fault. `Resolve-FaultPath` (EPIC-007) must land before `chaos-study-run` can execute. `Get-StudySignals` (EPIC-009) must land before findings (EPIC-011). Findings must land before the report (EPIC-012). Nothing depends on the MCP reshape (EPIC-006) except the manifest field it writes.
 
 ---
 
 ## Impact Analysis
 
-- **Codebase areas affected:** `copilot-cli-plugin/skills/` (additive targeted entries plus shipped-skill hardening), `copilot-cli-plugin/mcp/chaos_mcp/` (the additive wrappers named in §MCP tool additions plus pure-function modules), `copilot-cli-plugin/references/` and `copilot-cli-plugin/schemas/` (new), existing and new test families, `evals/`, docs, package manifests, and CI.
-- **Backward compatibility:** additive. The five existing skills and all **15** existing MCP tools keep working. No initial renames; any future alias survives at least one minor version. `impactReportSchemaVersion: 1` is unchanged.
-- **Performance:** `chaos-inventory` is the heaviest step (ARG paging + deployment history + telemetry aggregation); it is cached per `scopeId` with a freshness bound. `monitor_fault_window_pack` replaces N round trips with one, reducing latency and token usage materially. `chaos-availability` calls shipped `chaos_refresh_recommendations` only when forced or cached evaluation data is stale; Tier B adds 2N ARM writes and is therefore opt-in (ALT-9).
-- **Operational:** a new on-disk store (`$CHAOS_EVIDENCE_ROOT`) requires a documented location, size expectations, and a retention/cleanup command. Tool-availability reconciliation costs nothing at runtime — it reads the host's existing `tools/list` result — but eliminates an entire class of silent failure (F5).
+**Codebase areas.** `copilot-cli-plugin/skills/` (five new skill directories; two shipped `SKILL.md` files shrink), `copilot-cli-plugin/scripts/` (seven new scripts, three reshaped, `Constants.ps1` promoted), `copilot-cli-plugin/references/chaos/` (two principle docs, fifteen guidance files), `copilot-cli-plugin/schemas/` (five new schemas), `mcp/chaos_mcp/` (front-matter parsing only — no tool changes), package manifests, and docs. **`.github/workflows/test.yml` is unchanged.**
+
+**Backward compatibility.** Additive through v0.4.x (NFR-10, D18):
+
+| Surface | Guarantee |
+|---|---|
+| Five shipped skill names and triggers | Unchanged in v0.4.x. Deprecation, if any, is decided in Q12 and takes two minor releases. |
+| 18 MCP tool names, signatures, envelopes | Unchanged. Nothing removed or renamed. |
+| `$env:STARTCHAOS_STATE_PATH` and the v1 state schema | Unchanged; existing state files still resume |
+| `impactReportSchemaVersion: 1` | Unchanged |
+| `[E2]` evidence store layout and env vars | Unchanged; the study store is a sibling, not a migration |
+| `requiredTools:` front matter | Still parsed and honoured where present (FR-20) |
+
+**Performance.** `Get-StudySignals` replaces N hand-assembled round trips with one composed call (F2) — the same win `chaos-impact` already banked. The heaviest new cost is Log Analytics queries over the three windows; they are bounded by row caps and by an explicit `truncated: true` flag. Report rendering is local string substitution: sub-second. `chaos-study-history list/show/compare` makes **zero** Azure calls (D20).
+
+**Operational.** One new on-disk location (`$CHAOS_STUDY_ROOT`) needs a documented per-OS default, a size expectation, and a purge command. A typical study is a few hundred KB of JSON plus a report under 2 MB (NFR-8); at the 365-day default this is tens of MB per scope. Debuggability improves materially: the redacted command trail (FR-22) means a failed study can be reproduced from the manifest without re-running the conversation.
 
 ---
 
 ## Security Considerations
 
-- **Auth:** unchanged — the existing `chaos_set_auth_mode` lever (`cli` vs `managed-identity`) governs all new tools.
-- **Least privilege:** reads are preferred; workspace/configuration/evaluation writes are disclosed and consented, while fault execution has the strongest approval. Validation-derived targeted roles are preferred over broad permission fix (D13).
-- **Attack surface:** the largest new surface is source-repository reading. Repositories are read **locally and read-only**; no credentials are used to clone remote repositories on the user's behalf without explicit paths, and repository selection requires confirmation (Open Question Q2). No repository content is written to any artifact beyond a bounded excerpt with a file path and line range (NFR-8).
-- **Secret hygiene:** artifacts are scanned for connection-string, key and token patterns before `evidence_put`; matches are redacted with a marker. `chaos-evidence --redact` (default on) applies a second pass at export.
-- **Evidence store:** contains resource IDs, telemetry aggregates and code excerpts. It is created with user-only permissions and documented as sensitive. `chaos-evidence` supports a purge command.
-- **Destructive-action gating:** `destructiveHint: true` on `chaos_execute_scenario` and `chaos_cancel_scenario_run` so hosts prompt; execution additionally requires the in-skill approval token.
+- **Auth.** Unchanged. The existing `chaos_set_auth_mode` lever (`cli` vs `managed-identity`) governs everything; no new credential path is introduced.
+- **Least privilege.** Readiness and history need `Reader`. Execution needs `Chaos Studio Experiment Contributor` on the workspace or experiment, plus `Azure Kubernetes Service Cluster Admin Role` on the cluster for the experiment's managed identity. Targeted grants from `Build-TargetedGrantProposal` are always proposed before the broad fix, and the broad fix keeps its separate consent (NFR-4, D15).
+- **Secret hygiene.** The study store inherits the `[E2]` redaction — by key name and by value shape (bearer, JWT, hex ≥ 32, base64 ≥ 40) — applied **on write and on read**, plus the `$CHAOS_KEY_DIR` denylist. The command trail is redacted argument-by-argument before it is written, not after. A dedicated test asserts that a token planted in every input surface (plan, signals, error text, `az` argv) appears nowhere in a sealed study (NFR-5).
+- **Attack surface — new.** Two additions, both small. (1) `Invoke-AzChaosClassic.ps1` widens the ARM surface the plugin can reach; it is constrained to a fixed allowlist of classic Chaos paths and a pinned api-version, and a Pester test asserts no caller can pass an arbitrary path. (2) `report.html` embeds Azure-sourced and model-sourced strings; every injection point is HTML-escaped and the template has no script sink.
+- **Attack surface — removed.** Revision 5's source-repository reading (local clone analysis) is DEFERRED and unbuilt, removing the largest single surface that design carried (Q14).
+- **Study store permissions.** Created user-only (`0700` equivalent). It contains resource IDs, telemetry aggregates and findings — sensitive but not secret. Documented as such. Purge requires an explicit confirmed command and never runs implicitly (NFR-12).
+- **Destructive-action gating.** `destructiveHint: true` remains on `chaos_execute_scenario` and `chaos_cancel_scenario_run` so MCP hosts prompt. The script path's equivalent is the typed consent bound to `frozenConfigHash`.
+- **Portability caveat.** A sealed study is portable by design (NFR-11), which means it is also *exfiltratable*. The report footer states plainly what the file contains so a user can make an informed sharing decision.
 
 ---
 
@@ -1317,456 +935,584 @@ Evidence store and schemas must land before any skill that persists artifacts. `
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| Service returns no ineligibility reason (CS-4), so eligibility gaps stay opaque | High | Medium | Synthesise `gapReason` from **two** observable sources at Tier A (capability-map misses, unsatisfiable parameters) and a third at Tier B (configuration-scoped validation errors); report `"unknown"` rather than guessing; file CS-4 and CS-4b |
-| Data-plane probes are wrong or missing for a fault type | **High at launch**, falling to Medium as coverage lands | High | This is **Epic 7a**, not a fallback. The safe-by-default behaviour (unknown fault type → `dataPlane.proven: false` → `NOT EXERCISED`) prevents *unsound* verdicts but does not prevent *useless* ones: at launch it would fire for nearly every fault type. Mitigation is therefore the coverage programme — documentation-sourced heuristic entries for every fault type reachable by a top-20 scenario, empirical probe runs upgrading the top 10 to `verified`, `dataPlaneProbe.coverage` surfaced at recommendation time so a user learns *before* executing, and warn-only `DQ-NO-DATAPLANE-PROBE` becoming disqualifying once the bar is met. `fault-semantics.md` remains authoritative and versioned, with `observedEffect` separated from `candidateMechanism`. |
-| Build attestation stuck at rung 3 gives weak identity | High | Medium | Rung is recorded and surfaced; rung-3-only runs cannot yield `CONFIRMED` on a code-change verification (verify mode) |
-| API-version drift (`2026-05-01-preview` vs `2026-08-01-preview`) | Medium | Medium | Single pin file per language (NFR-9); contract tests over recorded fixtures fail loudly on shape change |
-| IaC → ARM-ID correlation overclaims | Medium | High | Strict ladder with recorded method + confidence; `low` confidence caps ranking; `null` never guessed |
-| Evidence store grows unbounded | Medium | Low | Retention policy + `chaos-evidence purge`; raw telemetry stored as aggregates, not row dumps |
-| Eight skills confuse users versus one entry point | Medium | Medium | Each skill ends with explicit next-step guidance; `chaos-scope-setup` doubles as the natural front door; docs include the full journey walkthrough |
-| Recommendation eval set is small (30 cases) and self-graded | High | Medium | Publish the rubric, use two graders with written disagreement resolution, gate on regression rather than absolute quality, grow the set from real engagements |
-| Model still fabricates a scenario name in narrative prose | Medium | High | `chaos-recommend` validates every emitted `scenarioId` against `availability.v1.json` and fails the artifact on a mismatch — a schema-level check, not a prompt instruction |
-| ARG constraints break inventory at large scope | Medium | Medium | Paging + type-partitioned queries; explicit `truncated: true` with a narrower-scope instruction |
+| The classic REST path breaks when the classic model is retired | Medium | High | `Resolve-FaultPath` probes rather than assumes (D5); the manifest records which path a study used, so a broken path is diagnosable, not mysterious. CS-10 is filed. Deleting the wrapper when v2 gains AKS scenarios is a one-commit change (ALT-8). |
+| Chaos Mesh is absent, or in the wrong namespace, on most target clusters — so most first runs are blocked | **High** | Medium | Readiness is a *first-class deliverable*, not an error path: seven checks, each with the exact remediation command, written into a `blocked` plan the user can act on and re-run (Flow C). The suite never installs into a cluster (Q3). |
+| Data-plane proof is heuristic for most faults at launch, so `mechanismProven` is false and findings read as weak | **High at launch** | High | This is the honest state and it is surfaced, not hidden: `dataPlaneProof.coverage` appears in the plan *before* consent and in Limitations `L5` after. The mitigation is coverage work in EPIC-005, prioritised on the three Kubernetes scenarios, not a softer verdict rule. |
+| The 200-line cap is met by moving prose into `references/`, and the *reference* layer becomes the bloat | Medium | Medium | The fault-guide schema caps what a guide may contain (FR-21), and the index-bijection test prevents unreferenced files accumulating. The principle docs are capped by review, which is weaker — called out as a known soft spot. |
+| Five skills still confuse users; they invoke `chaos-study-run` first and get a "no plan" error | Medium | Medium | Every supporting skill degrades explicitly (FR-2): given no plan, `chaos-study-run` runs the scope step itself rather than failing. `chaos-study` is the documented and marketed front door. Re-evaluated in Q8 after the first usability round. |
+| The report is polished but says nothing useful, because the signals were absent | Medium | High | FR-7a applies at *plan* time, not report time: a plan whose steady-state predicate cannot be evaluated by any available source is marked `blocked` with the missing source named. The user learns before executing, not after. |
+| Deterministic rendering breaks across OS (line endings, culture, sort order) | Medium | Low | Invariant culture and explicit sort keys are contractual (D12); the Pester OS matrix already runs on Windows, Linux and macOS, and the determinism test runs on all three. |
+| ~~Uncommitted `[E3]` work is lost from the dirty worktree~~ **RETIRED — closed by `283cb61`** | — | — | Phase 0 landed EPIC-003 in full, including `blast-radius.md` and both `tests/` directories. Nothing from the dirty worktree was lost; `.gitignore` was checked not to shadow the newly tracked paths. |
+| Study store grows unbounded | Low | Low | `CHAOS_STUDY_RETENTION_DAYS` (365) plus an explicit purge; raw telemetry is stored as aggregates, not row dumps |
+| The model writes a severity or a number into the narrative slot that contradicts the computed one | Medium | High | The narrative slots are separate template regions marked `narrative`; findings, severities and limitations are rendered from `findings.v1.json` only. A test asserts the renderer ignores any severity-shaped token in the narrative input. |
+| Scope creep back toward a controller | Medium | High | D1/D17/N3 are explicit, and there is no run-state document to accrete into one — state is the filesystem (§Detailed Design 1). |
 
 ---
 
 ## Open Questions
 
-| # | Question | Why it matters | Current lean |
-|---|---|---|---|
-| **Q1** | Should recommendation be a distinct skill from analysis? | Determines skill count and where the deterministic boundary falls | **Keep separate** (ALT-2): different determinism profiles, different prerequisites, and separable testing. Revisit after the first usability round. |
-| **Q2** | How are source repositories selected and authorised? | Analysis quality depends on it; it is also the largest new attack surface | Explicit user-provided local paths, plus inference from deployment tags offered as *suggestions requiring confirmation*. No automatic remote clone. Needs a decision on whether GitHub-authenticated remote reads are ever permitted. |
-| **Q3** | Where does dependency topology come from — ARG, Application Map, config, or code? | Determines edge quality and whether telemetry is a hard prerequisite | **All four, labelled.** Each edge records `edgeSource` and `correlationConfidence`. Open: whether an observed (telemetry) edge should be required before a dependency-fault recommendation may rank in the top 3. |
-| **Q4** | How do we get live service-side scenario eligibility, given no `notRecommendedReason`? | Without it, "why can't I run this" is unanswerable | Synthesise from capability map + parameter satisfiability (Tier A), plus configuration-scoped validation when the user opts into Tier B; file CS-4 and CS-4b. Open: whether the Discovered Resources / Connections operation groups expose a richer read-only signal we have not yet exercised — this is the single change that would let Tier B be deleted. |
-| **Q5** | What is the minimum telemetry/SLO contract required before execution? | Determines `DQ-NO-TELEMETRY` strictness | Proposed minimum: (a) one request/throughput signal for the work predicate, (b) one success/error signal for steady state, (c) for dependency faults, dependency spans for the specific target host, (d) for alert predicates, a matching alert rule. SLO is optional; when absent, thresholds derive from the `pre` baseline. Needs sign-off. |
-| **Q6** | Are required preview operations available in target runtimes, and should the pin move from `2026-05-01-preview` to `2026-08-01-preview`? | Source proves the pin, not deployed operation availability | Stay on the current pin until Phase 0 exercises required calls. Move only with recorded fixtures and compatibility evidence. |
-| **Q7** | Should `chaos-analyze` be allowed to run without a workspace? | Affects whether analysis is usable pre-onboarding | Lean yes — analysis is a code/IaC/resource activity; only `chaos-recommend` requires availability data. |
-| **Q8** | Does the reverse-Advisor flow have a receiving partner? | Determines whether `advisor-candidate.v1.json` is worth emitting | Unknown. **Treated as a design note, not a work item** — no schema, tool or task is scheduled for it, and the corresponding Epic 11 task slot (E11-T2) is marked removed rather than TO DO. If a partner appears, the shape is a small additive transform over `diagnosis.v1.json`, so deferring costs nothing. |
-| **Q9** | Where should `$CHAOS_EVIDENCE_ROOT` default to on each OS, and what is the retention default? | Durability vs disk footprint | Lean: per-user app-data directory, 90-day retention, aggregates only. |
-| **Q10** | Do we retain `chaos_fix_resource_permissions` at all once targeted remediation exists? | Broad grants are a security smell | Lean: retain for one release behind explicit consent, then re-evaluate on telemetry. |
-| **Q11** | What was the *third* App Insights query failure in F4? | The field record names three failures; only two survive verification (subscription injection, classic schema). The third was attributed to `first` being a reserved token, which is unsupported — the KQL reserved-keywords reference does not list it, and `--first` is an Azure CLI/ARG paging parameter mapping to REST `$top`, not a KQL construct | Needs the original session transcript re-read to recover the actual error text. Until then the plan encodes only the two verified causes and `test_appinsights_subscription_injection_and_classic_schema` asserts only those. If the third cause is recovered and is real, it becomes a third assertion; if it was a mis-attribution of one of the other two, nothing changes. |
-| **Q12** | Where does `fault-semantics.md` coverage come from, and how much is needed before the suite is usable? | This is the **launch-blocking usability question**, not a documentation detail — see the analysis in Epic 7a | Proposed: seed from the Chaos fault library documentation + Azure SDK behaviour notes, then confirm empirically per fault via probe runs. Needs a decision on the acceptance bar (proposed: every fault type reachable by a top-20 scenario has an entry with at least `coverage: heuristic`) and on who owns ongoing curation. |
-| **Q13** | What are target-service retention/cancel semantics, runtime MCP exposure, and current `chaos-mcp` PyPI publication status? | Repository workflows/configuration show intent, not deployed/runtime state | Verify in Phase 0 against supported target environments; do not encode source-based assumptions. |
+Each has a stated lean so implementation is not blocked. A lean is a default, not a decision.
+
+| # | Question | Why it matters | Lean | Owner |
+|---|---|---|---|---|
+| **Q1** | Is the classic REST `faultPath` acceptable for GA, or must Kubernetes wait for v2 scenario coverage? | Determines whether EPIC-007 ships or the release slips | **Ship the probe + wrapper.** It is bounded (one allowlisted wrapper), reversible (delete when v2 lands) and it is the only way G8 happens this release. | Chaos Studio engineering |
+| **Q2** | What are the "upcoming Kubernetes faults", and when? | The brief names them; no public source describes them | **Encode nothing.** The guidance pack is additive by construction (G9), so a new fault is a file. Needs a product answer before it can be scheduled. | Chaos Studio product |
+| **Q3** | Should the suite help install Chaos Mesh, or only detect its absence? | It is the most likely first-run blocker | **Detect and instruct only.** Installing into a user's cluster from a chaos tool is a trust boundary we should not cross. Revisit if readiness-blocked runs dominate telemetry. | Copilot plugin owners |
+| **Q4** | Should `chaos-study` default to `-DryRun:$true`? | Trades safety against a two-step first experience | **Yes, default true.** N8 is non-negotiable; the plan card is genuinely useful on its own. | Copilot plugin owners |
+| **Q5** | Do we ship the Markdown report format, or HTML only? | One more renderer to keep deterministic | **Ship HTML in v0.4.0; Markdown behind `-Format md` only if asked for.** The `chaos-impact` Markdown renderer already covers the diff-in-a-PR use case. | Copilot plugin owners |
+| **Q6** | Do we need `chaos_study_*` MCP tools? | Determines whether the MCP registry grows from 18 to 21 | **Defer.** No host has asked for cross-process study access. Add only on a real request. | Copilot plugin owners |
+| **Q7** | What is the per-OS default for `$CHAOS_STUDY_ROOT`, and is 365 days the right retention? | Affects portability, backup and support | **`%LOCALAPPDATA%\chaos-studio\studies` / `$XDG_DATA_HOME/chaos-studio/studies` / `~/Library/Application Support/chaos-studio/studies`; 365 days.** Needs one review pass with support. | Copilot plugin owners |
+| **Q8** | Is five skills the right number, or should report fold into run? | Directly tests D2 | **Keep five** until the first usability round. `chaos-study-report` is separately invocable against a *sealed* study, which run cannot be. | Copilot plugin owners |
+| **Q9** | Are the five comparability conditions too strict? | Too strict and compare is useless; too loose and it lies | **Start strict.** A refused comparison with a stated reason is recoverable; a misleading delta is not. Relax on evidence. | Chaos Studio engineering |
+| **Q10** | When a cluster has both Container Insights and managed Prometheus, which is authoritative? | Two sources can disagree, and a report cannot shrug | **Prometheus for rate/gauge series, Container Insights for events and inventory; record `signalSource` on every value; on disagreement report both and add a limitation.** Needs Azure Monitor partner review. | Azure Monitor partners |
+| **Q11** | The third recorded App Insights query failure was never explained | Two of three causes are known and implemented; the third is not | **Leave unimplemented.** Building a mitigation for an unidentified cause is how the falsified `first`-is-reserved theory nearly shipped. Reopen if it recurs. | Copilot plugin owners |
+| **Q12** | Do the five shipped skills stay, get aliased into the study suite, or get deprecated? | Determines the v0.5 surface and the migration cost | **Stay unchanged in v0.4.x.** They are the low-level verbs; the study suite is the workflow. Re-evaluate at v0.5 with usage data; any deprecation gets two minor releases. | Copilot plugin owners |
+| **Q13** | Do we pursue the reverse-Advisor flow? | Would give chaos findings a first-party destination | **Not scheduled.** Propose it to the Advisor team; build nothing until they commit. | Chaos Studio product |
+| **Q14** | Is source/IaC analysis permanently out, or deferred? | It was a large part of Revision 5 and the largest attack surface | **Deferred with a named trigger:** revisit only if findings routinely cannot be acted on without code context. Revisit is a new design doc, not an epic here. | Chaos Studio engineering |
+
+---
+
+## Migration and Disposition
+
+**This is the single authoritative disposition table.** Every asset appears exactly once.
+
+### `[MAIN]` — shipped at `55c74c5`
+
+| Asset | Disposition | Detail |
+|---|---|---|
+| `skills/start-chaos`, `create-workspace`, `setup-scenario`, `run-scenario`, `chaos-impact` | **RETAINED** | Names, triggers and behaviour unchanged in v0.4.x (NFR-10, Q12). `setup-scenario/SKILL.md` and `run-scenario/SKILL.md` shrink as `[E3]` narrative moves into `references/chaos/` — behaviour identical. |
+| `agents/start-chaos.md` | **RESHAPED** | The "no ad-hoc `az chaos` / `az rest`" invariant is extended to name `Invoke-AzChaosClassic.ps1` as the only permitted classic path. |
+| `scripts/Invoke-AzChaos.ps1`, `Invoke-AzRest.ps1`, `Ensure-AzLogin.ps1`, `Wait-AzureLro.ps1` | **RETAINED** | The load-bearing seam. Unmodified. |
+| `scripts/Render.ps1` (`Write-Card`, `Write-Table`, `Write-Error-Card`) | **RETAINED** | Extended by `[E3]`, not rewritten. |
+| `scripts/New-RunReport.ps1` | **RETAINED** | Its token-substitution pattern is the model for `New-StudyReport.ps1`. |
+| `skills/chaos-impact/**` — schema v1, KQL templates, `metrics/defaults.json`, collectors, offline replay | **RETAINED** | `Get-StudySignals` composes these collectors. `impactReportSchemaVersion: 1` frozen (D18). |
+| `skills/chaos-impact/scripts/Constants.ps1` | **RESHAPED** | Promoted to `copilot-cli-plugin/scripts/Constants.ps1` with a dot-source shim at the old path for one minor version (NFR-9, E7-T1). |
+| `mcp/chaos_mcp/{server.py,azure.py,monitor.py}` — 15 tools | **RETAINED** | Names, signatures and envelopes frozen. `server.py` gains no new tool in v0.4.0 (Q6). |
+| `plugin.json`, `marketplace.json`, `mcp/pyproject.toml` | **RESHAPED** | Version → 0.4.0; five skill registrations added. Synchronised in one commit (E15-T1). |
+| `.github/workflows/test.yml`, `release.yml`, Dependabot | **RETAINED** | Unchanged. New tests land under already-scanned paths. |
+
+### `[E1]` — EPIC-001, `5257c2a`
+
+| Asset | Disposition | Detail |
+|---|---|---|
+| `mcp/chaos_mcp/apiversions.py` + dead-pin lint test | **RETAINED** | Extended to cover the promoted PowerShell `Constants.ps1` (NFR-9). |
+| `mcp/tests/test_lifecycle_contract.py`, `test_tool_manifest.py`, `FROZEN_SKILLS` | **RETAINED** | The merge gate. `FROZEN_SKILLS` gains the five new skills at their v0.4.0 descriptions. |
+| `scripts/Preflight.ps1` — `Get-PreflightFailurePrefix`, `Get-SkillRequiredTools`, `Test-RequiredTools`, `Assert-RequiredTools` | **RESHAPED** | All four functions kept. `Resolve-ToolPath` added; `Assert-RequiredTools` is no longer called by the new skills but remains callable and tested (FR-20, D6). |
+| `requiredTools:` front matter on the five shipped skills | **RETAINED** | Still parsed and honoured. New skills declare `optionalTools:`. |
+| `skills/start-chaos/tests/Preflight.Tests.ps1` | **RESHAPED** | Fail-fast cases move to a `requiredTools` fixture; `optionalTools` substitution cases added. Nothing deleted. |
+| `jsonschema` as a hard test dependency | **RETAINED** | Now also validates the five new schemas and the fault-guide front matter. |
+
+### `[E2]` — EPIC-002, `4befd5e`
+
+| Asset | Disposition | Detail |
+|---|---|---|
+| `mcp/chaos_mcp/evidence.py` — canonicalization, key denylist, redaction, atomic revisioned writes | **RETAINED** | Unmodified. The study store reuses the same guarantees in PowerShell rather than forking the Python (D16). |
+| `scripts/State.ps1` — `Get-EvidenceRoot`, `Get-EvidenceScopeHash`, `Save-StateToEvidence`, `Mirror-State`, `Import-State` | **RESHAPED** | `Get-EvidenceScopeHash` and the redaction lists are exported for `Study.ps1`; `$env:STARTCHAOS_STATE_PATH` semantics unchanged. |
+| Schemas `run-record.v1`, `evidence-bundle.v1` | **RETAINED** | `run-record.v1` is written into every study directory unchanged. |
+| Schemas `availability.v1`, `diagnosis.v1`, `hypotheses.v1`, `inventory.v1`, `mechanism-ledger.v1`, `recommendations.v1`, `scope-setup.v1` | **DEFERRED** | On disk, schema-validated by CI, **no producer in v0.4.0**. They are the contract surface for the deferred Revision 5 modules (D19). Revisit trigger: a consumer exists. |
+| MCP tools `chaos_evidence_put` / `_get` / `_list` | **RETAINED** | Unchanged. No study siblings in v0.4.0 (Q6). |
+| `references/chaos/evidence-contract.md` | **RESHAPED** | Extended with a study-store section describing sealing and the evidence/study boundary. |
+| `references/chaos/verdict-matrix.md` | **RESHAPED** | Demoted from user-facing vocabulary to the internal derivation table behind `severity` / `confidence` / `mechanismProven` (D8). Content retained. |
+| `mcp/tests/test_evidence.py`, `skills/start-chaos/tests/State.Tests.ps1` | **RETAINED** | Unmodified. |
+
+### `[E3]` — EPIC-003, commit `283cb61` (uncommitted working tree at planning time; landed in Phase 0)
+
+**All of it is RETAINED or RESHAPED. Nothing here is discarded. Landing it was Phase 0 and is complete.**
+
+| Asset | Disposition | Detail |
+|---|---|---|
+| `scripts/Validate-AndFix.ps1` (+250) — `Test-StructuredValidationError`, `ConvertTo-ValidationBlocker`, `Build-RoleAssignmentRemediation`, validate → fix → revalidate, broad-fix consent | **RETAINED verbatim** | The highest-risk code in the repository. Not rewritten for cosmetic consistency (D15, FR-9, FR-10). |
+| `scripts/Rbac.ps1` (+74) — `Build-TargetedGrantProposal` | **RETAINED** | Pure function; called by `chaos-study-run` before any broad fix is offered. |
+| `scripts/Render.ps1` (+224) — `Resolve-BlastRadius`, `Write-BlastRadiusCard` | **RETAINED** | `Resolve-BlastRadius` is called directly by `chaos-study-scope`. |
+| `references/chaos/blast-radius.md` (198 lines, **untracked at planning time**) | **RETAINED verbatim** | Including the load-bearing honesty note that `resourceTargeting` is advisory and never transmitted (CS-7 → limitation `L6`). **`git add`-ed in Phase 0; tracked as of `283cb61`.** |
+| `skills/setup-scenario/tests/{BlastRadius,PermissionBlockers,SetupExitContract}.Tests.ps1`, `skills/run-scenario/tests/PreExecuteGate.Tests.ps1` (**untracked at planning time**) | **RETAINED** | 1,242 lines of Pester. Tracked as of `283cb61`. |
+| `skills/setup-scenario/scripts/Invoke-SetupScenario.ps1` (+88), `skills/run-scenario/scripts/Invoke-RunScenario.ps1` (+13) | **RETAINED** | The skill-level wiring of the gate and the pre-execute check. Exit codes `2`, `3`, `4` are emitted here and are frozen by E3-T6/E15-T5; `chaos-study-run` dot-sources `Invoke-RunScenario.ps1` in place rather than moving it (NFR-10). |
+| `server.py` (+188) — normalised blockers, `build_targeted_grant_proposal()` | **RETAINED** | Additive on an existing tool; no signature change. |
+| `mcp/tests/test_lifecycle_contract.py` (+259) | **RETAINED** | — |
+| `skills/setup-scenario/SKILL.md` (+70), `skills/run-scenario/SKILL.md` (+38) | **RESHAPED** | The narrative added here moves to `references/chaos/blast-radius.md` (already written) and the new principle docs; the skills keep a routing pointer. This is the P2 correction, and it is the only `[E3]` change that is undone — the *content* survives, its *location* changes. |
+
+### `[PR32]` — chaos-loop prototype, never merged
+
+| Asset | Disposition | Detail |
+|---|---|---|
+| `skills/chaos-loop` + `advisory`/`coding` phase skills | **REMOVED** | Rescoped and replaced (D17, P9). Not on main; nothing to delete on disk. |
+| `scripts/chaos_loop_state.py` state machine | **REMOVED** | Not ported. No epic depends on it. |
+| `references/chaos-loop/scenario-catalog.v1.json` | **REMOVED** | Hard-coded catalogs are the fabrication risk (ALT-3). Scenario names come from a service response or from a guide's `faultUrn` only. |
+| Repo-local `tmp/chaos-loop/` state | **REMOVED** | Exactly F12. Replaced by the study store. |
+| Atomic revisioned writes | **RETAINED as a pattern** | Already delivered in `[E2]`. Credited. |
+| Proposal/evaluate split | **RETAINED as a pattern** | Becomes D9 — the model proposes, scripts compute. |
+| Frozen-configuration drift gate | **RETAINED as a pattern** | Already delivered in `[E3]`; surfaced as exit code 12. |
+| Three-verdict vocabulary | **RESHAPED** | Becomes severity + confidence + `mechanismProven` (D8); `verdict-matrix.md` keeps the derivation. |
+
+### Revision 5 speculative work — DEFERRED, not deleted (D19)
+
+`scoring.py`, `analysis.py`, `verdict.py`, `proof.py`, `scope.py`, `availability.py`, the 30-case nDCG golden set, the mechanism-class ledger, source/IaC analysis, build attestation rungs, and the approval-token transport. **None was built.** Each is deferred with a named revisit trigger: a consumer in a shipped study workflow. The seven unconsumed `[E2]` schemas are their surviving contract surface, which is why those schemas are DEFERRED rather than deleted.
+
+### Migration steps for an existing user
+
+1. `v0.3.x → v0.4.0` is a normal upgrade. No state migration, no evidence migration, no config change.
+2. `$CHAOS_STUDY_ROOT` is created on first study. Nothing reads it before then.
+3. Existing `startchaos-state.json` files continue to resume against the five shipped skills.
+4. Existing `[E2]` evidence directories are untouched and still readable by `chaos_evidence_get`.
+5. There is nothing to roll back beyond reinstalling v0.3.x; the study store is additive and self-contained.
 
 ---
 
 ## Implementation Phases
 
-| Phase | Epics | Content | Exit criteria |
+| Phase | Goal | Epics | Exit criteria |
 |---|---|---|---|
-| **Phase 0 — Baseline contract, tests, preflight** | **E1** | Freeze the five-skill/15-tool/state/impact contracts; add host-visible tool preflight and direct lifecycle contract tests | Existing `/start-chaos`, five skills, 15 signatures/envelopes, replay, Pester matrix, pytest 3.10–3.13 and ruff are green before feature work |
-| **Phase 1 — Current state and evidence durability** | **E2** | Mirror/import `STARTCHAOS_STATE_PATH` into an atomic per-user evidence root; add schemas without breaking impact v1 | Current state resumes unchanged; mirror survives repo/session cleanup; secrets/key material are unreachable |
-| **Phase 2 — Setup validation and exclusions** | **E3** | Harden current setup/config/validation, expose include/exclude preview and targeted RBAC before broad fix | Existing setup path works; exclusions are visible; broad permission fix requires explicit consent |
-| **Phase 3 — Run validation and identity** | **E4** | Preserve strict validate/fix/revalidate; harden run-ID recovery and action identity | Concurrent-run fixture resolves correctly or fails loudly; null action name is never silently mislabeled |
-| **Phase 4 — Impact telemetry normalization** | **E5** | Extend `monitor.py`, `server.py`, `chaos-impact`, and replay with App Insights, exact alerts and fault-window pack | F2/F3/F4 regressions pass; PowerShell alerts/Service Health behavior remains; three existing monitor tools stay compatible |
-| **Phase 5 — Additive discovery/analysis entries** | **E6–E8** | Add scope/inventory/availability/analyze/recommend by composing current assets | Each entry names reused main assets; no current skill is deprecated; artifacts validate offline |
-| **Phase 6 — Targeted run, proof, and diagnosis** | **E9–E10** | Add run/diagnose; build attestation, two-sided proof, liveness, mechanism ledger and verdict | F1/F6/F10/F11/F14/F15 tests pass; control-plane-only is `NOT EXERCISED` |
-| **Phase 7 — Evidence and rollout** | **E11** | Add evidence entry; docs, examples, synchronized additive minor version | All compatibility gates pass and all three version files move together |
-| **Post-launch** | **E7a empirical tasks** | Upgrade heuristic fault semantics via dedicated-subscription probe runs | Separate funded program; never CI and never claimed as already available |
+| **0 — Land what exists** — **CLOSED by `283cb61`**, one leg outstanding | Nothing is lost from the dirty worktree | EPIC-003 | `[E3]` committed **including the two untracked directories and `blast-radius.md`** — **done**; Pester, pytest and ruff green on all three OS — **done on Windows and locally only; the hosted three-OS / 3.10–3.13 matrix has not run because the branch is local-only. Closes on the first push.** |
+| **1 — Foundations** | A study can be created, sealed and read; the first-vertical faults are described; provenance is automatic and MCP is off the critical path | EPIC-004, EPIC-005, EPIC-006 | A study directory can be created, sealed and re-read offline; three fault guides validate; a skill runs with zero MCP tools present and records the substitution; `commands.jsonl` is complete without per-caller effort |
+| **2 — Kubernetes reachability** | The plugin can reach AKS faults without ad-hoc REST | EPIC-007 | `Resolve-FaultPath` returns `experiment` with evidence on a real subscription; `Get-K8sReadiness` returns seven checks; one classic experiment created and cancelled by hand against a disposable cluster |
+| **3 — Production path** | A study can be planned, executed and measured | EPIC-008, EPIC-009, EPIC-010 | End-to-end dry run produces a valid `study-plan.v1.json`; a consented run produces `run-record.v1.json` and three evidence windows; abort path exercised |
+| **4 — The deliverable** | A reader gets an executive summary, dated evidence, prioritized findings, limitations and remediation in one file | EPIC-011, EPIC-012, EPIC-013 | Three golden studies render byte-identically twice; `report.html` opens from `file://` with JS disabled; Limitations non-empty in all three; entry skill under 200 lines with CI enforcing it |
+| **5 — Longitudinal and coverage** | A later conversation can answer "did it get better?", and fault coverage expands additively | EPIC-014, EPIC-016 | `list`/`show`/`compare`/`rerun`/`purge` work from a zipped study on a second machine with no Azure credentials; EPIC-016 lands with a diff touching no code |
+| **6 — Release** | v0.4.0 ships | EPIC-015 | Versions synchronised; docs updated; api-version and N8-exception decisions recorded; Q4/Q7/Q12 decided |
+
+Phases 1 and 2 can run in parallel after Phase 0. Phase 3 requires both. EPIC-016 can start any time after EPIC-012 and does not gate release.
 
 ---
 
 ## Files Affected
 
-### Modified `[MAIN]`
+### New Files
 
-| Exact current path | Planned reuse/change |
+| File Path | Purpose |
 |---|---|
-| `copilot-cli-plugin/skills/start-chaos/SKILL.md` and `copilot-cli-plugin/skills/start-chaos/scripts/Invoke-StartChaos.ps1` | Retain triggers/orchestration; add preflight and evidence mirroring |
-| `copilot-cli-plugin/skills/create-workspace/SKILL.md` and `copilot-cli-plugin/skills/create-workspace/scripts/Invoke-CreateWorkspace.ps1` | Add plan/reuse/provenance without replacing |
-| `copilot-cli-plugin/skills/setup-scenario/SKILL.md` and `copilot-cli-plugin/skills/setup-scenario/scripts/Invoke-SetupScenario.ps1` | Exclusion preview, normalized validation, targeted RBAC first |
-| `copilot-cli-plugin/skills/run-scenario/SKILL.md` and `copilot-cli-plugin/skills/run-scenario/scripts/Invoke-RunScenario.ps1` | Preserve strict gate; harden identity/recovery |
-| `copilot-cli-plugin/skills/chaos-impact/**` | Extend collection/schema-compatible output/tests/replay; do not duplicate |
-| `copilot-cli-plugin/agents/start-chaos.md` | Add host-visible preflight and targeted entry guidance |
-| `copilot-cli-plugin/scripts/{State,Render,New-RunReport,Rbac,Validate-AndFix,Invoke-AzRest,Invoke-AzChaos,Wait-AzureLro,Ensure-AzLogin}.ps1` | Extend current shared seams |
-| `copilot-cli-plugin/.chaos-plugins.yaml.example` | Add evidence root/retention and proof-policy examples |
-| `copilot-cli-plugin/mcp/chaos_mcp/server.py` | Keep all 15 decorators; add wrappers and additive run/result fields |
-| `copilot-cli-plugin/mcp/chaos_mcp/azure.py` | Paging/provenance and optional pin consolidation |
-| `copilot-cli-plugin/mcp/chaos_mcp/monitor.py` | App Insights, alert instances and fault-window pack helpers |
-| `copilot-cli-plugin/mcp/tests/test_auth_mode.py`, `test_monitor_tools.py` | Preserve existing tests; add regressions |
-| `copilot-cli-plugin/mcp/pyproject.toml`, `copilot-cli-plugin/mcp/README.md`, `copilot-cli-plugin/mcp/mcp-config.example.json` | Version/dependencies/docs/config updates as needed |
-| `copilot-cli-plugin/plugin.json` | Retain directory/server registrations; synchronize version only after gates |
-| `.github/plugin/marketplace.json` | Synchronize additive minor version |
-| `copilot-cli-plugin/README.md`, `copilot-cli-plugin/CHANGELOG.md`, `copilot-cli-plugin/CONTRIBUTING.md`, `copilot-cli-plugin/docs/impact-synthesis-skill.md` | Evolution/compatibility documentation |
-| `.github/workflows/test.yml` | Add contract/preflight/replay tests without shrinking matrices |
+| `copilot-cli-plugin/scripts/Study.ps1` | Study store: create, resolve, save, seal, index, command trail (FR-14) |
+| `copilot-cli-plugin/scripts/Constants.ps1` | Promoted shared PowerShell api-version pin file (NFR-9) |
+| `copilot-cli-plugin/scripts/Invoke-AzChaosClassic.ps1` | Pinned, allowlisted REST wrapper for the classic model (FR-5, CS-10) |
+| `copilot-cli-plugin/scripts/Resolve-FaultPath.ps1` | Runtime capability probe → `scenario` \| `experiment` \| `none` (FR-6) |
+| `copilot-cli-plugin/scripts/Get-K8sReadiness.ps1` | Seven Kubernetes readiness checks with remediation (FR-7) |
+| `copilot-cli-plugin/scripts/Get-StudySignals.ps1` | Pre/during/post window pack (FR-11) |
+| `copilot-cli-plugin/scripts/Build-StudyFindings.ps1` | Pure findings + limitations engine (FR-12, FR-18) |
+| `copilot-cli-plugin/scripts/New-StudyReport.ps1` | Deterministic HTML renderer (FR-16, FR-17) |
+| `copilot-cli-plugin/scripts/Compare-Study.ps1` | Pure study comparison (FR-15) |
+| `copilot-cli-plugin/skills/chaos-study/SKILL.md` + `scripts/Invoke-ChaosStudy.ps1` | Entry skill (G1, FR-1) |
+| `copilot-cli-plugin/skills/chaos-study-scope/SKILL.md` + `scripts/Invoke-ChaosStudyScope.ps1` | Discovery, readiness, hypothesis, plan |
+| `copilot-cli-plugin/skills/chaos-study-run/SKILL.md` + `scripts/Invoke-ChaosStudyRun.ps1` | Consent, execution, window capture |
+| `copilot-cli-plugin/skills/chaos-study-report/SKILL.md` + `scripts/Invoke-ChaosStudyReport.ps1` | Findings and report |
+| `copilot-cli-plugin/skills/chaos-study-report/templates/study-report.html.tmpl` | Single-file report template, inline CSS + SVG |
+| `copilot-cli-plugin/skills/chaos-study-history/SKILL.md` + `scripts/Invoke-ChaosStudyHistory.ps1` | List, show, compare, rerun |
+| `copilot-cli-plugin/schemas/study-plan.v1.schema.json` | Plan contract |
+| `copilot-cli-plugin/schemas/findings.v1.schema.json` | Findings + mandatory limitations |
+| `copilot-cli-plugin/schemas/study-manifest.v1.schema.json` | Seal manifest |
+| `copilot-cli-plugin/schemas/comparison.v1.schema.json` | Comparison contract |
+| `copilot-cli-plugin/schemas/fault-guide.v1.schema.json` | Fault-guide front matter (FR-21) |
+| `copilot-cli-plugin/references/chaos/study-method.md` | Hypothesis, steady state, blast radius, abort, evidence |
+| `copilot-cli-plugin/references/chaos/report-contract.md` | Sections, severity scale, limitation taxonomy |
+| `copilot-cli-plugin/references/chaos/faults/_index.md` | Routing table (FR-4) |
+| `copilot-cli-plugin/references/chaos/faults/aks-chaosmesh-{pod,network,stress,io,dns,http,time,kernel}.md` | Eight Chaos Mesh fault guides |
+| `copilot-cli-plugin/references/chaos/faults/aks-nodepool-vmss-shutdown.md`, `aks-nsg-rule.md` | Two non-Chaos-Mesh Kubernetes-adjacent guides |
+| `copilot-cli-plugin/references/chaos/scenarios/_index.md` + `kubernetes-{pod-resilience,node-loss,dependency-latency}.md` | Scenario guidance |
+| `copilot-cli-plugin/skills/chaos-study*/tests/**` | Pester suites (one per epic; see Implementation Plan) |
+| `copilot-cli-plugin/skills/chaos-study-report/tests/fixtures/golden-{pass,critical,not-exercised}/` | Three golden studies |
 
-### New `[NEW]`
+### Modified Files
 
-| Exact proposed path/family | Purpose |
+| File Path | Changes |
 |---|---|
-| `copilot-cli-plugin/skills/{chaos-scope-setup,chaos-inventory,chaos-availability,chaos-analyze,chaos-recommend,chaos-run,chaos-diagnose,chaos-evidence}/SKILL.md` | Additive targeted entry definitions that name composed main assets |
-| `copilot-cli-plugin/schemas/{scope-setup,inventory,availability,hypotheses,recommendations,run-record,diagnosis,evidence-bundle,mechanism-ledger}.v1.schema.json` | Focused artifacts; no monolithic state replacement |
-| `copilot-cli-plugin/references/chaos/{evidence-contract,verdict-matrix,fault-semantics,telemetry-contract,blast-radius}.md` | Shared field-derived contracts |
-| `copilot-cli-plugin/mcp/chaos_mcp/{scope,availability,evidence,proof,analysis,scoring,verdict}.py` | Semantically distinct scope/planning, opt-in probe validation, store/proof, and pure decision modules |
-| `copilot-cli-plugin/mcp/chaos_mcp/apiversions.py` | Optional Python pin consolidation after a baseline test proves behavior |
-| `copilot-cli-plugin/mcp/tests/{test_lifecycle_contract,test_scope,test_evidence,test_proof,test_analysis,test_scoring,test_verdict,test_tool_manifest,test_execute,test_fault_semantics}.py` | New additive tests; monitor regressions modify existing `[MAIN] test_monitor_tools.py` rather than creating a replacement |
-| `copilot-cli-plugin/mcp/tests/fixtures/**` | F1–F15 and compatibility fixtures |
-| `copilot-cli-plugin/skills/start-chaos/tests/Preflight.Tests.ps1` | Skill requirement/host-visible inventory contract; located under the existing Pester `Run.Path` |
-| `copilot-cli-plugin/mcp/tests/e2e/test_journey_replay.py` | Python replay over the same scrubbed corpus |
-| `evals/recommendation/**` | Recommendation-quality golden set/rubric/scorer |
-| `docs/targeted-chaos-skills.md`, `docs/examples/{full-journey,cold-diagnose}.md` | User guidance |
+| `copilot-cli-plugin/scripts/Preflight.ps1` | `+ Resolve-ToolPath`; `optionalTools` front-matter support. Existing functions untouched (FR-20) |
+| `copilot-cli-plugin/scripts/Invoke-AzChaos.ps1`, `Invoke-AzRest.ps1` | Optional study-context hook so every `az`/REST call is trailed automatically (FR-22, E6-T1). No behaviour change when no study context is set |
+| `copilot-cli-plugin/scripts/State.ps1` | Export `Get-EvidenceScopeHash` and the redaction lists for `Study.ps1`. No behaviour change |
+| `copilot-cli-plugin/skills/chaos-impact/scripts/Constants.ps1` | Becomes a dot-source shim to the promoted `scripts/Constants.ps1` for one minor version |
+| `copilot-cli-plugin/skills/setup-scenario/SKILL.md` | `[E3]` blast-radius/consent narrative replaced by a routing pointer; target < 140 lines (P2) |
+| `copilot-cli-plugin/skills/run-scenario/SKILL.md` | Same treatment; target < 140 lines. Plus E15-T8: remove or gate `$env:STARTCHAOS_NONINTERACTIVE` so it cannot skip fault-execution confirmation (N8) |
+| `copilot-cli-plugin/skills/run-scenario/scripts/Invoke-RunScenario.ps1` | E15-T8 only: the `STARTCHAOS_NONINTERACTIVE` bypass at line 48 |
+| `copilot-cli-plugin/agents/start-chaos.md` | Extend the no-ad-hoc-REST invariant to name `Invoke-AzChaosClassic.ps1` |
+| `copilot-cli-plugin/references/chaos/evidence-contract.md` | New section: evidence store vs study store, sealing, boundary |
+| `copilot-cli-plugin/references/chaos/verdict-matrix.md` | Reframed as the internal derivation table behind severity/confidence (D8) |
+| `copilot-cli-plugin/skills/start-chaos/tests/Preflight.Tests.ps1` | Fail-fast cases move to a `requiredTools` fixture; substitution cases added |
+| `copilot-cli-plugin/mcp/tests/test_tool_manifest.py` | `FROZEN_SKILLS` gains the five new skills |
+| `copilot-cli-plugin/mcp/chaos_mcp/apiversions.py` | Lint test extended to cover the promoted PowerShell pin file |
+| `copilot-cli-plugin/plugin.json`, `.github/plugin/marketplace.json`, `copilot-cli-plugin/mcp/pyproject.toml` | v0.4.0; five skill registrations |
+| `copilot-cli-plugin/README.md`, `docs/` | Study workflow walkthrough; `$CHAOS_STUDY_ROOT` documented |
+| `docs/targeted-chaos-skills.decisions.md` | The executive companion to this plan. Regenerated from this document at every revision; it adds no decision of its own, so it can never disagree with the plan (E15-T3) |
 
-### Not ported `[PR32 PROTOTYPE]`
+### Deleted Files
 
-| Prototype-only path | Disposition |
+| File Path | Reason |
 |---|---|
-| `copilot-cli-plugin/references/chaos-loop/scenario-catalog.v1.json` and `scenario-catalog.md` | **Do not port**; service-derived availability is authoritative |
-| `copilot-cli-plugin/scripts/chaos_loop_state.py` | **Do not port wholesale**; re-express atomic/proposal-evaluate patterns |
-| `copilot-cli-plugin/schemas/chaos-loop/{run-state.v1,external-gate.v1,workspace-plan.v1}.schema.json` | **Do not port**; focused new artifacts cover retained concepts |
-| `copilot-cli-plugin/skills/{chaos-loop,resilience-analysis,chaos-execution,diagnostic,advisory,coding}/**` | **Do not port**; current shipped skills remain and targeted entries are additive |
+| `docs/_p1.md` | A Revision-4 fragment fully superseded by this document. Removed in E15-T4. **This is the only file this plan deletes.** |
 
-There is no "Deleted from main" table because none of these prototype paths exists at the research SHA.
+No file under `copilot-cli-plugin/` is deleted. `[PR32]` paths do not exist on `main`, so its removal is a plan-of-record decision, not a filesystem change (D17).
 
 ---
 
 ## Implementation Plan
 
-### Epic 1 — Baseline contracts, tests, and runtime preflight — DONE
+Statuses reflect the branch at `283cb61` (EPIC-001 through EPIC-003 committed).
 
-**Goal:** Prove and freeze the shipped behavior before adding anything.
+### EPIC-001 — Baseline contracts, tests, runtime preflight — **DONE** (`5257c2a`)
+
+**Goal:** api-version consolidation, lifecycle/manifest test coverage, host-visible tool preflight.
 **Prerequisites:** none.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E1-T1 | TEST | Snapshot the five skill names/triggers, current state fixture, impact schema v1, and exact 15 tool signatures/envelopes from the research SHA | `mcp/tests/test_lifecycle_contract.py`, `skills/chaos-impact/tests/e2e/**` | DONE |
-| E1-T2 | TEST | Add direct recorded tests for the ten lifecycle tools currently lacking them | `mcp/tests/test_lifecycle_contract.py` | DONE |
-| E1-T3 | IMPL | Add `requiredTools` declarations and host-visible inventory preflight to current skills; never add server self-introspection | `skills/*/SKILL.md`, `agents/start-chaos.md` | DONE |
-| E1-T4 | TEST | CI lint every declared tool against decorators in `server.py`; assert exactly the original 15 remain callable. Put Pester coverage at `skills/start-chaos/tests/Preflight.Tests.ps1`, under current `Run.Path='./copilot-cli-plugin/skills'` | `mcp/tests/test_tool_manifest.py`, `skills/start-chaos/tests/Preflight.Tests.ps1`, `.github/workflows/test.yml` | DONE |
-| E1-T5 | SPIKE | Verify runtime MCP SDK/output-schema support, current PyPI availability, and required preview operations in a target environment; record unknowns rather than inferring from source | `mcp/README.md`, test evidence | DONE |
-| E1-T6 | TEST | Run unchanged Pester OS matrix, pytest Python matrix, ruff, and current offline replay as the baseline gate | `.github/workflows/test.yml` | DONE |
-| E1-T7 | REFACTOR | After baseline tests, consolidate Python API pins from `azure.py`, `monitor.py`, and `server.py` into `apiversions.py`; keep PowerShell impact pins in `Constants.ps1` | exact current modules + new constants module | DONE |
+| E1-T7 | IMPL | Consolidate Python api-version pins + dead-pin lint | `mcp/chaos_mcp/apiversions.py` | DONE |
+| E1-T8 | TEST | Lifecycle + tool-manifest contract tests, `FROZEN_SKILLS` | `mcp/tests/test_lifecycle_contract.py`, `test_tool_manifest.py` | DONE |
+| E1-T9 | IMPL | `Preflight.ps1` + `requiredTools:` front matter | `scripts/Preflight.ps1`, five `SKILL.md` | DONE |
+| E1-T10 | TEST | Preflight Pester contract | `skills/start-chaos/tests/Preflight.Tests.ps1` | DONE |
 
 **Acceptance criteria**
-- [x] Five skills, 15 tools, state fixture, impact schema v1 and replay are frozen by tests.
-- [x] Registration-vs-runtime availability produces an exact named preflight failure (F5).
-- [x] CI test discovery output includes `skills/start-chaos/tests/Preflight.Tests.ps1` without changing or narrowing the current Pester `Run.Path`.
-- [x] Existing Pester/pytest/ruff matrices pass before and after each later epic.
+- [x] pytest 104 passed, ruff clean, Pester 112 passed / 0 failed on this machine
+- [x] No api-version literal escapes `apiversions.py`
 
-**Completed:** 2026-08-24
+### EPIC-002 — Compatible state and durable evidence — **DONE** (`4befd5e`)
 
-**Completion notes**
-- Verification gate on this machine: `pytest` 104 passed, `ruff check chaos_mcp tests` clean, `Invoke-Pester -Path ./copilot-cli-plugin/skills` 112 passed / 0 failed with `skills/start-chaos/tests/Preflight.Tests.ps1` discovered under the unchanged `Run.Path`.
-- E1-T7: `apiversions.py` holds seven flat ARM api-version constants plus one aggregate map and the Log Analytics path version. `azure.py` now builds the Log Analytics query URL from `LOG_ANALYTICS_QUERY_VERSION` (value `"v1"`, byte-identical to the previous hardcoded segment, so recorded fixtures stay valid); `test_no_pin_is_dead` enforces that no pin is unused.
-- E1-T1: `FROZEN_SKILLS` holds real normalised description strings for all five skills — no `None` escape hatch, so every trigger is unconditionally frozen.
-- E1-T3/T4 (F5): preflight is host-inventory driven and never introspects the server (`test_preflight_never_introspects_the_server`). Failure text is duplicated across Python and PowerShell and pinned by `test_preflight_failure_prefix_matches_powershell`. Negative/edge coverage: empty host inventory, case-sensitivity near-miss, extra host tools, zero declared tools.
-- `create-workspace` declares only `chaos_create_workspace`; the over-declared `chaos_get_workspace` was dropped so preflight cannot block on a tool the skill never calls.
-- Documented decision: `chaos_set_auth_mode`/`chaos_get_auth_mode` are deliberately excluded from every skill's `requiredTools` — Phase 0 authenticates via `scripts/Ensure-AzLogin.ps1` and the server defaults to CLI auth, making the pair an optional managed-identity override. Rationale recorded in `agents/start-chaos.md` and pinned by `Preflight.Tests.ps1`.
-
----
-
-### Epic 2 — Compatible state and durable evidence — DONE
-
-**Goal:** Preserve current state while adding evidence that survives repo/session cleanup.
-**Prerequisites:** Epic 1.
+**Goal:** a durable, redacted, atomic evidence store outside the repository.
+**Prerequisites:** EPIC-001.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E2-T1 | IMPL | Define focused artifact schemas plus a backward-compatible importer for current `startchaos-state.json`; keep impact schema v1 | `schemas/*.v1.schema.json`, `scripts/State.ps1` | DONE |
-| E2-T2 | IMPL | Mirror phase outputs atomically to `$CHAOS_EVIDENCE_ROOT` (per-user default), while continuing to update `STARTCHAOS_STATE_PATH` | `scripts/State.ps1`, `.chaos-plugins.yaml.example` | DONE |
-| E2-T3 | IMPL | Add MCP evidence read/write/list only for cross-session access; path canonicalization, redaction and key denylist are mandatory | `mcp/chaos_mcp/evidence.py`, `server.py` | DONE |
-| E2-T4 | IMPL | Add `evidence-contract.md` and `verdict-matrix.md`; re-express `[PR32 PROTOTYPE]` invariants without copying its state engine | `references/chaos/*.md` | DONE |
-| E2-T5 | TEST | State round-trip/import, tmp/repo wipe survival, atomic concurrency, redaction, traversal/symlink/key-material denial | `mcp/tests/test_evidence.py`, Pester state tests | DONE |
+| E2-T1 | IMPL | Evidence store: canonicalization, key denylist, redaction, atomic revisioned writes | `mcp/chaos_mcp/evidence.py` | DONE |
+| E2-T2 | IMPL | PowerShell mirror + import | `scripts/State.ps1` | DONE |
+| E2-T3 | IMPL | Nine v1 artifact schemas | `schemas/*.v1.schema.json` | DONE |
+| E2-T4 | IMPL | Three evidence MCP tools (15 → 18) | `mcp/chaos_mcp/server.py` | DONE |
+| E2-T5 | TEST | Evidence + state suites | `mcp/tests/test_evidence.py`, `skills/start-chaos/tests/State.Tests.ps1` | DONE |
 
 **Acceptance criteria**
-- [x] An existing `startchaos-state.json` resumes unchanged and is mirrored, not relocated.
-- [x] Evidence survives deletion of repo/session temporary content (F12).
-- [x] No secret or approval key is reachable through evidence tools.
+- [x] pytest 193 passed / 1 skipped, ruff clean
+- [x] `$CHAOS_KEY_DIR` unreachable; redaction applied on write **and** read
 
-**Completed:** 2026-08-24
+### EPIC-003 — Validation blockers, blast radius, consent — **DONE** (`283cb61`)
 
-**Completion notes**
-- Verification gate on this machine: `python -m pytest -q` → 193 passed / 1 skipped; `ruff check chaos_mcp tests` → all checks passed.
-- E2-T3 hardening: `_is_ascii_digits(value)` (`bool(value) and value.isascii() and value.isdigit()`) is the single pinned predicate for model-supplied numeric strings. `str.isdigit()` alone was unsafe on both sides — `int('\u00b2')` raises (escaping the `{ok, errorType}` envelope as a raw `ValueError`) while `int('\u0967')` silently succeeds as `1`. `try/except ValueError` would have closed only the crash half, so the alphabet is pinned to ASCII instead.
-- Call sites converted: `_coerce_revision` (checks `value.strip()`, so the pre-existing lenient `' 5 '` padding behaviour is preserved) returns `EvidenceBadRevision`; `_decode_token` (after the `isinstance(str)` guard) returns `EvidenceBadToken`.
-- Audited every `int(` in `evidence.py` for the same defect: `retention_days()` is env-sourced and already `try/except`-wrapped; the L625 parse reads a revision the store itself wrote. No sibling instances remain.
-- Regression coverage was added as parametrized inputs to the tests that already own those behaviours; `test_a_non_integer_expected_revision_stays_inside_the_envelope` asserts the named `errorType` *and* that the refused write never landed, giving the silent-accept path explicit no-side-effect coverage.
-- Test hygiene: the manifest guard was renamed to `test_server_registers_the_frozen_fifteen_plus_declared_additions` to match what it now asserts against the 18-tool registry (nothing removed from the frozen 15, nothing added undeclared); the redundant `len(ORIGINAL_FIFTEEN_TOOLS & registered) == 15` assertion was dropped as implied by `missing`. `mcp/README.md` was updated so the cited test name stays resolvable.
-- `references/chaos/evidence-contract.md` §10 records the ASCII-digits-only rule for `expected_revision` and `continuation_token`, and folds the `sha256`/`digest` duplicate spelling into the existing deprecation note (`digest` is the contract field, `sha256` the deprecated alias).
-
----
-
-### Epic 3 — Harden current setup validation and exclusions
-
-**Goal:** Improve the shipped setup path before adding targeted setup/availability entries.
-**Prerequisites:** Epics 1–2.
+**Goal:** land the working tree without losing anything.
+**Prerequisites:** EPIC-002.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E3-T1 | IMPL | Render resolved include/exclude targeting and blast radius before configuration creation | `skills/setup-scenario/scripts/Invoke-SetupScenario.ps1`, `Render.ps1` | TO DO |
-| E3-T2 | IMPL | Normalize `validations/latest` permission/resource errors; propose exact targeted grants from current `Rbac.ps1` before broad fix | `Validate-AndFix.ps1`, `Rbac.ps1`, `server.py` | TO DO |
-| E3-T3 | IMPL | Keep `chaos_fix_resource_permissions` available only after an explicit consent prompt describing breadth | `skills/setup-scenario/SKILL.md`, `skills/run-scenario/SKILL.md` | TO DO |
-| E3-T4 | IMPL | Document/service-test exclusion recipes and configuration-scoped validation limits | `references/chaos/blast-radius.md`, current skill docs | TO DO |
-| E3-T5 | TEST | Existing setup replay plus include/exclude precedence, blocker normalization, targeted-first, and consent tests | Pester setup tests, `mcp/tests/test_lifecycle_contract.py` | TO DO |
+| E3-T1 | IMPL | Structured validation errors, normalised blockers, validate → fix → revalidate, broad-fix consent (exit 4) | `scripts/Validate-AndFix.ps1` | DONE |
+| E3-T2 | IMPL | `Build-TargetedGrantProposal` + `build_targeted_grant_proposal()` | `scripts/Rbac.ps1`, `mcp/chaos_mcp/server.py` | DONE |
+| E3-T3 | IMPL | `Resolve-BlastRadius`, `Write-BlastRadiusCard` | `scripts/Render.ps1` | DONE |
+| E3-T4 | IMPL | Blast-radius reference doc incl. the advisory-targeting note | `references/chaos/blast-radius.md` | DONE (tracked) |
+| E3-T5 | TEST | Four Pester suites | `skills/{setup,run}-scenario/tests/**` | DONE (tracked) |
+| E3-T6 | IMPL | **`git add` the untracked files, commit, run the full matrix on three OS** | — | DONE for the commit (`283cb61`); **three-OS / 3.10–3.13 matrix still pending** — the branch is local-only and the workflow fires on push/PR to `main`, so only Windows Pester and local Python were run. Closes when CI runs on first push. |
 
 **Acceptance criteria**
-- [ ] Existing setup path remains directly invocable and validates before completion.
-- [ ] Exclusions and affected resources are shown before mutation (F8).
-- [ ] Broad permission fix never runs without explicit consent.
+- [x] `git status` clean for `copilot-cli-plugin/`; `blast-radius.md` and both `tests/` directories tracked
+- [~] Pester green on Windows, Linux and macOS; pytest green on 3.10–3.13; ruff clean — **verified on Windows (PowerShell 7.6.5) and local Python only.** The hosted matrix has not run: the branch has no PR and the workflow is gated on push/PR to `main`. This leg is outstanding and closes on the first CI run (see E3-T6).
+- [x] Exit codes 2, 3 and 4 asserted by `SetupExitContract.Tests.ps1` (the shipped `0`–`4` block is frozen by this epic)
 
----
+### EPIC-004 — Immutable dated study store
 
-### Epic 4 — Harden current run validation and identity
-
-**Goal:** Make the shipped run path concurrency-safe and evidence-addressable.
-**Prerequisites:** Epic 3.
+**Goal:** create, seal, enumerate and re-read a study offline. **Prerequisites:** EPIC-003.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E4-T1 | IMPL | Preserve validate/fix/revalidate gate and frozen configuration summary before execute | `Invoke-RunScenario.ps1`, `Validate-AndFix.ps1` | TO DO |
-| E4-T2 | IMPL | Capture `requestSentAt`; resolve only matching runs started afterward with bounded retry and loud ambiguity/failure | `mcp/chaos_mcp/server.py`, `Invoke-RunScenario.ps1` | TO DO |
-| E4-T3 | IMPL | Preserve raw run payload and add action identity source/confidence fallback when `actionName` is null | `server.py`, `New-RunReport.ps1` | TO DO |
-| E4-T4 | TEST | Empty-start, concurrent-run, null-action, validation failure, cancel-request and resume fixtures | `mcp/tests/test_lifecycle_contract.py`, Pester run tests | TO DO |
+| E4-T1 | IMPL | `Study.ps1`: `New-Study`, `Get-StudyRoot`, `Resolve-StudyPath`, `Save-StudyArtifact`, `Complete-Study` (alias `Seal-Study`), `Get-Study`, `Get-StudyIndex`, `Add-StudyIndexEntry` (`Add-CommandTrailEntry` lands in EPIC-006) | `scripts/Study.ps1` | TO DO |
+| E4-T2 | IMPL | Export scope-hash + redaction lists from `State.ps1` for reuse (no fork — D16) | `scripts/State.ps1` | TO DO |
+| E4-T3 | IMPL | `study-plan.v1` and `study-manifest.v1` schemas | `schemas/study-plan.v1.schema.json`, `schemas/study-manifest.v1.schema.json` | TO DO |
+| E4-T4 | IMPL | Extend the evidence contract doc with the study-store boundary | `references/chaos/evidence-contract.md` | TO DO |
+| E4-T5 | TEST | Sealing, immutability, three-step commit, index rebuild, root-location assertions, redaction of a planted token | `skills/start-chaos/tests/Study.Tests.ps1` | TO DO |
+| E4-T6 | TEST | Portability: zip → unzip elsewhere → `Get-Study` succeeds with no credentials | `skills/start-chaos/tests/StudyPortability.Tests.ps1` | TO DO |
 
 **Acceptance criteria**
-- [ ] Execute/get/cancel signatures and envelopes are unchanged.
-- [ ] Empty start yields one correct run ID or a named error; never a guessed concurrent run (F7).
-- [ ] Null action names are preserved and never silently relabeled.
+- [ ] `Save-StudyArtifact` on a sealed study throws `StudyAlreadySealed` (exit 13); **no force flag exists**
+- [ ] A test asserts the resolved root is neither under the repository root nor under the system temp directory (FR-14)
+- [ ] `manifest.json` SHA-256 covers every file except itself and `SEALED`; a mutated file is detected
+- [ ] `Get-StudyIndex -Rebuild` reconstructs an index deleted mid-test
+- [ ] A token planted in plan, signals, error text and `az` argv appears nowhere in the sealed study (NFR-5)
 
----
+### EPIC-005 — Fault-guide contract and the first-vertical guides
 
-### Epic 5 — Monitoring core: the fault-window pack
-
-**Goal:** One call returns the complete pre/during/post evidence bundle, on the correct schema.
-**Prerequisites:** Epic 1.
+**Goal:** fault knowledge is versioned, schema-validated, discoverable and additive, with exactly the guides the first vertical needs. **Prerequisites:** EPIC-003 (parallel with EPIC-004). Remaining coverage is EPIC-016.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E5-T1 | IMPL | Add half-open/symmetric window helpers and pack composition around the three current monitor helpers | `mcp/chaos_mcp/monitor.py`, wrappers in `server.py` | TO DO |
-| E5-T2 | IMPL | `monitor_query_appinsights`: inject subscription and normalize classic lowercase resource-scoped schema; do not implement the falsified `first` escaping theory | `monitor.py`, `server.py` | TO DO |
-| E5-T3 | IMPL | `monitor_list_alert_instances` matching current PowerShell `timeRange=custom` + `customTimeRange` and `2023-05-01-preview` → `2018-05-05` fallback; record version used | `monitor.py`, `server.py`, `chaos-impact/scripts/Get-MonitorSignals.ps1` | TO DO |
-| E5-T4 | IMPL | `monitor_fault_window_pack` and `monitor_check_work_starvation`; consume metrics/logs/activity/alerts and preserve `null` + caveat | `monitor.py`, `server.py` | TO DO |
-| E5-T5 | TEST | App Insights, alert exact-window, pack boundaries, starvation ordering, and current three-tool regressions | `mcp/tests/test_monitor_tools.py`, `chaos-impact/tests/e2e/**` | TO DO |
+| E5-T1 | IMPL | `fault-guide.v1.schema.json` — front-matter contract; `dataPlaneProof.coverage: none` is invalid | `schemas/fault-guide.v1.schema.json` | TO DO |
+| E5-T2 | IMPL | Three core AKS Chaos Mesh guides at capability 2.2 — `podChaos`, `networkChaos`, `stressChaos` — each with `jsonSpec` shape, prerequisites, steady-state and impact signals, blast-radius controls, abort conditions, `dataPlaneProof` | `references/chaos/faults/aks-chaosmesh-{pod,network,stress}.md` | TO DO |
+| E5-T3 | IMPL | Routing table + the first scenario guide | `references/chaos/faults/_index.md`, `references/chaos/scenarios/{_index,kubernetes-pod-resilience}.md` | TO DO |
+| E5-T4 | IMPL | `study-method.md` — hypothesis, steady state, blast radius, abort, evidence | `references/chaos/study-method.md` | TO DO |
+| E5-T5 | TEST | Index/guide bijection, schema validity, no orphan guides, every `faultUrn` unique | `skills/start-chaos/tests/FaultGuides.Tests.ps1` | TO DO |
+| E5-T6 | TEST | Additivity proof: a fixture guide is added with no script, skill or test change | `skills/start-chaos/tests/fixtures/faults/example-fault.md` | TO DO |
 
 **Acceptance criteria**
-- [ ] A single `monitor_fault_window_pack(runId)` call returns all three buckets (F2).
-- [ ] App Insights queries succeed first time on the classic resource-scoped schema (F4).
-- [ ] Absent sources return `null` + caveat, never `0` (NFR-3).
-- [ ] Existing PowerShell alerts/Service Health and all three current MCP monitor tools remain green.
+- [ ] Three guides validate against `fault-guide.v1.schema.json`
+- [ ] `_index.md` rows and guide files are in exact bijection
+- [ ] Every guide states `dataPlaneProof.coverage` as `documented` or `heuristic`; `none` fails CI (FR-21)
+- [ ] Adding a fault requires no script, skill or test change — demonstrated by E5-T6, not asserted in prose (G9)
 
----
+### EPIC-006 — Provenance: command trail and optional MCP
 
-### Epic 6 — Additive scope, inventory, and availability entries
-
-**Goal:** Expose targeted discovery without replacing current setup.
-**Prerequisites:** Epics 1–5.
+**Goal:** every `az` call a study makes is recorded, and no MCP tool is required or silently substituted. **Prerequisites:** EPIC-004.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E6-T1 | IMPL | Add `chaos-scope-setup` by composing `create-workspace`, state, RBAC, create/get workspace tools; dry-run by default | new SKILL.md; minimal `azure.py`/`server.py` extensions | TO DO |
-| E6-T2 | IMPL | Add `chaos-inventory` by reusing workspace state, impact diagnostic/monitor collection and paged ARM helpers | new SKILL.md; existing collectors plus focused pure inventory code | TO DO |
-| E6-T3 | IMPL | Add `chaos-availability` over current refresh/list/create/validate paths; Tier A reports permission unknown, Tier B is explicit disposable validation | new SKILL.md; `server.py`/`azure.py` only where current responses are insufficient | TO DO |
-| E6-T4 | TEST | Workspace reuse, inventory provenance/null IDs, service-only scenario names, Tier A unknown, Tier B cleanup | new recorded tests plus current setup replay | TO DO |
+| E6-T1 | IMPL | Optional study-context hook in the two `az` seams, so **every** invocation is trailed automatically rather than per-caller (FR-22) | `scripts/Invoke-AzChaos.ps1`, `scripts/Invoke-AzRest.ps1` | TO DO |
+| E6-T2 | IMPL | `Add-CommandTrailEntry` writes `commands.jsonl` — command, exit code, duration, api-version, **arguments redacted before write** | `scripts/Study.ps1` | TO DO |
+| E6-T3 | IMPL | `Resolve-ToolPath` + `optionalTools:` front-matter parsing; `Assert-RequiredTools` retained and still callable | `scripts/Preflight.ps1` | TO DO |
+| E6-T4 | IMPL | `toolSubstitutions[]` written into the study manifest and rendered in the report appendix | `scripts/Study.ps1` | TO DO |
+| E6-T5 | TEST | Reshape Preflight tests: fail-fast under a `requiredTools` fixture; substitution cases for `optionalTools`; zero-MCP run completes | `skills/start-chaos/tests/{Preflight,OptionalTools}.Tests.ps1` | TO DO |
+| E6-T6 | TEST | Trail completeness: a scripted study makes N `az` calls and `commands.jsonl` has exactly N entries, none containing a planted token | `skills/start-chaos/tests/CommandTrail.Tests.ps1` | TO DO |
 
 **Acceptance criteria**
-- [ ] Each skill documents the exact current skills/scripts/tools it composes.
-- [ ] No prototype scenario catalog is ported and no scenario is fabricated.
-- [ ] Current create/setup/start entry paths remain unchanged.
+- [ ] Recording is automatic at the seam — a new caller cannot forget to trail a command (FR-22)
+- [ ] Every new skill declares `optionalTools:` and none declares `requiredTools:`
+- [ ] With an empty tool inventory the workflow completes and the manifest lists each substitution (D6, F5)
+- [ ] The `[E1]` fail-fast capability is still exercised by at least one test
 
----
+### EPIC-007 — Fault-path probe, classic REST wrapper, Kubernetes readiness
 
-### Epic 7 — Analysis, correlation and the mechanism-class ledger
-
-**Goal:** Hypotheses are grounded, non-repeating, and liveness-aware.
-**Prerequisites:** Epics 1–6.
+**Goal:** AKS faults are reachable without ad-hoc REST. **Prerequisites:** EPIC-005.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E7-T1 | IMPL | `correlate_iac_to_resources()` — deployment history → tags → naming ladder with recorded method and confidence. **Pure library function, not an MCP tool** (D15) | `mcp/chaos_mcp/analysis.py` | TO DO |
-| E7-T2 | IMPL | IaC normalisation adapters: ARM JSON, `bicep build`, `terraform show -json`, `helm template`/`kustomize build`; each optional and degrade-reporting | `mcp/chaos_mcp/analysis.py` | TO DO |
-| E7-T3 | IMPL | `check_mechanism_class()` over the durable failed-class ledger (F11). **Pure library function** reading the ledger through `evidence_get` | `mcp/chaos_mcp/analysis.py` | TO DO |
-| E7-T4 | IMPL | `chaos-analyze` SKILL.md — deterministic resource rules, model-owned code/IaC reading, mandatory liveness predicate for probe/observability hypotheses (F10), `consumerCoupling` capture (F13) | `skills/chaos-analyze/SKILL.md` | TO DO |
-| E7-T5 | TEST | Correlation-ladder fixtures (high/medium/low/unresolvable); `test_mechanism_class_repeat_blocked`; liveness-required schema test | `mcp/tests/test_analysis.py` | TO DO |
+| E7-T1 | IMPL | Promote `Constants.ps1` to `scripts/`; shim the old path; add the classic pin (NFR-9) | `scripts/Constants.ps1`, `skills/chaos-impact/scripts/Constants.ps1` | TO DO |
+| E7-T2 | IMPL | `Invoke-AzChaosClassic.ps1` — allowlisted classic paths, pinned api-version | `scripts/Invoke-AzChaosClassic.ps1` | TO DO |
+| E7-T3 | IMPL | `Resolve-FaultPath.ps1` — probe v2 catalog then classic target types; return the evidence | `scripts/Resolve-FaultPath.ps1` | TO DO |
+| E7-T4 | IMPL | `Get-K8sReadiness.ps1` — seven checks, each pass/fail/unknown + exact remediation | `scripts/Get-K8sReadiness.ps1` | TO DO |
+| E7-T5 | IMPL | Extend the agent invariant to name the classic wrapper | `agents/start-chaos.md` | TO DO |
+| E7-T6 | TEST | Replay-based tests for probe and readiness; allowlist-escape test for the wrapper; `kubectl`-absent yields `unknown` | `skills/chaos-study-scope/tests/{FaultPath,K8sReadiness,ClassicWrapper}.Tests.ps1` | TO DO |
 
 **Acceptance criteria**
-- [ ] No hypothesis cites an ARM ID that was not resolved by a recorded method.
-- [ ] Three different implementations of one mechanism class are blocked as one (F11).
-- [ ] A probe hypothesis without a liveness predicate fails schema validation (F10).
+- [ ] `Resolve-FaultPath` returns `scenario` \| `experiment` \| `none` **with the evidence for the answer**, and never guesses (FR-6); `none` exits 14
+- [ ] No caller can pass an arbitrary path to `Invoke-AzChaosClassic` (asserted)
+- [ ] `Get-K8sReadiness` returns exactly seven checks; absent `kubectl` yields `unknown`, never `fail`
+- [ ] Manual live verification recorded: one classic experiment created and cancelled against a disposable cluster
 
----
+### EPIC-008 — `chaos-study-scope`
 
-### Epic 7a — Fault-semantics coverage (the launch-usability epic)
-
-**Goal:** Enough per-fault data-plane knowledge exists that the suite returns useful verdicts at launch rather than a uniform `NOT EXERCISED`.
-**Prerequisites:** Epic 2 for the document structure. The documentation-sourced half (T1, T2, T5, T6) can proceed with Epics 6–8. The empirical half (T3, T4) requires Epic 9 execution and Epic 10 proof, and remains post-launch.
-
-**Cost and launch gating.** T3/T4 are the only tasks in this plan that require live Azure spend: a dedicated test subscription with representative resources per fault type, a synthetic workload generator, and operator time per probe run. They **cannot run in CI** and must not be wired into it. Proposed split, to be confirmed with the owning team: **launch is gated on the heuristic tier only** — every fault type reachable by a top-20 scenario has an entry with at least `coverage: heuristic` and a named `dataPlaneProbe`. The `verified` tier (10 fault types) is a **post-launch programme** funded as ongoing chaos-team engineering time, upgrading entries as the harness is run. Users are never misled in the interim because `dataPlaneProbe.coverage` is surfaced at recommendation time, so a `heuristic` probe is visibly weaker evidence than a `documented` one.
-
-**Why this is its own epic.** The safety rule from F6 — a leg is only `CONFIRMED`/`REFUTED` if data-plane disruption is *proven*, and proof requires a per-fault probe from `fault-semantics.md` — is correct and non-negotiable. But it has a consequence that is easy to miss: **at launch, `fault-semantics.md` is seeded from a single engagement, so nearly every fault type has no entry, so nearly every run returns `NOT EXERCISED` regardless of what actually happened.** A tool that is rigorous and uniformly uninformative will not be used, and the rule that made it rigorous will be the first thing removed. Coverage is therefore a launch requirement, not documentation debt.
-
-**Source strategy**, cheapest first:
-
-| Source | What it yields | Confidence it earns |
-|---|---|---|
-| Chaos Studio fault library documentation | The declared control-plane mutation per fault, and often the intended data-plane effect | `coverage: documented`, `mechanismConfidence: plausible` |
-| Azure SDK behaviour notes and source (connection lifecycle, retry, caching) | Why a client might not observe a control-plane mutation — the F6 class of surprise | `mechanismConfidence: plausible`, never `verified` on reading alone |
-| **Empirical probe runs** in a test subscription, one per fault type, with a deliberately generated workload | The actual observed effect, with numbers | `coverage: documented`, `mechanismConfidence: verified` |
-| Field engagements | Real-world variants and starvation recipes | Appended as occurrences |
-
-Only the third source produces `verified`. The first two are how the file gets broad, shallow coverage quickly; the third is how it gets deep where it matters.
+**Goal:** a plan a human can read and consent to. **Prerequisites:** EPIC-004, EPIC-005, EPIC-007.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E7a-T1 | IMPL | Define the `fault-semantics.md` entry schema: `faultUrn`, `controlPlaneMutation`, `observedEffect`, `candidateMechanism`, `mechanismConfidence`, `dataPlaneProbe` (the query/signal that proves disruption), `starvationRecipe`, `coverage` | `references/chaos/fault-semantics.md` | TO DO |
-| E7a-T2 | IMPL | Populate from the fault library documentation for **every fault type reachable by a top-20 scenario**, at `coverage: heuristic` where the probe is inferred rather than observed | `references/chaos/fault-semantics.md` | TO DO |
-| E7a-T3 | IMPL | Build a probe-run harness: for one fault type, drive a synthetic workload, execute at minimum blast radius, and record the observed data-plane signature | `mcp/tests/e2e/probe_harness.py` | TO DO |
-| E7a-T4 | IMPL | Run the harness against the top-10 fault types by expected usage; upgrade those entries to `coverage: documented` / `mechanismConfidence: verified` | `references/chaos/fault-semantics.md` | TO DO |
-| E7a-T5 | IMPL | **Launch-mode handling for uncovered faults.** When a fault type has no entry, the recommendation still ranks but carries `dataPlaneProbe.coverage: "none"` and a prominent warning: *"a run of this scenario can only return NOT EXERCISED until a data-plane probe exists for this fault."* `DQ-NO-DATAPLANE-PROBE` is **warn-only** until the coverage bar is met, then becomes disqualifying | `mcp/chaos_mcp/scoring.py`, `skills/chaos-recommend/SKILL.md` | TO DO |
-| E7a-T6 | TEST | A coverage test asserting the acceptance bar below; a test asserting an uncovered fault produces the warning and not a silent `NOT EXERCISED` at diagnosis time | `mcp/tests/test_fault_semantics.py` | TO DO |
+| E8-T1 | IMPL | `Invoke-ChaosStudyScope.ps1` — readiness, discovery, blast radius, signal availability, plan write | `skills/chaos-study-scope/scripts/Invoke-ChaosStudyScope.ps1` | TO DO |
+| E8-T2 | IMPL | `SKILL.md` — principle-led, routing pointer only, `optionalTools:` | `skills/chaos-study-scope/SKILL.md` | TO DO |
+| E8-T3 | IMPL | Plan card rendering via `[E3] Render.ps1` | `scripts/Render.ps1` | TO DO |
+| E8-T4 | IMPL | Move `[E3]` narrative out of `setup-scenario` / `run-scenario` into references (P2) | `skills/{setup,run}-scenario/SKILL.md` | TO DO |
+| E8-T5 | TEST | Plan validity, `blocked` path when a signal or prerequisite is missing, no invented scenario or fault name | `skills/chaos-study-scope/tests/Plan.Tests.ps1` | TO DO |
 
 **Acceptance criteria**
-- [ ] **Launch gate:** every fault type reachable by a top-20 scenario has a `fault-semantics.md` entry with at least `coverage: heuristic` and a named `dataPlaneProbe`.
-- [ ] **Post-launch programme:** at least 10 fault types reach `coverage: documented` with `mechanismConfidence: verified` from an actual probe run. Not a launch gate; funding and ownership confirmed before Epic 9 completes.
-- [ ] A user is told **before** executing that an uncovered fault can only yield `NOT EXERCISED` — the limitation is surfaced at recommendation time, not discovered after a run.
-- [ ] No entry's `candidateMechanism` can influence a verdict; only `observedEffect` and `dataPlaneProbe` can. The seed entry records the falsified `MaxMessageSize` theory under `rejectedMechanisms` so it is not re-derived.
-- [ ] T3/T4 are excluded from CI and documented as requiring a dedicated test subscription.
+- [ ] `study-plan.v1.json` validates and contains hypothesis, steady state, fault + parameters, resolved blast radius, duration, abort conditions and signals (FR-8)
+- [ ] A plan is `blocked` **only** when no available source can evaluate its steady-state predicate (FR-7a), with the missing source named
+- [ ] Every fault and scenario name traces to a service response or a guide `faultUrn` — asserted, not instructed
+- [ ] All three touched `SKILL.md` files under 200 lines; `setup-scenario` under 140
 
----
+### EPIC-009 — Window-pack signal collector
 
-### Epic 8 — Recommendation scoring
-
-**Goal:** Ranking is deterministic, explainable, and cannot fabricate a scenario.
-**Prerequisites:** Epics 6–7.
+**Goal:** one deterministic answer to F2/F3/F4. **Prerequisites:** EPIC-004.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E8-T1 | IMPL | Disqualification rules `DQ-*` as pure functions | `mcp/chaos_mcp/scoring.py` | TO DO |
-| E8-T2 | IMPL | Scoring model with `scoreBreakdown` and tie-breaks, including `couplingAdjustment` (F13) | `mcp/chaos_mcp/scoring.py` | TO DO |
-| E8-T3 | IMPL | `compute_blast_radius()` producing `resourceTargeting` include/exclude plus starvation recipes (F8). **Pure library function, not an MCP tool** (D15) | `mcp/chaos_mcp/scoring.py` | TO DO |
-| E8-T4 | IMPL | `chaos-recommend` SKILL.md, with hard validation that every emitted `scenarioId` exists in `availability.v1.json` | `skills/chaos-recommend/SKILL.md` | TO DO |
-| E8-T5 | TEST | Rule-by-rule disqualification tests; `test_coupling_split_penalty`; scenario-fabrication rejection test | `mcp/tests/test_scoring.py` | TO DO |
-| E8-T6 | TEST | Golden set (30 cases), scorer, and the nDCG@3 regression gate | `evals/recommendation/**`, `.github/workflows/test.yml` | TO DO |
+| E9-T1 | IMPL | `Get-StudySignals.ps1` composing the `[MAIN] chaos-impact` collectors; add AKS metrics, Container Insights KQL, Prometheus | `scripts/Get-StudySignals.ps1` | TO DO |
+| E9-T2 | IMPL | Window arithmetic: half-open `[start, end)`, baseline and recovery defaults | `scripts/Get-StudySignals.ps1` | TO DO |
+| E9-T3 | IMPL | KQL templates for `KubePodInventory`, `KubeEvents`, `KubeNodeInventory` | `skills/chaos-study-run/templates/kql/*.kql` | TO DO |
+| E9-T4 | TEST | Recorded-response replay for all six sources; `null` + caveat on each failure; null-vs-zero contract test (NFR-3) | `skills/chaos-study-run/tests/Signals.Tests.ps1` | TO DO |
+| E9-T5 | TEST | Window boundary tests: no double-count at `runEnd`; DST and leap-second-adjacent inputs | `skills/chaos-study-run/tests/Windows.Tests.ps1` | TO DO |
 
 **Acceptance criteria**
-- [ ] Every disqualification code has a dedicated test.
-- [ ] A recommendation naming a scenario absent from availability fails artifact validation.
-- [ ] nDCG@3 baseline is recorded and CI gates on a ≤0.05 regression.
+- [ ] The AlertsManagement `timeRange=custom` + `customTimeRange` contract and its api-version fallback are reused unchanged
+- [ ] Every source returns `{source, window, requestedAt, values|null, caveat|null, queryDigest}`
+- [ ] A failing source never produces `0`; the null-vs-zero test fails if it does
+- [ ] Absent Prometheus yields `unknown`, never `fail`
 
----
+### EPIC-010 — `chaos-study-run`
 
-### Epic 9 — Additive targeted run and build attestation
-
-**Goal:** Safe, frozen, recoverable execution with a real run ID.
-**Prerequisites:** Epics 4, 6, 8.
+**Goal:** consented, safe, recoverable execution. **Prerequisites:** EPIC-007, EPIC-008, EPIC-009.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E9-T1 | IMPL | `frozenValidation` hash over the seven fields + byte-for-byte drift gate at execute | `mcp/chaos_mcp/server.py` | TO DO |
-| E9-T2 | IMPL | Consume the hardened current `chaos_execute_scenario`/get/cancel path; do not add aliases or duplicate execution wrappers | `mcp/chaos_mcp/server.py`, current run skill/script | TO DO |
-| E9-T3 | IMPL | `chaos-run` SKILL.md: explicitly composes current setup/run skills, strict validation, approval, dry run, abort/cancel/recovery | `skills/chaos-run/SKILL.md` | TO DO |
-| E9-T4 | IMPL | Pre-flight steady-state capture + build attestation persisted into `run-record.v1.json` | `mcp/chaos_mcp/proof.py`, `evidence.py` | TO DO |
-| E9-T5 | TEST | `test_run_id_recovered_from_empty_start`; frozen-drift abort test; approval-required test; cancellation path test | `mcp/tests/test_execute.py` | TO DO |
+| E10-T1 | IMPL | Freeze + hash, `[E3]` validate/fix/revalidate, typed consent bound to `frozenConfigHash` (decline → 11), drift abort (→ 12) | `skills/chaos-study-run/scripts/Invoke-ChaosStudyRun.ps1` | TO DO |
+| E10-T2 | IMPL | Execute via `faultPath`; deterministic run-id recovery after an empty 2xx (FR-13) | same | TO DO |
+| E10-T3 | IMPL | Abort-condition poller + cancel; post-window capture still runs after an abort | same | TO DO |
+| E10-T4 | IMPL | `run-record.v1.json` + `evidence/{pre,during,post}` written through `Save-StudyArtifact`; the command trail is produced automatically by the EPIC-006 seam hook | `scripts/Study.ps1` | TO DO |
+| E10-T5 | IMPL | `SKILL.md`, `optionalTools:`, degrade-to-scope when no plan exists (FR-2) | `skills/chaos-study-run/SKILL.md` | TO DO |
+| E10-T6 | TEST | Consent decline (11), broad-fix decline (4), drift (12), empty-2xx recovery, abort path, resume from a partial study, **and `$env:STARTCHAOS_NONINTERACTIVE=1` does not bypass consent on the study path** | `skills/chaos-study-run/tests/Execute.Tests.ps1` | TO DO |
 
 **Acceptance criteria**
-- [ ] An empty 2xx start still yields a run ID or a loud, named failure (F7).
-- [ ] Any drift between validate and execute aborts with a diff.
-- [ ] Execution never proceeds without an approval token.
+- [ ] `--skip-validation` is passed **only** after the `[E3]` gate succeeded (FR-10) — asserted
+- [ ] Run-id recovery fails loudly rather than returning null; null `actionName` is labelled by URN, never relabelled (FR-13)
+- [ ] An aborted run still produces a sealed-able study with `abortedBy`, `abortedAtUtc` and the breaching predicate
+- [ ] No flag, environment variable or file grants execution consent on the study path; `$env:STARTCHAOS_NONINTERACTIVE=1` is explicitly ignored and asserted (N8)
 
----
+### EPIC-011 — Findings engine
 
-### Epic 10 — Diagnosis
-
-**Goal:** A verdict computed by code from numeric evidence, enterable cold by run ID.
-**Prerequisites:** Epics 5, 6, 9.
+**Goal:** severities and limitations that are computed, not asserted. **Prerequisites:** EPIC-009, EPIC-010.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E10-T1 | IMPL | `chaos_prove_fault_landed`: ARM entity-state/re-poll plus independent per-leg data-plane delta; Activity Log cannot satisfy proof | `mcp/chaos_mcp/proof.py`, wrapper in `server.py` | TO DO |
-| E10-T2 | IMPL | Pure verdict/baseline/liveness evaluation; `NOT EXERCISED` never downgraded | `mcp/chaos_mcp/verdict.py` | TO DO |
-| E10-T3 | IMPL | `chaos-diagnose` SKILL.md with `explore`/`verify` modes and the verify-mode changed-path rule (F14) | `skills/chaos-diagnose/SKILL.md` | TO DO |
-| E10-T4 | IMPL | Cold-start path: `evidence_get(runId)` + `chaos_get_scenario_run`; degraded behaviour with `steadyStateBaseline: null` | `mcp/chaos_mcp/evidence.py` | TO DO |
-| E10-T5 | IMPL | Exercise-repair brief generator | `skills/chaos-diagnose/SKILL.md` | TO DO |
-| E10-T6 | TEST | Event Hubs control-plane-only, NSG re-poll, liveness, mechanism-class, verdict table, cold entry and verify-mode fixtures | `mcp/tests/test_proof.py`, `test_verdict.py` | TO DO |
+| E11-T1 | IMPL | `Build-StudyFindings.ps1` — **pure**; severity rules, confidence, `mechanismProven` | `scripts/Build-StudyFindings.ps1` | TO DO |
+| E11-T2 | IMPL | Limitations taxonomy L1–L9; L1 always emitted | same | TO DO |
+| E11-T3 | IMPL | `findings.v1.schema.json` with `limitations[]` required and `minItems: 1` | `schemas/findings.v1.schema.json` | TO DO |
+| E11-T4 | IMPL | `verdict-matrix.md` reframed as the internal derivation table (D8) | `references/chaos/verdict-matrix.md` | TO DO |
+| E11-T5 | TEST | Table-driven severity and confidence matrix; control-plane-only input can never yield `mechanismProven: true` | `skills/chaos-study-report/tests/Findings.Tests.ps1` | TO DO |
+| E11-T6 | TEST | Every L-class is reachable and asserted by at least one fixture | `skills/chaos-study-report/tests/Limitations.Tests.ps1` | TO DO |
 
 **Acceptance criteria**
-- [ ] Verify mode without changed-path proof yields `NOT EXERCISED` + a repair brief (F14).
-- [ ] `chaos-diagnose --run-id` works with no prior conversational context (F12).
-- [ ] Control-plane-only or unproven mechanism liveness yields `NOT EXERCISED` (F6/F10).
-- [ ] `candidateMechanism` cannot influence a verdict.
+- [ ] `Build-StudyFindings` performs no I/O, no `az` call and reads no clock — asserted by test isolation
+- [ ] Control-plane state alone never produces a `confirmed` finding (F6, FR-12)
+- [ ] `limitations[]` is never empty for any input, including a perfectly clean study (FR-18, D13)
+- [ ] Findings carry `findingKey` = hash(fault URN, signal, predicate) for stable matching
 
----
+### EPIC-012 — HTML report and `chaos-study-report`
 
-### Epic 11 — Evidence export, docs and rollout
-
-**Goal:** The suite is shippable, documented and versioned.
-**Prerequisites:** Epics 1–10.
+**Goal:** a deliverable a human reads. **Prerequisites:** EPIC-011.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E11-T1 | IMPL | `chaos-evidence` SKILL.md + bundle assembly, redaction, Markdown rendering via `Render.ps1` | `skills/chaos-evidence/SKILL.md` | TO DO |
-| E11-T2 | IMPL | *(Removed — the `advisor-candidate.v1.json` reverse-Advisor emission has no known receiving partner. Per Q8 it is a design note, not a work item: no schema, tool or task is scheduled. If a partner appears, the shape is a small additive transform over `diagnosis.v1.json`, so deferring costs nothing.)* | — | N/A |
-| E11-T3 | IMPL | Package additive skills through the existing `skills/` directory registration and synchronize 0.4.0 in `plugin.json`, `mcp/pyproject.toml`, and `.github/plugin/marketplace.json`; **no current skill deprecation** | exact three version files | TO DO |
-| E11-T4 | IMPL | Complete the **PowerShell half** of the two-harness E2E: `Run-OfflineReplay.ps1` exercises every PowerShell skill script against the shared fixture corpus and validates its outputs against the artifact schemas. It deliberately does **not** drive the Python journey — see §Testing Strategy for why the Pester-drives-Python bridge was rejected | `skills/chaos-impact/tests/e2e/Run-OfflineReplay.ps1` | TO DO |
-| E11-T5 | IMPL | User docs + two worked examples | `docs/targeted-chaos-skills.md`, `docs/examples/*.md` | TO DO |
-| E11-T6 | IMPL | File CS-1 … CS-10 with the Chaos Studio service team | *(external tracker)* | TO DO |
-| E11-T7 | TEST | Both harnesses green on ubuntu/windows/macOS as **separate CI jobs** (Pester for the PowerShell skills, pytest for the Python journey), plus the golden-artifact comparison and the plugin manifest lint | `.github/workflows/test.yml`, `mcp/tests/e2e/test_journey_replay.py` | TO DO |
+| E12-T1 | IMPL | `study-report.html.tmpl` — eight sections, inline CSS, inline SVG sparklines, no script | `skills/chaos-study-report/templates/study-report.html.tmpl` | TO DO |
+| E12-T2 | IMPL | `New-StudyReport.ps1` — deterministic renderer, HTML-escaping, invariant culture, explicit sort keys | `scripts/New-StudyReport.ps1` | TO DO |
+| E12-T3 | IMPL | `report-contract.md` — sections, severity scale, limitation taxonomy | `references/chaos/report-contract.md` | TO DO |
+| E12-T4 | IMPL | `SKILL.md` + `Invoke-ChaosStudyReport.ps1`; seal on success | `skills/chaos-study-report/**` | TO DO |
+| E12-T5 | TEST | Three golden studies; render twice, mask `generatedAt`, assert byte equality on all three OS | `skills/chaos-study-report/tests/Determinism.Tests.ps1` | TO DO |
+| E12-T6 | TEST | No `<script`, no `javascript:`, no `http(s)://` asset reference; size bound; escaping of a hostile resource name | `skills/chaos-study-report/tests/ReportSafety.Tests.ps1` | TO DO |
 
-**Acceptance criteria** *(mirrors the four-part criterion in §Testing Strategy; the single-harness wording is deliberately not used)*
-- [ ] (a) `Run-OfflineReplay.ps1` exercises every PowerShell skill script against the shared fixture corpus and validates outputs against the artifact schemas.
-- [ ] (b) `test_journey_replay.py` exercises scope → inventory → availability → analyze → recommend → run → diagnose → evidence against the same corpus with zero network access.
-- [ ] (c) A golden-artifact set is committed and compared in both harnesses after timestamp normalisation.
-- [ ] (d) Both harnesses are wired into `.github/workflows/test.yml` as separate jobs.
-- [ ] `plugin.json` 0.4.0 retains the existing `skills/` directory registration, packages all additive entries, and leaves every legacy skill functional.
-- [ ] All 15 original tool names/signatures/envelopes and current state/replay compatibility tests remain green.
-- [ ] Every product issue CS-1…CS-10 has a filed tracking item with the workaround referenced.
-- [ ] Documentation covers the evidence store location, retention and purge.
+**Acceptance criteria**
+- [ ] `report.html` opens from `file://` with JavaScript disabled and renders all eight sections
+- [ ] Byte-identical across two renders and across three operating systems, except `generatedAt` (FR-17, D12)
+- [ ] Zero external asset references; typical study under 2 MB (NFR-8)
+- [ ] The narrative slots cannot alter a severity, a number or the limitations list (D9) — asserted
+- [ ] The Chaos Studio portal scenario report is **linked**, not reimplemented (N9)
+
+### EPIC-013 — `chaos-study` entry skill and the line cap
+
+**Goal:** one obvious front door, mechanically kept short. **Prerequisites:** EPIC-008, EPIC-010, EPIC-012.
+
+| Task | Type | Description | Files | Status |
+|---|---|---|---|---|
+| E13-T1 | IMPL | `SKILL.md` — frontmatter, four principles, six steps, safety, routing table, exit codes, worked example | `skills/chaos-study/SKILL.md` | TO DO |
+| E13-T2 | IMPL | `Invoke-ChaosStudy.ps1` — in-process orchestration of the four supporting scripts; `-DryRun` default true | `skills/chaos-study/scripts/Invoke-ChaosStudy.ps1` | TO DO |
+| E13-T3 | IMPL | Terminal summary card: verdict banner, top findings, report path | `scripts/Render.ps1` | TO DO |
+| E13-T4 | TEST | CI line-cap test over **every** user-facing `SKILL.md` (FR-3) | `skills/start-chaos/tests/SkillLineCap.Tests.ps1` | TO DO |
+| E13-T5 | TEST | End-to-end dry run against recorded responses produces a valid plan and stops before consent | `skills/chaos-study/tests/EndToEnd.Tests.ps1` | TO DO |
+
+**Acceptance criteria**
+- [ ] `chaos-study/SKILL.md` is **under 200 lines**; all ten user-facing skills are under 200; CI fails otherwise (FR-3, D3)
+- [ ] The skill inlines **zero** fault parameters; it names `faults/_index.md` and stops (FR-4)
+- [ ] `-DryRun` defaults to true; a plan is produced with no mutation (N8, Q4)
+
+### EPIC-014 — `chaos-study-history`
+
+**Goal:** a cold conversation can answer "did it get better?". **Prerequisites:** EPIC-004, EPIC-012.
+
+| Task | Type | Description | Files | Status |
+|---|---|---|---|---|
+| E14-T1 | IMPL | `Compare-Study.ps1` — **pure**; five comparability conditions; deltas; appeared/resolved/changed | `scripts/Compare-Study.ps1` | TO DO |
+| E14-T2 | IMPL | `comparison.v1.schema.json` | `schemas/comparison.v1.schema.json` | TO DO |
+| E14-T3 | IMPL | `Invoke-ChaosStudyHistory.ps1` — list, show, compare, rerun with `derivedFrom` | `skills/chaos-study-history/scripts/Invoke-ChaosStudyHistory.ps1` | TO DO |
+| E14-T4 | IMPL | Comparison HTML report reusing the EPIC-012 renderer | `skills/chaos-study-report/templates/study-report.html.tmpl` | TO DO |
+| E14-T5 | IMPL | `SKILL.md` | `skills/chaos-study-history/SKILL.md` | TO DO |
+| E14-T6 | IMPL | `Invoke-ChaosStudyHistory -Purge` — retention enforcement (NFR-12): dry-run by default, lists what would go, requires an explicit confirmed switch, refuses to touch a sealed study without it, never runs implicitly | `skills/chaos-study-history/scripts/Invoke-ChaosStudyHistory.ps1` | TO DO |
+| E14-T7 | TEST | Incomparable cases (each of the five conditions) exit 15 with a stated reason; `findingKey` matching survives a retitled finding; offline/no-credential operation | `skills/chaos-study-history/tests/Compare.Tests.ps1` | TO DO |
+| E14-T8 | TEST | Purge: nothing is deleted without the confirm switch; a study inside `CHAOS_STUDY_RETENTION_DAYS` is never a candidate; an `ABANDONED` study is listed but not auto-deleted | `skills/chaos-study-history/tests/Purge.Tests.ps1` | TO DO |
+
+**Acceptance criteria**
+- [ ] `list`, `show` and `compare` make **zero** Azure calls (D20, FR-15)
+- [ ] A comparison across scopes, fault URNs, capability versions, `faultPath` or ±20% window length is refused with `incomparableReason` (exit 15)
+- [ ] `-Rerun` produces a new `studyId` with `derivedFrom` and surfaces blast-radius drift before consent
+- [ ] Verified against a study zipped and moved to a second machine with no Azure credentials (NFR-11)
+- [ ] `-Purge` deletes nothing without an explicit confirmed switch, and never runs implicitly (NFR-12)
+
+### EPIC-015 — Migration, docs and release
+
+**Goal:** v0.4.0 ships coherently. **Prerequisites:** all.
+
+| Task | Type | Description | Files | Status |
+|---|---|---|---|---|
+| E15-T1 | IMPL | Synchronise versions and register the five skills | `plugin.json`, `.github/plugin/marketplace.json`, `mcp/pyproject.toml` | TO DO |
+| E15-T2 | IMPL | `FROZEN_SKILLS` gains the five new skills; api-version lint extended to the promoted PowerShell pin file | `mcp/tests/test_tool_manifest.py`, `mcp/chaos_mcp/apiversions.py` | TO DO |
+| E15-T3 | IMPL | Docs: study walkthrough, `$CHAOS_STUDY_ROOT`, retention, purge, the five-skill map; regenerate `docs/targeted-chaos-skills.decisions.md` from the shipped plan | `copilot-cli-plugin/README.md`, `docs/` | TO DO |
+| E15-T4 | IMPL | Housekeeping: remove the superseded `docs/_p1.md` fragment | `docs/_p1.md` | TO DO |
+| E15-T5 | TEST | Backward-compatibility suite: v0.3.x state file resumes; 18 tool signatures unchanged; `impactReportSchemaVersion: 1` unchanged; `[E2]` evidence still readable; the shipped `0`–`4` exit block unchanged | `skills/start-chaos/tests/Compatibility.Tests.ps1` | TO DO |
+| E15-T6 | TEST | Full matrix on three OS and four Python versions; record the gate in Appendix A | — | TO DO |
+| E15-T7 | IMPL | **Evidence-gated api-version decision.** Exercise the required v2 operations against a target environment on the shipped `2026-05-01-preview`; bump to `2026-08-01-preview` **only** with recorded fixtures proving each operation, updating both pin files and the contract tests together (CS-12) | `mcp/chaos_mcp/apiversions.py`, `scripts/Constants.ps1`, `mcp/tests/test_tool_manifest.py` | TO DO |
+| E15-T8 | IMPL | **Close the N8 legacy exception.** Remove or gate `$env:STARTCHAOS_NONINTERACTIVE` in `run-scenario` so it can no longer skip fault-execution confirmation; if removal must wait for the deprecation window (Q12), emit a loud warning and document it in the release notes | `skills/run-scenario/SKILL.md`, `skills/run-scenario/scripts/Invoke-RunScenario.ps1`, `skills/run-scenario/tests/PreExecuteGate.Tests.ps1` | TO DO |
+
+**Acceptance criteria**
+- [ ] All 18 MCP tool names, signatures and envelopes unchanged (NFR-10, D18)
+- [ ] A v0.3.x `startchaos-state.json` resumes unmodified
+- [ ] The api-version pin is either unchanged or bumped with recorded per-operation evidence — never bumped on spec existence alone
+- [ ] N8 holds for the whole plugin, or the residual `run-scenario` exception is documented in the release notes with a loud runtime warning
+- [ ] Q4, Q7 and Q12 have recorded decisions before release
+- [ ] Pester green on three OS; pytest green on 3.10–3.13; ruff clean
+
+### EPIC-016 — Fault guide coverage expansion
+
+**Goal:** the remaining Kubernetes fault and scenario coverage, added purely additively. **Prerequisites:** EPIC-005, EPIC-012 (so `dataPlaneProof` claims can be checked against real reports).
+
+| Task | Type | Description | Files | Status |
+|---|---|---|---|---|
+| E16-T1 | IMPL | Five further AKS Chaos Mesh guides — `IOChaos`, `dnsChaos`, `httpChaos`, `timeChaos`, `kernelChaos` | `references/chaos/faults/aks-chaosmesh-{io,dns,http,time,kernel}.md` | TO DO |
+| E16-T2 | IMPL | Two Kubernetes-adjacent guides: VMSS shutdown against a node pool, NSG security rule | `references/chaos/faults/aks-nodepool-vmss-shutdown.md`, `aks-nsg-rule.md` | TO DO |
+| E16-T3 | IMPL | Two further scenario guides | `references/chaos/scenarios/kubernetes-{node-loss,dependency-latency}.md` | TO DO |
+| E16-T4 | IMPL | Routing-table rows for all seven new guides | `references/chaos/faults/_index.md` | TO DO |
+| E16-T5 | TEST | Re-run E5-T5 bijection/schema tests over the expanded set; assert **no** script, skill or schema file changed in this epic | `skills/start-chaos/tests/FaultGuides.Tests.ps1` | TO DO |
+
+**Acceptance criteria**
+- [ ] Ten fault guides and three scenario guides validate and are in bijection with the index
+- [ ] `dnsChaos` records its separate Chaos Mesh DNS service prerequisite; `kernelChaos` records its privileged-container caveat
+- [ ] **This epic changes no `.ps1`, no `SKILL.md` and no schema** — the additivity claim of G9 is proved by the diff, not asserted
 
 ---
 
 ## References
 
-**Repository**
+**Repository (read on this machine)**
 
-- `copilot-cli-plugin/plugin.json`, `copilot-cli-plugin/README.md`
+- `copilot-cli-plugin/plugin.json`, `README.md`, `agents/start-chaos.md`
 - `copilot-cli-plugin/skills/{start-chaos,create-workspace,setup-scenario,run-scenario,chaos-impact}/SKILL.md`
-- `copilot-cli-plugin/skills/chaos-impact/schema/impact-report.schema.json`, `scripts/Constants.ps1`, `templates/metrics/defaults.json`, `tests/e2e/Run-OfflineReplay.ps1`
-- `copilot-cli-plugin/mcp/chaos_mcp/{server.py,azure.py,monitor.py}`
-- `.github/workflows/test.yml`
-- Branch `renzopretto-microsoft-add-chaos-loop-plugin`: `skills/{chaos-loop,resilience-analysis,chaos-execution,diagnostic,advisory,coding}/SKILL.md`, `references/chaos-loop/{shared-contract.md,scenario-catalog.md,scenario-catalog.v1.json}`, `schemas/{run-state.v1,workspace-plan.v1,external-gate.v1}.schema.json`, `scripts/chaos_loop_state.py`, `docs/chaos-loop.md`
+- `copilot-cli-plugin/scripts/{Invoke-AzChaos,Invoke-AzRest,Ensure-AzLogin,Wait-AzureLro,Preflight,State,Rbac,Render,Validate-AndFix,New-RunReport}.ps1`
+- `copilot-cli-plugin/skills/chaos-impact/{schema/impact-report.schema.json,scripts/Constants.ps1,templates/**,tests/e2e/Run-OfflineReplay.ps1}`
+- `copilot-cli-plugin/schemas/*.v1.schema.json` (nine, `[E2]`)
+- `copilot-cli-plugin/references/chaos/{evidence-contract,verdict-matrix,blast-radius}.md`
+- `copilot-cli-plugin/mcp/chaos_mcp/{server.py,azure.py,monitor.py,evidence.py,apiversions.py}`
+- `copilot-cli-plugin/mcp/tests/{test_lifecycle_contract,test_tool_manifest,test_evidence}.py`
+- `.github/workflows/test.yml` (`Run.Path = './copilot-cli-plugin/skills'`), `release.yml`
+- Branch `renzopretto-microsoft-add-chaos-loop-plugin` (`[PR32]`, not merged): `skills/chaos-loop/**`, `scripts/chaos_loop_state.py`, `references/chaos-loop/scenario-catalog.v1.json`
 
 **Azure Chaos Studio**
 
 - Chaos Studio documentation — https://learn.microsoft.com/azure/chaos-studio/
+- Manage workspaces and scenarios with the Azure CLI — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-manage-cli
+- Chaos Studio scenario reports — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-scenario-reports
+- Fault and action library (AKS Chaos Mesh faults, capability 2.2, `jsonSpec`) — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-fault-library
+- Tutorial: AKS Chaos Mesh faults in the portal (Chaos Mesh prerequisites, `chaos-testing` namespace, AKS Cluster Admin role) — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-tutorial-aks-portal
+- Permissions and security (four built-in roles) — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-permissions-security
+- Limitations and known issues — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-limitations
 - Chaos Studio REST API reference — https://learn.microsoft.com/rest/api/chaosstudio/
 - `az chaos` CLI reference — https://learn.microsoft.com/cli/azure/chaos
-- Chaos Studio fault and action library — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-fault-library
-- Chaos Studio limitations and known issues — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-limitations
-- Chaos Studio permissions and security — https://learn.microsoft.com/azure/chaos-studio/chaos-studio-permissions-security
+- Available Azure CLI extensions (`chaos` — min core 2.75.0, preview) — https://learn.microsoft.com/cli/azure/azure-cli-extensions-list
+- `Azure/chaos-studio-samples` — https://github.com/Azure/chaos-studio-samples
 
-**Azure platform**
+**Kubernetes and observability**
 
-- Azure Resource Graph query language and limits — https://learn.microsoft.com/azure/governance/resource-graph/
-- Azure Monitor Metrics Batch API — https://learn.microsoft.com/rest/api/monitor/metrics-batch
+- Chaos Mesh documentation (PodChaos, NetworkChaos, StressChaos, IOChaos, DNSChaos, HTTPChaos, TimeChaos, KernelChaos) — https://chaos-mesh.org/docs/
+- Container Insights log tables (`KubePodInventory`, `KubeEvents`, `KubeNodeInventory`) — https://learn.microsoft.com/azure/azure-monitor/containers/container-insights-log-query
+- Azure Monitor managed service for Prometheus — https://learn.microsoft.com/azure/azure-monitor/essentials/prometheus-metrics-overview
 - Log Analytics query API — https://learn.microsoft.com/rest/api/loganalytics/
-- Application Insights table reference (workspace-based vs classic schema) — https://learn.microsoft.com/azure/azure-monitor/app/convert-classic-resource
-- Azure Monitor alerts (`Microsoft.AlertsManagement`) REST API — https://learn.microsoft.com/rest/api/monitor/alertsmanagement/alerts
+- `Microsoft.AlertsManagement` alerts REST API — https://learn.microsoft.com/rest/api/monitor/alertsmanagement/alerts
 - Azure Activity Log — https://learn.microsoft.com/azure/azure-monitor/essentials/activity-log
-- ARM deployment history — https://learn.microsoft.com/azure/azure-resource-manager/templates/deployment-history
-- Azure Advisor reliability recommendations — https://learn.microsoft.com/azure/advisor/advisor-reference-reliability-recommendations
+- AKS node pools and VMSS — https://learn.microsoft.com/azure/aks/create-node-pools
 
 **Methodology and standards**
 
 - Principles of Chaos Engineering — https://principlesofchaos.org/
-- Azure Well-Architected Framework, RE:08 (design a reliability testing strategy) — https://learn.microsoft.com/azure/well-architected/reliability/testing-strategy
-- Model Context Protocol specification (tools, `outputSchema`, annotations) — https://modelcontextprotocol.io/
+- Azure Well-Architected Framework RE:08, design a reliability testing strategy — https://learn.microsoft.com/azure/well-architected/reliability/testing-strategy
+- Model Context Protocol specification — https://modelcontextprotocol.io/
 - GitHub Copilot CLI plugins and skills — https://docs.github.com/copilot
-- Bicep to ARM compilation — https://learn.microsoft.com/azure/azure-resource-manager/bicep/bicep-cli
-- `terraform show -json` — https://developer.hashicorp.com/terraform/cli/commands/show
-- nDCG and ranking evaluation — Järvelin & Kekäläinen, *Cumulated gain-based evaluation of IR techniques*, ACM TOIS 20(4), 2002
+- Pester documentation — https://pester.dev/
 
 ---
 
-## Appendix A: Revision History and Corrections
+## Appendix A: Revision History
 
-This plan has been revised through Revision 5. The latest independent review scored Technical 86/100 and Readability 91/100 before the Revision 5 corrections; re-review is pending. Corrections are recorded here rather than silently overwritten. The falsification detail for field observations lives in §Background → *Corrections to the field record*.
+Corrections are recorded rather than silently overwritten, so a rejected inference is not re-derived by the next reader of the same source.
 
-| Rev | Change | Why it is recorded rather than silently fixed |
+| Rev | Change | Why it is recorded |
 |---|---|---|
-| 2 | **`validations/latest` re-scoped.** An earlier draft treated it as a workspace polling artifact alongside `discoveries/latest` and `evaluations/latest`. It is `@parentResource(ScenarioConfiguration)` `@singleton("latest")`, so permission blockers cannot be read without creating a configuration. This produced the Tier A / Tier B split (FR-16), CS-4b and ALT-9. | The mis-scoping had made an advertised read-only skill silently dependent on writes. Recording it prevents the same inference being made again from the API's naming symmetry. |
-| 2 | **Event Hubs mechanism falsified.** The `AmqpSender` `MaxMessageSize` caching theory is wrong — `AmqpProducer.CreateLinkAndEnsureProducerStateAsync` refreshes it on every link open. The observation (namespace `Disabled`, sends 60/60) is unaffected. | The theory was about to become the seed entry of a normative behaviour oracle. It is now carried in `rejectedMechanisms` precisely so it is not re-derived by the next reader of the same source. |
-| 2 | **`first` is not a KQL reserved token** (it is an Azure CLI/ARG paging parameter). No escaping layer is built; the real third App Insights failure is Q11. | Prevents building a mitigation for a non-problem. |
-| 2 | External spec research confirmed `2026-05-01-preview` exists, contradicting a review finding; Revision 4 clarifies that this does not prove runtime operation availability. | Preserves the correction without converting a spec artifact into a service-availability claim. |
-| 2 | **`chaos_list_tools` cut**; reconciliation moved to manifest declarations + host-visible `tools/list` + CI lint. | The tool could not detect the failure it existed for. |
-| 2 | **`outputSchema` made conditional** on the runtime-capability spike (now E1-T5); **api-version pins** consolidated into `chaos_mcp/apiversions.py` (E1-T7); **`jsonschema`** added to CI. | Each was asserted as already-true and was not. |
-| 3 | **`scopeId` / `scopeFingerprint` split** (D16); **`thresholdKind`** added to predicates (D17), replacing an incoherent "CONFIRMED against a null baseline" path; **`approvalToken`** issuance, `k_session` transport and `evidence_get` denylist specified (D18); Tier A disclosed its recommendation-refresh write; **Epic 7a** added with a launch gate on the heuristic tier only. | These are design gaps rather than factual errors, and each changes what an implementer builds. |
-| 4 | Reframed as `[MAIN]` v0.3.0 evolution at research SHA `55c74c59a5eb123edecd91374be4d385407be8f0`; added exhaustive inventory, exact 15-tool matrix, source/field gap matrix, compatibility-first phases/files/epics, and `[PR32 PROTOTYPE]` not-ported classification. | Prevents prototype/main conflation and makes backward compatibility measurable. |
-| 5 | Restored shipped scenario-tool names, removed the unsupported `/evaluate` assumption, matched the PowerShell alert query/pin fallback, specified all additive MCP contracts, and placed preflight Pester coverage under the current CI scan root. | Resolves the independent technical review blockers without changing the approved field-evidence design. |
+| 2 | **`validations/latest` re-scoped** from a workspace artifact to a configuration-scoped singleton, producing CS-5. | The mis-scoping had made an advertised read-only skill silently dependent on ARM writes. |
+| 2 | **Event Hubs mechanism falsified** — `AmqpProducer.CreateLinkAndEnsureProducerStateAsync` refreshes `MaxMessageSize` on every link open, so the caching theory is wrong. The F6 *observation* is unaffected. | The theory was about to seed a normative behaviour oracle. |
+| 2 | **`first` is not a KQL reserved token** — it is an Azure CLI/ARG paging parameter mapping to REST `$top`. No escaping layer built. | Prevents building a mitigation for a non-problem; the real third failure is Q11. |
+| 2 | **`chaos_list_tools` cut**; reconciliation moved to manifest declarations plus the host-visible `tools/list`. | The tool could not detect the failure it existed for. |
+| 3 | `scopeId` / `scopeFingerprint` split; `thresholdKind` added to predicates; approval-token issuance specified. | Design gaps, each changing what an implementer builds. |
+| 4 | Reframed as `[MAIN]` v0.3.0 evolution at `55c74c5`; exhaustive inventory, 15-tool matrix, compatibility-first phases. | Prevents prototype/main conflation and makes backward compatibility measurable. |
+| 5 | Restored shipped scenario-tool names, removed the unsupported `/evaluate` assumption, matched the PowerShell alert query and api-version fallback, placed preflight Pester coverage under the CI scan root. | Resolved the independent technical review blockers. Scored Technical 86 / Readability 91. |
+| **6** | **Product rescope.** Eight speculative peer skills → five real ones with one obvious entry point (D2); the deliverable becomes a dated, sealed, self-contained HTML study report (D1, D11); MCP moves from required to optional (D6); an immutable dated study store is added on the `[E2]` primitives (D7, D16); Kubernetes becomes the first and only vertical (D14); `[PR32]` is closed and replaced (D17); Revision 5's speculative modules are DEFERRED with named triggers (D19). Every `[E1]`/`[E2]`/`[E3]` asset is classified exactly once in §Migration and Disposition. | Revision 5 was internally coherent but had outgrown the product: thirteen front doors, no deliverable, and MCP on the critical path. The corrections are shape, not substance — no delivered code is discarded. |
+| **6** | **Factual corrections against the working tree:** `Render.ps1` is `+224` on a pre-existing 214-line file (not a 224-line new file); the only PowerShell api-version pin file is `skills/chaos-impact/scripts/Constants.ps1`, not `scripts/Constants.ps1` — promoting it is now E7-T1; the AKS prerequisite role is named exactly (`Azure Kubernetes Service Cluster Admin Role`); Chaos Mesh capability version is 2.2 and the `chaos-testing` namespace is the only supported one; `Invoke-RunScenario.ps1` is dot-sourced in place rather than moved. | Each was a claim an implementer would have acted on and found false. |
+| **6** | **`[E3]` was uncommitted and partly untracked — now closed by `283cb61`.** `references/chaos/blast-radius.md` and both new `tests/` directories were untracked; 1,440 lines of delivered work were one `git clean` from gone. Phase 0 and E3-T6 existed solely to close this, and did: all three paths are tracked and the working tree is clean. The residual gap is the hosted three-OS / 3.10–3.13 matrix, which has not yet run. | The highest-probability way this plan loses real value had nothing to do with the design. |
+| **6** | **Independent review corrections (Technical 76/100, Readability 86/100).** Three technical blockers were real and are fixed: (a) **exit-code collision** — `Invoke-SetupScenario.ps1` already exits `2` and `3`, so the study suite moved to a new `10`–`15` block and the shipped `0`–`4` block is now frozen by E3-T6/E15-T5; (b) **N8 was false as written** — `run-scenario` honours `$env:STARTCHAOS_NONINTERACTIVE=1`, so N8 is now scoped to the study path with the legacy exception named and E15-T8 scheduled to close it; (c) **api-version** — the repository pins `2026-05-01-preview`, not `2026-08-01-preview`, so v0.4.0 stays on the shipped pin and any bump is evidence-gated (E15-T7). | Each was a claim an implementer would have acted on and found false, and two of them were safety claims. |
+| **6** | **Structural corrections from the same review:** FR-22's command trail moved from per-caller calls to an automatic hook at the `Invoke-AzChaos` / `Invoke-AzRest` seam (EPIC-006, renamed *Provenance*); retention/purge gained a real implementation and tests (E14-T6/T8) instead of being a documented knob with no code; the seal manifest now states exactly which files it hashes; EPIC-005 was split, with the seven remaining fault guides and two scenario guides moved to the new **EPIC-016**, whose acceptance criterion is that its diff touches no code — turning G9's additivity claim into a test; **FR-7a** was added as the single observability-blocking rule after three sections stated it three different ways; and the Contents, source-label convention, Deleted Files table and progressive-discovery section were corrected for accuracy. | Recorded because each changes what an implementer builds, not merely how the document reads. |
+| **6 — final pass** | **Verification, not redesign.** Every Revision-6 correction was re-checked against the working tree rather than against the previous draft, and all held: the E3 diff is exactly 9 modified files / +1180 / −24 with 5 untracked files; `Invoke-SetupScenario.ps1` emits exits `2`/`3`/`4` at lines 139/175/313; `Invoke-RunScenario.ps1:48` honours `STARTCHAOS_NONINTERACTIVE`; both pin files read `2026-05-01-preview`. Four narrow defects were then fixed: (a) **the front-door arithmetic was wrong** — G2 claimed "exactly five user-facing skills" while the design keeps the five shipped skills, so v0.4.x actually ships ten; P1, G2, D2 and FR-3 now state 13 → 10 and hand the end state to Q12; (b) the `[E3]` inventory omitted `Invoke-SetupScenario.ps1` (+88) and `Invoke-RunScenario.ps1` (+13) although it claimed nine modified files — both are now listed and dispositioned; (c) `Seal-Study` used a verb `Get-Verb` rejects, so the seal operation is `Complete-Study` with `Seal-Study` as an alias; (d) the plan did not account for its own companion `docs/targeted-chaos-skills.decisions.md`, which is now a Modified-Files row and part of E15-T3. | An overstated goal, a two-file gap in an inventory the reader is told is exhaustive, and a function name that fails the repository's own linting are each things an implementer would act on and find false. Recorded so the next reader does not re-derive "five skills" as the shipped surface. |
