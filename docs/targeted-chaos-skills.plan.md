@@ -1196,25 +1196,25 @@ Statuses reflect the branch at `283cb61` (EPIC-001 through EPIC-003 committed).
 - [~] Pester green on Windows, Linux and macOS; pytest green on 3.10–3.13; ruff clean — **verified on Windows (PowerShell 7.6.5) and local Python only.** The hosted matrix has not run: the branch has no PR and the workflow is gated on push/PR to `main`. This leg is outstanding and closes on the first CI run (see E3-T6).
 - [x] Exit codes 2, 3 and 4 asserted by `SetupExitContract.Tests.ps1` (the shipped `0`–`4` block is frozen by this epic)
 
-### EPIC-004 — Immutable dated study store
+### EPIC-004 — Immutable dated study store — **DONE**
 
 **Goal:** create, seal, enumerate and re-read a study offline. **Prerequisites:** EPIC-003.
 
 | Task | Type | Description | Files | Status |
 |---|---|---|---|---|
-| E4-T1 | IMPL | `Study.ps1`: `New-Study`, `Get-StudyRoot`, `Resolve-StudyPath`, `Save-StudyArtifact`, `Complete-Study` (alias `Seal-Study`), `Get-Study`, `Get-StudyIndex`, `Add-StudyIndexEntry` (`Add-CommandTrailEntry` lands in EPIC-006) | `scripts/Study.ps1` | TO DO |
-| E4-T2 | IMPL | Export scope-hash + redaction lists from `State.ps1` for reuse (no fork — D16) | `scripts/State.ps1` | TO DO |
-| E4-T3 | IMPL | `study-plan.v1` and `study-manifest.v1` schemas | `schemas/study-plan.v1.schema.json`, `schemas/study-manifest.v1.schema.json` | TO DO |
-| E4-T4 | IMPL | Extend the evidence contract doc with the study-store boundary | `references/chaos/evidence-contract.md` | TO DO |
-| E4-T5 | TEST | Sealing, immutability, three-step commit, index rebuild, root-location assertions, redaction of a planted token | `skills/start-chaos/tests/Study.Tests.ps1` | TO DO |
-| E4-T6 | TEST | Portability: zip → unzip elsewhere → `Get-Study` succeeds with no credentials | `skills/start-chaos/tests/StudyPortability.Tests.ps1` | TO DO |
+| E4-T1 | IMPL | `Study.ps1`: `New-Study`, `Get-StudyRoot`, `Resolve-StudyPath`, `Save-StudyArtifact`, `Complete-Study` (alias `Seal-Study`), `Get-Study`, `Get-StudyIndex`, `Add-StudyIndexEntry` (`Add-CommandTrailEntry` lands in EPIC-006) | `scripts/Study.ps1` | DONE |
+| E4-T2 | IMPL | Export scope-hash + redaction lists from `State.ps1` for reuse (no fork — D16) | `scripts/State.ps1` | DONE |
+| E4-T3 | IMPL | `study-plan.v1` and `study-manifest.v1` schemas | `schemas/study-plan.v1.schema.json`, `schemas/study-manifest.v1.schema.json` | DONE |
+| E4-T4 | IMPL | Extend the evidence contract doc with the study-store boundary | `references/chaos/evidence-contract.md` | DONE |
+| E4-T5 | TEST | Sealing, immutability, three-step commit, index rebuild, root-location assertions, redaction of a planted token | `skills/start-chaos/tests/Study.Tests.ps1` | DONE |
+| E4-T6 | TEST | Portability: zip → unzip elsewhere → `Get-Study` succeeds with no credentials | `skills/start-chaos/tests/StudyPortability.Tests.ps1` | DONE |
 
 **Acceptance criteria**
-- [ ] `Save-StudyArtifact` on a sealed study throws `StudyAlreadySealed` (exit 13); **no force flag exists**
-- [ ] A test asserts the resolved root is neither under the repository root nor under the system temp directory (FR-14)
-- [ ] `manifest.json` SHA-256 covers every file except itself and `SEALED`; a mutated file is detected
-- [ ] `Get-StudyIndex -Rebuild` reconstructs an index deleted mid-test
-- [ ] A token planted in plan, signals, error text and `az` argv appears nowhere in the sealed study (NFR-5)
+- [x] `Save-StudyArtifact` on a sealed study throws `StudyAlreadySealed` (exit 13); **no force flag exists**
+- [x] A test asserts the resolved root is neither under the repository root nor under the system temp directory (FR-14)
+- [x] `manifest.json` SHA-256 covers every file except itself and `SEALED`; a mutated file is detected
+- [x] `Get-StudyIndex -Rebuild` reconstructs an index deleted mid-test
+- [x] A token planted in plan, signals, error text and `az` argv appears nowhere in the sealed study (NFR-5)
 
 ### EPIC-005 — Fault-guide contract and the first-vertical guides
 

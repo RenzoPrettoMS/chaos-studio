@@ -48,6 +48,42 @@ $script:EvidenceDenyKeyHints = @(
     'sastoken', 'sas_token'
 )
 
+# Unanchored forms of the Test-EvidenceSecretValue shapes, for callers that must
+# scrub a token EMBEDDED in a longer string (an error message, an `az` argv)
+# rather than test a whole value. Exported through Get-EvidenceRedactionList so
+# the study store reuses these shapes instead of forking them (D16).
+# Each is bounded so a resource id, a GUID or an ISO timestamp cannot match.
+$script:EvidenceSecretValuePatterns = @(
+    '(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{16,}',
+    '\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]*',
+    '(?<![A-Za-z0-9])[A-Fa-f0-9]{32,}(?![A-Za-z0-9])',
+    '(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])'
+)
+
+function Get-EvidenceRedactionList {
+    <#
+    .SYNOPSIS
+        Returns the redaction denylists and secret-value shapes (E4-T2).
+    .DESCRIPTION
+        The single source of the redaction vocabulary. `Study.ps1` reads it so
+        the study store redacts exactly what the evidence store redacts; the
+        two must never drift (D16). Copies are returned so a caller cannot
+        mutate the lists in place.
+    .OUTPUTS
+        [ordered] hashtable with denyKeyExact, denyKeyHints, secretValuePatterns
+        and redacted (the placeholder string).
+    #>
+    [CmdletBinding()]
+    param()
+
+    return [ordered]@{
+        denyKeyExact        = @($script:EvidenceDenyKeyExact)
+        denyKeyHints        = @($script:EvidenceDenyKeyHints)
+        secretValuePatterns = @($script:EvidenceSecretValuePatterns)
+        redacted            = $script:EvidenceRedacted
+    }
+}
+
 function Get-StatePath {
     <# Returns the resolved state file path. #>
     if ($env:STARTCHAOS_STATE_PATH) {
@@ -363,6 +399,92 @@ function Protect-EvidenceData {
     }
 }
 
+function Invoke-WithEvidenceLock {
+    <#
+    .SYNOPSIS
+        Runs a script block while holding an exclusive on-disk lock (E4-T2).
+    .DESCRIPTION
+        The lock primitive behind every evidence write, exported so the study
+        store serializes its writes with the same code rather than a fork
+        (D16). A lock left behind by a process that died mid-write goes stale
+        after $script:EvidenceLockStaleSeconds and is reclaimed. Only lock
+        contention is retryable: a missing directory or an unwritable store is
+        a real failure and surfaces immediately.
+    .PARAMETER LockPath
+        Path of the lock file to create.
+    .PARAMETER Action
+        The script block to run while the lock is held.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$LockPath,
+        [Parameter(Mandatory)][scriptblock]$Action
+    )
+
+    $deadline = (Get-Date).AddSeconds($script:EvidenceLockTimeoutSeconds)
+    $lockStream = $null
+    while ($null -eq $lockStream) {
+        try {
+            $lockStream = [System.IO.File]::Open(
+                $LockPath, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+        } catch [System.IO.IOException] {
+            # Only lock contention is retryable. A missing directory or an
+            # unwritable store is a real failure and must surface immediately
+            # rather than spinning until the timeout.
+            if (-not (Test-Path $LockPath)) { throw }
+            # A lock left behind by a process that died mid-write.
+            $stale = ((Get-Date) - (Get-Item $LockPath).LastWriteTime).TotalSeconds -gt $script:EvidenceLockStaleSeconds
+            if ($stale) {
+                Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
+                continue
+            }
+            if ((Get-Date) -gt $deadline) {
+                throw "Timed out acquiring the evidence lock at ${LockPath}."
+            }
+            Start-Sleep -Milliseconds 10
+        }
+    }
+
+    try {
+        & $Action
+    } finally {
+        $lockStream.Dispose()
+        Remove-Item $LockPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Write-EvidenceFileAtomic {
+    <#
+    .SYNOPSIS
+        Writes text to a file via a temp file in the same directory + rename.
+    .DESCRIPTION
+        The atomicity primitive behind every evidence write, exported so the
+        study store commits its artifacts the same way (D16). A reader never
+        observes a partial file; a failed write leaves no scratch behind.
+    .PARAMETER Path
+        Destination file path.
+    .PARAMETER Content
+        The exact bytes (as UTF-8 text) to write. No trailing newline is added.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content
+    )
+
+    $tempPath = "${Path}.tmp.$([System.IO.Path]::GetRandomFileName())"
+    try {
+        $Content | Out-File -FilePath $tempPath -Encoding utf8 -NoNewline
+        Move-Item -Path $tempPath -Destination $Path -Force
+    } catch {
+        if (Test-Path $tempPath) {
+            Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+}
+
 function Write-EvidenceArtifact {
     <#
     .SYNOPSIS
@@ -405,38 +527,14 @@ function Write-EvidenceArtifact {
     $target = Join-Path $dir $Name
     $lockPath = "${target}.lock"
 
-    $deadline = (Get-Date).AddSeconds($script:EvidenceLockTimeoutSeconds)
-    $lockStream = $null
-    while ($null -eq $lockStream) {
-        try {
-            $lockStream = [System.IO.File]::Open(
-                $lockPath, [System.IO.FileMode]::CreateNew,
-                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-        } catch [System.IO.IOException] {
-            # Only lock contention is retryable. A missing directory or an
-            # unwritable store is a real failure and must surface immediately
-            # rather than spinning until the timeout.
-            if (-not (Test-Path $lockPath)) { throw }
-            # A lock left behind by a process that died mid-write.
-            $stale = ((Get-Date) - (Get-Item $lockPath).LastWriteTime).TotalSeconds -gt $script:EvidenceLockStaleSeconds
-            if ($stale) {
-                Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
-                continue
-            }
-            if ((Get-Date) -gt $deadline) {
-                throw "Timed out acquiring the evidence lock at ${lockPath}."
-            }
-            Start-Sleep -Milliseconds 10
-        }
-    }
-
-    try {
-        $revision = 1
+    $revision = 1
+    $revision = Invoke-WithEvidenceLock -LockPath $lockPath -Action {
+        $rev = 1
         if (Test-Path $target) {
             try {
                 $existing = Get-Content -Path $target -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
                 if ($existing -and $existing['revision']) {
-                    $revision = [int]$existing['revision'] + 1
+                    $rev = [int]$existing['revision'] + 1
                 }
             } catch {
                 # A corrupt prior revision must not block the current write.
@@ -450,26 +548,14 @@ function Write-EvidenceArtifact {
             runId                 = $RunId
             kind                  = $Kind
             name                  = $Name
-            revision              = $revision
+            revision              = $rev
             writtenAt             = (Get-Date).ToUniversalTime().ToString('o')
             redacted              = $true
             data                  = (Protect-EvidenceData -Data $Data)
         }
 
-        $json = $envelope | ConvertTo-Json -Depth 32
-        $tempPath = "${target}.tmp.$([System.IO.Path]::GetRandomFileName())"
-        try {
-            $json | Out-File -FilePath $tempPath -Encoding utf8 -NoNewline
-            Move-Item -Path $tempPath -Destination $target -Force
-        } catch {
-            if (Test-Path $tempPath) {
-                Remove-Item $tempPath -Force -ErrorAction SilentlyContinue
-            }
-            throw
-        }
-    } finally {
-        $lockStream.Dispose()
-        Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
+        Write-EvidenceFileAtomic -Path $target -Content ($envelope | ConvertTo-Json -Depth 32)
+        $rev
     }
 
     [Console]::Error.WriteLine("[Evidence] Mirrored $Kind/$Name rev $revision to $target")

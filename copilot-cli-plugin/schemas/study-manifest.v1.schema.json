@@ -1,0 +1,290 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "study-manifest.v1.schema.json",
+  "title": "ChaosStudyManifestV1",
+  "description": "The seal of a study: a SHA-256 over every file in the study directory except the manifest itself and the SEALED marker, plus everything a cold reader on another machine needs to interpret those files with no network and no credentials (NFR-11).",
+  "type": "object",
+  "required": [
+    "artifactSchemaVersion",
+    "artifactType",
+    "scopeId",
+    "runId",
+    "generatedAt",
+    "provenance",
+    "warnings",
+    "manifest"
+  ],
+  "properties": {
+    "artifactSchemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "artifactType": {
+      "type": "string",
+      "const": "study-manifest"
+    },
+    "scopeId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The studyId. A study is the run."
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "provenance": {
+      "$ref": "#/definitions/provenance"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/warning"
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "required": [
+        "studyId",
+        "createdAt",
+        "sealedAt",
+        "outcome",
+        "scope",
+        "scopeHash",
+        "faultPath",
+        "apiVersions",
+        "toolSubstitutions",
+        "files",
+        "schemaVersions"
+      ],
+      "properties": {
+        "studyId": {
+          "type": "string",
+          "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "sealedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Sealing is one-way. A study with a sealedAt refuses every further write with StudyAlreadySealed (D7)."
+        },
+        "outcome": {
+          "enum": [
+            "completed",
+            "blocked",
+            "abandoned",
+            "failed"
+          ]
+        },
+        "scope": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "description": "Human-readable scope descriptor, so a zipped study names its own subject."
+        },
+        "scopeHash": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The [E2] scope hash — the directory this study is enumerated under."
+        },
+        "derivedFrom": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The studyId this study was rerun from, if any."
+        },
+        "faultPath": {
+          "enum": [
+            "scenario",
+            "experiment",
+            "none",
+            null
+          ],
+          "description": "The path actually taken, recorded so the study is reproducible after the catalog moves (D5)."
+        },
+        "apiVersions": {
+          "type": "object",
+          "description": "Every pinned REST api-version this study depended on."
+        },
+        "toolSubstitutions": {
+          "type": "array",
+          "description": "Every optional tool that was absent and what was used instead. A substitution is never silent (D6).",
+          "items": {
+            "type": [
+              "object",
+              "string"
+            ]
+          }
+        },
+        "files": {
+          "type": "array",
+          "description": "Every file in the study directory except manifest.json and SEALED, which do not exist when this is computed.",
+          "items": {
+            "type": "object",
+            "required": [
+              "path",
+              "sha256",
+              "bytes"
+            ],
+            "properties": {
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "description": "POSIX-relative to the study directory."
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              },
+              "bytes": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "schemaVersions": {
+          "type": "object",
+          "description": "The artifact schema version of every file in this study, so a later reader parses it as it was written."
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "source": {
+      "type": "object",
+      "description": "Which tool produced the item, at which API version, with which query.",
+      "required": [
+        "tool",
+        "apiVersion",
+        "query"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "apiVersion": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "null only when the source is not a versioned REST surface."
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "KQL/OData/ARM path the item was read from; null when not applicable."
+        }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Mandatory on every evidence item. An item without provenance is invalid and is rejected by schema validation.",
+      "required": [
+        "source",
+        "collectedAt",
+        "confidence",
+        "maxAgeMinutes",
+        "stale"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/source"
+        },
+        "collectedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "Assigned by code from the collection method, never chosen by the model."
+        },
+        "maxAgeMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "Computed from collectedAt + maxAgeMinutes. A stale item is usable only with an explicit warning and never for a CONFIRMED verdict."
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "citedNumber": {
+      "type": "object",
+      "description": "A measured scalar. value 0 means 'measured zero from a successful query'; absence, failure or an unqueryable source is value null plus a caveat naming why.",
+      "required": [
+        "value",
+        "caveat",
+        "provenance"
+      ],
+      "properties": {
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/definitions/provenance"
+        }
+      },
+      "additionalProperties": false
+    },
+    "warning": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

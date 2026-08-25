@@ -1,0 +1,299 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "study-plan.v1.schema.json",
+  "title": "ChaosStudyPlanV1",
+  "description": "What a study intends to do: the question, the hypothesis, the captured steady state, the fault and its resolved path, the blast radius, the bounded window and the abort conditions. Written before any mutation and consented to by a human.",
+  "type": "object",
+  "required": [
+    "artifactSchemaVersion",
+    "artifactType",
+    "scopeId",
+    "runId",
+    "generatedAt",
+    "provenance",
+    "warnings",
+    "plan"
+  ],
+  "properties": {
+    "artifactSchemaVersion": {
+      "type": "integer",
+      "const": 1
+    },
+    "artifactType": {
+      "type": "string",
+      "const": "study-plan"
+    },
+    "scopeId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The studyId. A study is the run."
+    },
+    "generatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "provenance": {
+      "$ref": "#/definitions/provenance"
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/warning"
+      }
+    },
+    "scope": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Human-readable scope descriptor. Travels into the manifest so a zipped study names its own subject."
+    },
+    "derivedFrom": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The studyId this plan was copied from on a rerun. A rerun is always a new study (D7)."
+    },
+    "plan": {
+      "type": "object",
+      "required": [
+        "studyId",
+        "vertical",
+        "question",
+        "hypothesis",
+        "steadyState",
+        "fault",
+        "targeting",
+        "duration",
+        "abortConditions",
+        "signals",
+        "readiness",
+        "blocked"
+      ],
+      "properties": {
+        "studyId": {
+          "type": "string",
+          "pattern": "^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{8}$"
+        },
+        "vertical": {
+          "type": "string",
+          "minLength": 1
+        },
+        "question": {
+          "type": "string",
+          "minLength": 1
+        },
+        "hypothesis": {
+          "type": "string",
+          "minLength": 1
+        },
+        "steadyState": {
+          "type": "object",
+          "description": "The baseline the study measures against. Captured, never assumed."
+        },
+        "fault": {
+          "type": "object",
+          "required": [
+            "urn",
+            "faultPath",
+            "parameters"
+          ],
+          "properties": {
+            "urn": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "faultPath": {
+              "enum": [
+                "scenario",
+                "experiment",
+                "none",
+                null
+              ],
+              "description": "Discovered at runtime by Resolve-FaultPath, never assumed (D5)."
+            },
+            "parameters": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "additionalProperties": true
+        },
+        "targeting": {
+          "type": "object",
+          "description": "The resolved blast radius. resourceTargeting is advisory and is never transmitted to the service."
+        },
+        "duration": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "ISO 8601 duration of the bounded fault window."
+        },
+        "abortConditions": {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "object"
+            ]
+          }
+        },
+        "signals": {
+          "type": "array",
+          "items": {
+            "type": [
+              "string",
+              "object"
+            ]
+          }
+        },
+        "readiness": {
+          "type": "object",
+          "description": "Per-check pass/fail/unknown. An absent optional tool yields unknown, never fail."
+        },
+        "blocked": {
+          "type": "boolean",
+          "description": "true when the study cannot execute. A blocked plan is still written and may be sealed."
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false,
+  "definitions": {
+    "source": {
+      "type": "object",
+      "description": "Which tool produced the item, at which API version, with which query.",
+      "required": [
+        "tool",
+        "apiVersion",
+        "query"
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1
+        },
+        "apiVersion": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "null only when the source is not a versioned REST surface."
+        },
+        "query": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "KQL/OData/ARM path the item was read from; null when not applicable."
+        }
+      },
+      "additionalProperties": false
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Mandatory on every evidence item. An item without provenance is invalid and is rejected by schema validation.",
+      "required": [
+        "source",
+        "collectedAt",
+        "confidence",
+        "maxAgeMinutes",
+        "stale"
+      ],
+      "properties": {
+        "source": {
+          "$ref": "#/definitions/source"
+        },
+        "collectedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "confidence": {
+          "enum": [
+            "high",
+            "medium",
+            "low"
+          ],
+          "description": "Assigned by code from the collection method, never chosen by the model."
+        },
+        "maxAgeMinutes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "Computed from collectedAt + maxAgeMinutes. A stale item is usable only with an explicit warning and never for a CONFIRMED verdict."
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "citedNumber": {
+      "type": "object",
+      "description": "A measured scalar. value 0 means 'measured zero from a successful query'; absence, failure or an unqueryable source is value null plus a caveat naming why.",
+      "required": [
+        "value",
+        "caveat",
+        "provenance"
+      ],
+      "properties": {
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "caveat": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "provenance": {
+          "$ref": "#/definitions/provenance"
+        }
+      },
+      "additionalProperties": false
+    },
+    "warning": {
+      "type": "object",
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

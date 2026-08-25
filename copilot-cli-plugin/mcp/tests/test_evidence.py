@@ -68,6 +68,9 @@ EXPECTED_SCHEMAS = [
     "recommendations",
     "run-record",
     "scope-setup",
+    # E4-T3 — the study store's two artifacts share the same envelope.
+    "study-manifest",
+    "study-plan",
 ]
 
 
