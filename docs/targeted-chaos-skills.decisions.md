@@ -127,13 +127,14 @@ The suite probes which fault path is actually available, runs a seven-check AKS 
 
 | Item | Status | Owner |
 |------|--------|-------|
-| Land the uncommitted validation/blast-radius/consent work from the dirty worktree — Phase 0, nothing else starts until it is committed and green on all three operating systems | 🟡 In Progress | Copilot plugin owners |
+| Land the validation/blast-radius/consent work that was uncommitted at planning time — Phase 0. Committed as `283cb61`; Windows Pester, local pytest and ruff are green. The hosted three-OS / Python 3.10–3.13 matrix has not run (the branch is local-only and the workflow is gated on push/PR to `main`), so this closes on the first CI run — see EPIC-003 acceptance criterion 2 and E3-T6 | 🟡 In Progress — one leg outstanding | Copilot plugin owners |
 | Approve the classic REST fault path for general availability, or slip Kubernetes until the v2 catalog covers AKS (lean: ship the probe and wrapper — bounded and reversible) | 🔴 Blocked | Chaos Studio engineering |
 | Identify the "upcoming Kubernetes faults" referenced in the brief; no public source describes any (lean: encode nothing — the guidance pack is additive by construction) | 🔴 Blocked | Chaos Studio product |
 | Decide authority when a cluster has both Container Insights and managed Prometheus (lean: Prometheus for series, Container Insights for events; record the source on every value; report both on disagreement) | 🔴 Blocked | Azure Monitor partners |
 | Confirm the per-OS default study-store location and the 365-day retention with support | 🟡 In Progress | Copilot plugin owners |
 | Data-plane proof is heuristic for most faults at launch, so most early findings will read as unproven — surfaced honestly before consent and in limitations; coverage work is prioritized on the three Kubernetes scenarios | 🟡 In Progress | Chaos Studio engineering |
 | Chaos Mesh absence or wrong namespace will block most first runs — mitigated by treating readiness as a first-class deliverable with exact remediation per check | 🟢 Ready | Copilot plugin owners |
+| File the two `State.Tests.ps1` diagnostic-noise problems found during the EPIC-003 review — EPIC-002 surface, deliberately out of scope for the EPIC-003 commit so they are recorded here rather than fixed as drive-by scope creep | 🟢 Ready | Copilot plugin owners |
 | File the twelve service-level gaps (null action names, empty run-start responses, no data-plane attestation, removed classic CLI, preview-only surface) with the Chaos Studio service team | 🟢 Ready | Chaos Studio product |
 
 ## Follow-up Design Items
