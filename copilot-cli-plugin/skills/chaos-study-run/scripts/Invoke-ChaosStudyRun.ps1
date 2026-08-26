@@ -36,7 +36,6 @@ param(
     [string]$Consent,
     [string[]]$SignalSource = @(),
     [int]$PollSeconds = 20,
-    [switch]$FixPermissions,
     [switch]$KeepConfiguration,
     [switch]$Force
 )
@@ -196,12 +195,10 @@ $startedAt = Get-ChaosUtcNow
 Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'Invoke-ChaosStudyRun' `
     -Note "consented; configuration $configurationName in workspace $($plan.workspace.name)" | Out-Null
 
-# Baseline is read retrospectively over the window that just ended, so the
-# study does not have to idle for it.
+# The baseline window is fixed here, but read later. It covers the minutes
+# immediately before anything was touched, so bounding it now keeps it honest
+# even though configuration and validation happen first.
 $preWindow = New-ChaosWindow -Name 'pre' -Start (ConvertTo-ChaosUtcIso -Instant (Get-Date).ToUniversalTime().AddMinutes(-1 * $plan.windows.baselineMinutes)) -End $startedAt
-Write-ChaosStudyNote -Message "Collecting baseline evidence over the last $($plan.windows.baselineMinutes) minutes."
-$preEvidence = Invoke-ChaosSignalCollection -Plan $plan -Window $preWindow -Sources $sources
-Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'evidence/pre/signals.json' -Content $preEvidence | Out-Null
 
 $injectStart = $null
 $injectEnd = $null
@@ -212,8 +209,17 @@ $validationStatus = $null
 $permissionFix = $null
 $outcome = 'unknown'
 $failureMessage = $null
+# Seeded because the run record is written even when the try block fails part
+# way through, and an unassigned variable would fault under Set-StrictMode
+# while reporting a failure - hiding the failure behind a scripting error.
+$preEvidence = @()
+$duringEvidence = @()
 
 try {
+    # Configuration and validation come first. A configuration that cannot
+    # validate is a run that fails within seconds, and discovering that after a
+    # baseline window has already elapsed wastes the window and leaves a study
+    # that has to be planned again from scratch.
     Write-ChaosStudyNote -Message "Creating scenario configuration $configurationName."
     New-ChaosStudyConfiguration -Plan $plan -ConfigurationName $configurationName | Out-Null
     $configurationCreated = $true
@@ -221,24 +227,25 @@ try {
         -Arguments @($configurationName) -ExitCode 0 | Out-Null
 
     Write-ChaosStudyNote -Message 'Validating the configuration against the live scope.'
-    $validation = Get-ChaosConfigurationValidation -Plan $plan -ConfigurationName $configurationName
-    $validationStatus = Get-ChaosValidationStatus -Validation $validation
+    $validated = Resolve-ChaosConfigurationValidation -Plan $plan -ConfigurationName $configurationName
+    $validation = $validated.validation
+    $validationStatus = $validated.status
+    $permissionFix = $validated.permissionFix
 
-    if ($validationStatus -ne 'Succeeded' -and $FixPermissions) {
-        Write-ChaosStudyNote -Message 'Validation did not succeed. Applying the role assignments Chaos Studio reports as missing.' -Level 'warn'
-        $permissionFix = Repair-ChaosConfigurationPermission -Plan $plan -ConfigurationName $configurationName
+    if ($null -ne $permissionFix) {
         Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config fix-permissions' `
-            -Arguments @($configurationName) -ExitCode 0 | Out-Null
-
-        $validation = Get-ChaosConfigurationValidation -Plan $plan -ConfigurationName $configurationName
-        $validationStatus = Get-ChaosValidationStatus -Validation $validation
+            -Arguments @($configurationName, "applicable=$($permissionFix.applicable)") -ExitCode 0 | Out-Null
     }
 
     Assert-ChaosConfigurationValidated -Validation $validation -ConfigurationName $configurationName | Out-Null
 
+    Write-ChaosStudyNote -Message "Collecting baseline evidence over the $($plan.windows.baselineMinutes) minutes before this run began."
+    $preEvidence = Invoke-ChaosSignalCollection -Plan $plan -Window $preWindow -Sources $sources
+    Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'evidence/pre/signals.json' -Content $preEvidence | Out-Null
+
     Write-ChaosStudyNote -Message 'Starting the scenario run.'
     $injectStart = Get-ChaosUtcNow
-    $started = Start-ChaosStudyScenarioRun -Plan $plan -ConfigurationName $configurationName
+    $started = Start-ChaosStudyScenarioRun -Plan $plan -ConfigurationName $configurationName -Validation $validation
     $runId = $started.runId
     Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario run start' `
         -Arguments @($configurationName, $runId) -ExitCode 0 | Out-Null

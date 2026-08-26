@@ -387,8 +387,11 @@ function Repair-ChaosConfigurationPermission {
 
     .DESCRIPTION
         The service decides the grants; this only requests and reports them.
-        Callers show the what-if result to the operator before applying, so a
-        study never silently widens an identity's access.
+        With -WhatIf nothing is created, which is how the caller learns what
+        would change before any of it does.
+
+        The result is read back with show-permission-fix because the command
+        does not always echo a body of its own.
     #>
     [CmdletBinding()]
     param(
@@ -411,6 +414,192 @@ function Repair-ChaosConfigurationPermission {
     return Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'show-permission-fix') + $scoping)
 }
 
+function Get-ChaosPermissionFixSummary {
+    <#
+    .SYNOPSIS
+        Project a permission-fix result into a flat, reportable shape.
+
+    .DESCRIPTION
+        Counts the service did not report stay null. A fix that reported
+        nothing is not the same as a fix that granted nothing, and writing zero
+        would put a number in the study record that nobody measured.
+    #>
+    param([AllowNull()][object]$FixResult)
+
+    if ($null -eq $FixResult) { return $null }
+
+    $container = $FixResult
+    if ($FixResult.PSObject.Properties.Name -contains 'properties' -and $null -ne $FixResult.properties) {
+        $container = $FixResult.properties
+    }
+
+    $summary = $null
+    if ($container.PSObject.Properties.Name -contains 'summary') { $summary = $container.summary }
+    $hasSummary = ($null -ne $summary)
+
+    return [ordered]@{
+        state         = if ($container.PSObject.Properties.Name -contains 'state') { $container.state } else { $null }
+        whatIfMode    = if ($container.PSObject.Properties.Name -contains 'whatIfMode') { $container.whatIfMode } else { $null }
+        totalRequired = if ($hasSummary -and $summary.PSObject.Properties.Name -contains 'totalRequired') { $summary.totalRequired } else { $null }
+        succeeded     = if ($hasSummary -and $summary.PSObject.Properties.Name -contains 'succeeded') { $summary.succeeded } else { $null }
+        failed        = if ($hasSummary -and $summary.PSObject.Properties.Name -contains 'failed') { $summary.failed } else { $null }
+        skipped       = if ($hasSummary -and $summary.PSObject.Properties.Name -contains 'skipped') { $summary.skipped } else { $null }
+    }
+}
+
+function Test-ChaosPermissionFixApplicable {
+    <#
+    .SYNOPSIS
+        Decide whether a --what-if preview describes grants worth applying.
+
+    .DESCRIPTION
+        Applying changes who can reach the scoped resources, so it happens only
+        when the service actually named grants to make. A preview that reports
+        nothing - because the call failed, returned no body, or found nothing
+        to grant - is not read as permission to widen access. The validation
+        gate then refuses the run and says why, which is the honest outcome.
+    #>
+    param([AllowNull()][object]$FixResult)
+
+    $summary = Get-ChaosPermissionFixSummary -FixResult $FixResult
+    if ($null -eq $summary) { return $false }
+    if ($null -eq $summary.totalRequired) { return $false }
+
+    $total = 0
+    if ([int]::TryParse([string]$summary.totalRequired, [ref]$total)) { return ($total -gt 0) }
+    return $false
+}
+
+function Format-ChaosPermissionFixSummary {
+    <#
+    .SYNOPSIS
+        Render a permission-fix summary as operator-facing lines.
+    #>
+    param([AllowNull()][object]$Summary)
+
+    if ($null -eq $Summary) { return '  (the service returned no permission-fix result)' }
+
+    $lines = @()
+    foreach ($field in @('state', 'totalRequired', 'succeeded', 'failed', 'skipped')) {
+        $value = $Summary.$field
+        $text = if ($null -eq $value) { 'not reported' } else { [string]$value }
+        $lines += "  - $field`: $text"
+    }
+    return ($lines -join "`n")
+}
+
+function Resolve-ChaosConfigurationValidation {
+    <#
+    .SYNOPSIS
+        Validate a scenario configuration, repair the permissions the service
+        reports as missing, and return both the outcome and what was done.
+
+    .DESCRIPTION
+        Validation always runs, and it runs before any evidence is collected or
+        anything is injected, because a configuration that cannot validate is a
+        run that will fail in seconds - and finding that out after a baseline
+        window has already elapsed wastes the window and the operator's time.
+
+        When validation does not succeed the missing grants are previewed with
+        --what-if and shown before anything changes. They are applied only if
+        the service named grants to make, and the configuration is validated
+        again afterwards.
+
+        Repair is not optional here. This code path is already past the typed
+        consent phrase, so the operator has approved acting on this scope; a
+        switch that merely decides whether to fix the permissions that approval
+        requires adds a way to fail without adding a decision worth making.
+        What matters is that the change is visible, which is why the preview,
+        the applied result and the validation status either side of it are all
+        returned and persisted.
+
+        This does not decide whether to execute. Assert-ChaosConfigurationValidated
+        is the gate, and Start-ChaosStudyScenarioRun applies it again.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName
+    $status = Get-ChaosValidationStatus -Validation $validation
+
+    if ($status -eq 'Succeeded') {
+        return [pscustomobject]@{
+            validation    = $validation
+            status        = $status
+            permissionFix = $null
+        }
+    }
+
+    $statusText = if ($status) { $status } else { 'no status' }
+    $before = [ordered]@{
+        status = $status
+        errors = @(Get-ChaosValidationError -Validation $validation)
+    }
+
+    Write-ChaosStudyNote -Message "Validation reported '$statusText'. Asking Chaos Studio which role assignments are missing." -Level 'warn'
+
+    $preview = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName -WhatIf
+    $previewSummary = Get-ChaosPermissionFixSummary -FixResult $preview
+    $applicable = Test-ChaosPermissionFixApplicable -FixResult $preview
+
+    $decision = if ($applicable) {
+        'These grants will now be applied, and the configuration validated again.'
+    } else {
+        'Chaos Studio named no grants to make, so nothing will be changed. The validation gate below will refuse the run.'
+    }
+
+    Write-ChaosStudyCard -Title 'Permission repair preview - nothing has been granted yet' -Body @"
+Validation reported '$statusText'. Chaos Studio checks the workspace identity's
+access to every scoped resource, so this is what it says is missing.
+
+$(Format-ChaosPermissionFixSummary -Summary $previewSummary)
+
+$decision
+"@
+
+    $appliedSummary = $null
+    if ($applicable) {
+        Write-ChaosStudyNote -Message 'Applying the role assignments Chaos Studio reported as missing.' -Level 'warn'
+        $applied = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName
+        $appliedSummary = Get-ChaosPermissionFixSummary -FixResult $applied
+
+        if ($null -ne $appliedSummary) {
+            if ($appliedSummary.whatIfMode -eq $true) {
+                # The fix was requested without --what-if, so this means the
+                # service previewed instead of acting and nothing was granted.
+                Write-ChaosStudyNote -Message 'Chaos Studio reported whatIfMode on an applied fix, so no role assignments were actually created.' -Level 'warn'
+            }
+            $failedCount = 0
+            if ($null -ne $appliedSummary.failed -and [int]::TryParse([string]$appliedSummary.failed, [ref]$failedCount) -and $failedCount -gt 0) {
+                Write-ChaosStudyNote -Message "$failedCount role assignment(s) could not be created; the workspace identity may lack roleAssignments/write on the scope." -Level 'warn'
+            }
+        }
+
+        Write-ChaosStudyNote -Message 'Re-validating the configuration after the permission repair.'
+        $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName
+        $status = Get-ChaosValidationStatus -Validation $validation
+    }
+
+    return [pscustomobject]@{
+        validation    = $validation
+        status        = $status
+        permissionFix = [ordered]@{
+            attempted        = $true
+            applicable       = [bool]$applicable
+            preview          = $previewSummary
+            applied          = $appliedSummary
+            validationBefore = $before
+            validationAfter  = [ordered]@{
+                status = $status
+                errors = @(Get-ChaosValidationError -Validation $validation)
+            }
+        }
+    }
+}
+
 function Assert-ChaosConfigurationValidated {
     <#
     .SYNOPSIS
@@ -420,9 +609,13 @@ function Assert-ChaosConfigurationValidated {
         This is a hard gate, not a warning. A configuration in any state other
         than Succeeded produces a run that fails in seconds with an error that
         names neither the resource nor the missing permission, which is far
-        harder to diagnose than a refusal here. When the failure looks like a
-        permissions problem the caller is told to use -FixPermissions, because
-        granting roles is a mutation and belongs to the operator.
+        harder to diagnose than a refusal here.
+
+        By the time this runs, Resolve-ChaosConfigurationValidation has already
+        previewed and applied whatever grants the service reported as missing.
+        So reaching this gate means repair was either impossible or
+        insufficient, and the remediation says so rather than suggesting a
+        switch that would repeat what already happened.
     #>
     param(
         [AllowNull()][object]$Validation,
@@ -447,7 +640,7 @@ function Assert-ChaosConfigurationValidated {
     }).Count -gt 0
 
     $remediation = if ($looksLikePermissions) {
-        'Re-run with -FixPermissions to let Chaos Studio grant the workspace identity the roles it reports as missing, then run again.'
+        'Chaos Studio already previewed and applied the grants it reported as missing, and validation still failed. Role assignments can take a few minutes to propagate, so retrying often succeeds; if it does not, grant the workspace identity the roles named above manually, or ask someone with User Access Administrator on the scope to run az chaos scenario config fix-permissions.'
     } else {
         'Re-run chaos-study-scope against a scope the workspace can actually reach, then plan again.'
     }
@@ -473,17 +666,26 @@ function Start-ChaosStudyScenarioRun {
         Execute a validated configuration and return the run id.
 
     .DESCRIPTION
-        Validation is never skipped from here. The run id is read from the
-        response, falling back to the resource id, because everything the study
-        does afterwards - polling, cancelling, evidence correlation - is keyed
-        on it, and a run that started but cannot be identified is a run that
-        cannot be stopped.
+        The validation result is a required argument, and it is asserted here as
+        the last thing before the run starts. The caller has already applied the
+        same gate; this repeats it so that the guarantee belongs to the function
+        that starts the run rather than to the order of statements in one
+        caller. A future caller that reorders the sequence, or forgets the gate
+        entirely, still cannot execute an unvalidated configuration.
+
+        The run id is read from the response, falling back to the resource id,
+        because everything afterwards - polling, cancelling, evidence
+        correlation - is keyed on it, and a run that started but cannot be
+        identified is a run that cannot be stopped.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ConfigurationName
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [Parameter(Mandatory)][AllowNull()][object]$Validation
     )
+
+    Assert-ChaosConfigurationValidated -Validation $Validation -ConfigurationName $ConfigurationName | Out-Null
 
     $started = Invoke-AzChaos -ChaosArgs @(
         'scenario', 'run', 'start',

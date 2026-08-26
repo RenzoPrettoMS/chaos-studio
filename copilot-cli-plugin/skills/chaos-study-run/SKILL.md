@@ -24,10 +24,15 @@ variable that pre-approves it.
 execution. Any drift since scoping exits `12`. If the blast radius changed after
 you approved it, this refuses rather than running something you did not review.
 
-**Validation is a gate, not advice.** The scenario configuration is validated
-and the run is refused unless the service reports `Succeeded`. A configuration
-that only *probably* works is not executed. Permission gaps can be repaired with
-`-FixPermissions`, which previews the grants with `--what-if` first.
+**Validation is a gate, not advice.** The scenario configuration is created and
+validated *before* any evidence is collected or anything is injected, and the run
+is refused unless the service reports `Succeeded`. If validation fails, the
+missing role assignments are previewed with `--what-if`, shown, applied when the
+service names any, and validation is repeated. Repair is not a switch: this path
+is already past typed consent, so the operator has approved acting on this scope,
+and an opt-in flag for the permissions that approval requires would only add a
+way to fail. What matters is that the change is visible and recorded, which it
+is.
 
 **Evidence is collected around the run, not just during it.** Baseline, during,
 and post windows are all collected. Without baseline there is no "normal" to
@@ -63,25 +68,32 @@ by scoping a new one, so history stays comparable.
 Switches worth knowing:
 
 - `-SignalSource` — add evidence sources beyond the plan's (`metrics:` / `logs:`)
-- `-FixPermissions` — grant the workspace identity what validation says is
-  missing, after printing the `--what-if` preview
 - `-PollSeconds` — scenario run status poll interval
 - `-KeepConfiguration` — leave the configuration for inspection
 
 ## What actually happens
 
 1. Load the plan and re-verify its hash
-2. Create the scenario configuration on the workspace, carrying the plan's
+2. Render the consent phrase and require it back verbatim
+3. Create the scenario configuration on the workspace, carrying the plan's
    frozen parameters, filters and exclusions
-3. Validate it, and refuse to continue unless the service says `Succeeded`
-4. Render the consent phrase and require it back verbatim
-5. Collect the **baseline** window
-6. Execute the configuration; poll the scenario run until it reaches a terminal
+4. Validate it; on failure, preview the missing grants with `--what-if`, apply
+   them if the service names any, and validate again
+5. Refuse to continue unless validation now says `Succeeded`
+6. Collect the **baseline** window
+7. Execute the configuration; poll the scenario run until it reaches a terminal
    state or the injection window closes
-7. Collect the **during** window while the run is live
-8. Wait out recovery, then collect the **post** window
-9. Cancel any in-flight run and delete the configuration (always), then write
-   `run-record.v1.json` and evidence
+8. Collect the **during** window while the run is live
+9. Wait out recovery, then collect the **post** window
+10. Cancel any in-flight run and delete the configuration (always), then write
+    `run-record.v1.json` and evidence
+
+Steps 3–5 run before step 6 deliberately. A configuration that cannot validate
+is a run that fails within seconds, and finding that out after a baseline window
+has already elapsed wastes the window and the study. `Start-ChaosStudyScenarioRun`
+takes the validation result as a required argument and asserts it again as the
+last thing before `run start`, so the guarantee belongs to the function that
+starts the run rather than to the order of statements in one caller.
 
 The configuration is built from what the plan captured live at scope time: the
 scenario, its parameters as the `{key,value}` pairs the service takes, and the

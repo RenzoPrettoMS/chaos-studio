@@ -91,7 +91,6 @@ param(
     [Parameter(ParameterSetName = 'Study')][string]$StudyRoot,
     [Parameter(ParameterSetName = 'Study')][bool]$DryRun = $true,
     [Parameter(ParameterSetName = 'Study')][string]$Consent,
-    [Parameter(ParameterSetName = 'Study')][switch]$FixPermissions,
     [Parameter(ParameterSetName = 'Study')][switch]$KeepConfiguration,
     [Parameter(ParameterSetName = 'Study')][switch]$SkipDiscovery,
     [Parameter(ParameterSetName = 'Study')][switch]$PlanOnly
@@ -290,7 +289,6 @@ $runArgs = @{
 }
 if ($StudyRoot) { $runArgs['StudyRoot'] = $StudyRoot }
 if ($Consent) { $runArgs['Consent'] = $Consent }
-if ($FixPermissions) { $runArgs['FixPermissions'] = [switch]::Present }
 if ($KeepConfiguration) { $runArgs['KeepConfiguration'] = [switch]::Present }
 if ($SignalSource.Count -gt 0) { $runArgs['SignalSource'] = $SignalSource }
 
