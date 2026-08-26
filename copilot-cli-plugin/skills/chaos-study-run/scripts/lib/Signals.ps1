@@ -1,0 +1,378 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS
+    Evidence collection for a chaos study.
+
+.DESCRIPTION
+    The rule this file exists to enforce: a measurement that could not be taken
+    is recorded as null with a caveat, never as zero and never as a guess. A
+    study that reports "0 errors" when it actually failed to query anything is
+    worse than a study that reports nothing, because it is believed.
+
+    Every collector here returns the shape produced by New-ChaosSignalResult,
+    and every failure path returns that same shape with values = $null and a
+    caveat naming what went wrong.
+#>
+
+Set-StrictMode -Version Latest
+
+. (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Common.ps1')
+. (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'ApiVersions.ps1')
+
+# -- Source specifications -------------------------------------------------
+
+function ConvertFrom-ChaosSignalSourceSpec {
+    <#
+    .SYNOPSIS
+        Parse a signal source string into a structured spec.
+
+    .DESCRIPTION
+        Accepted forms:
+          k8s                        Ready/desired replica counts via kubectl
+          metrics:<name>             Azure Monitor metric on the target resource
+          metrics:<name>@<resourceId>   ... on a different resource
+          metrics:<name>|<aggregation> ... with an explicit aggregation
+          logs:<workspaceId>#<kql>   Log Analytics query
+    #>
+    param([Parameter(Mandatory)][string]$Spec)
+
+    $text = $Spec.Trim()
+    if ($text -eq 'k8s' -or $text -eq 'kubernetes') {
+        return [pscustomobject]@{ kind = 'k8s'; id = 'k8s'; raw = $text }
+    }
+
+    if ($text -like 'metrics:*') {
+        $rest = $text.Substring('metrics:'.Length)
+        $aggregation = 'Average'
+        if ($rest.Contains('|')) {
+            $parts = $rest.Split('|', 2)
+            $rest = $parts[0]
+            $aggregation = $parts[1]
+        }
+        $resourceId = $null
+        if ($rest.Contains('@')) {
+            $parts = $rest.Split('@', 2)
+            $rest = $parts[0]
+            $resourceId = $parts[1]
+        }
+        if ([string]::IsNullOrWhiteSpace($rest)) {
+            throw "Signal source '$Spec' is missing a metric name. Use 'metrics:<metricName>'."
+        }
+        return [pscustomobject]@{
+            kind        = 'metrics'
+            id          = "metrics:$rest"
+            metricName  = $rest
+            aggregation = $aggregation
+            resourceId  = $resourceId
+            raw         = $text
+        }
+    }
+
+    if ($text -like 'logs:*') {
+        $rest = $text.Substring('logs:'.Length)
+        if (-not $rest.Contains('#')) {
+            throw "Signal source '$Spec' is missing its query. Use 'logs:<workspaceId>#<kql>'."
+        }
+        $parts = $rest.Split('#', 2)
+        if ([string]::IsNullOrWhiteSpace($parts[0]) -or [string]::IsNullOrWhiteSpace($parts[1])) {
+            throw "Signal source '$Spec' needs both a workspace id and a query."
+        }
+        return [pscustomobject]@{
+            kind        = 'logs'
+            id          = "logs:$($parts[0])"
+            workspaceId = $parts[0]
+            query       = $parts[1]
+            raw         = $text
+        }
+    }
+
+    throw "Signal source '$Spec' is not recognised. Use 'k8s', 'metrics:<name>' or 'logs:<workspaceId>#<kql>'."
+}
+
+# -- Collectors ------------------------------------------------------------
+
+function Get-ChaosK8sReadinessSignal {
+    <#
+    .SYNOPSIS
+        Ready and desired replica counts, sampled once, from the cluster itself.
+
+    .DESCRIPTION
+        This is the closest thing to ground truth available without a metrics
+        pipeline, and it is the signal that proves an agent-based pod fault
+        actually landed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Namespace,
+        [AllowEmptyString()][string]$LabelSelector,
+        [Parameter(Mandatory)][object]$Window
+    )
+
+    $windowName = $Window.name
+    if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) {
+        return New-ChaosSignalResult -Source 'k8s' -Window $windowName `
+            -Caveat 'kubectl is not on PATH, so replica readiness could not be measured.'
+    }
+
+    $kubectlArgs = @('get', 'pods', '-n', $Namespace, '-o', 'json')
+    if (-not [string]::IsNullOrWhiteSpace($LabelSelector)) { $kubectlArgs += @('-l', $LabelSelector) }
+
+    try {
+        $raw = & kubectl @kubectlArgs 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $detail = ($raw | Out-String).Trim()
+            $message = "kubectl returned exit code $LASTEXITCODE. $detail"
+            return New-ChaosSignalResult -Source 'k8s' -Window $windowName -Caveat (Protect-ChaosSecret -Text $message)
+        }
+        $parsed = ($raw | Out-String) | ConvertFrom-Json
+    } catch {
+        $message = "kubectl output could not be read: $($_.Exception.Message)"
+        return New-ChaosSignalResult -Source 'k8s' -Window $windowName -Caveat (Protect-ChaosSecret -Text $message)
+    }
+
+    $pods = @($parsed.items)
+    $ready = 0
+    $restarts = 0
+    foreach ($pod in $pods) {
+        $statuses = @()
+        if ($pod.status.PSObject.Properties.Name -contains 'containerStatuses') {
+            $statuses = @($pod.status.containerStatuses)
+        }
+        if ($statuses.Count -gt 0 -and -not ($statuses | Where-Object { -not $_.ready })) { $ready++ }
+        foreach ($status in $statuses) { $restarts += [int]$status.restartCount }
+    }
+
+    $values = [ordered]@{
+        totalPods    = $pods.Count
+        readyPods    = $ready
+        restartTotal = $restarts
+        sampledAt    = Get-ChaosUtcNow
+    }
+    return New-ChaosSignalResult -Source 'k8s' -Window $windowName -Values $values `
+        -Query ([ordered]@{ namespace = $Namespace; selector = $LabelSelector })
+}
+
+function Get-ChaosMetricSignal {
+    <#
+    .SYNOPSIS
+        An Azure Monitor metric series over the window.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Spec,
+        [Parameter(Mandatory)][string]$ResourceId,
+        [Parameter(Mandatory)][object]$Window
+    )
+
+    $windowName = $Window.name
+    $target = if ($Spec.resourceId) { $Spec.resourceId } else { $ResourceId }
+    $timespan = "$(ConvertTo-ChaosUtcIso -Instant $Window.start)/$(ConvertTo-ChaosUtcIso -Instant $Window.end)"
+    $query = [ordered]@{
+        resourceId  = $target
+        metric      = $Spec.metricName
+        aggregation = $Spec.aggregation
+        timespan    = $timespan
+        interval    = 'PT1M'
+    }
+
+    if (-not (Get-Command Invoke-AzRest -ErrorAction SilentlyContinue)) {
+        return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
+            -Caveat 'The shared Invoke-AzRest helper is unavailable, so Azure Monitor could not be queried.'
+    }
+
+    $uri = "$target/providers/Microsoft.Insights/metrics?timespan=$timespan&interval=PT1M&metricnames=$($Spec.metricName)&aggregation=$($Spec.aggregation)"
+    try {
+        $response = Invoke-AzRest -Method GET -Uri $uri -ApiVersion (Get-ChaosApiVersion -Name 'metrics')
+    } catch {
+        $message = "Azure Monitor query failed: $($_.Exception.Message)"
+        return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
+            -Caveat (Protect-ChaosSecret -Text $message)
+    }
+
+    $series = @()
+    if ($response -and $response.body -and $response.body.PSObject.Properties.Name -contains 'value') {
+        foreach ($metric in @($response.body.value)) {
+            foreach ($timeseries in @($metric.timeseries)) {
+                foreach ($point in @($timeseries.data)) {
+                    $value = $null
+                    foreach ($candidate in @('average', 'total', 'maximum', 'minimum', 'count')) {
+                        if ($point.PSObject.Properties.Name -contains $candidate -and $null -ne $point.$candidate) {
+                            $value = $point.$candidate
+                            break
+                        }
+                    }
+                    $series += [ordered]@{ timestamp = $point.timeStamp; value = $value }
+                }
+            }
+        }
+    }
+
+    if ($series.Count -eq 0) {
+        return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
+            -Caveat "Azure Monitor returned no data points for '$($Spec.metricName)' in this window. The metric may not be emitted for this resource, or ingestion may lag the window."
+    }
+
+    return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Values $series -Query $query
+}
+
+function Invoke-ChaosLogAnalyticsQuery {
+    <#
+    .SYNOPSIS
+        Run a KQL query against a Log Analytics workspace.
+
+    .DESCRIPTION
+        The shared Invoke-AzRest helper is pinned to the ARM audience, so it
+        cannot reach the Log Analytics data plane. This calls az rest directly
+        with the correct audience rather than modifying a shipped script.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$WorkspaceId,
+        [Parameter(Mandatory)][string]$Query,
+        [Parameter(Mandatory)][string]$Timespan
+    )
+
+    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
+        throw 'The Azure CLI is not on PATH.'
+    }
+
+    $endpoint = Get-ChaosEndpoint -Name 'logAnalytics'
+    $uri = "$endpoint/v1/workspaces/$WorkspaceId/query"
+    $bodyFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $body = @{ query = $Query; timespan = $Timespan } | ConvertTo-Json -Depth 8 -Compress
+        [System.IO.File]::WriteAllText($bodyFile, $body, [System.Text.UTF8Encoding]::new($false))
+        $raw = & az rest --method POST --uri $uri --resource $endpoint `
+            --headers 'Content-Type=application/json' --body "@$bodyFile" --output json 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw (($raw | Out-String).Trim())
+        }
+        return ($raw | Out-String) | ConvertFrom-Json
+    } finally {
+        Remove-Item -LiteralPath $bodyFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-ChaosLogSignal {
+    <#
+    .SYNOPSIS
+        A Log Analytics result set over the window.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Spec,
+        [Parameter(Mandatory)][object]$Window
+    )
+
+    $windowName = $Window.name
+    $timespan = "$(ConvertTo-ChaosUtcIso -Instant $Window.start)/$(ConvertTo-ChaosUtcIso -Instant $Window.end)"
+    $query = [ordered]@{ workspaceId = $Spec.workspaceId; kql = $Spec.query; timespan = $timespan }
+
+    try {
+        $response = Invoke-ChaosLogAnalyticsQuery -WorkspaceId $Spec.workspaceId -Query $Spec.query -Timespan $timespan
+    } catch {
+        $message = "Log Analytics query failed: $($_.Exception.Message)"
+        return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
+            -Caveat (Protect-ChaosSecret -Text $message)
+    }
+
+    $rows = @()
+    $columns = @()
+    if ($response -and $response.PSObject.Properties.Name -contains 'tables') {
+        $table = @($response.tables) | Select-Object -First 1
+        if ($table) {
+            $columns = @($table.columns | ForEach-Object { $_.name })
+            foreach ($row in @($table.rows)) {
+                $record = [ordered]@{}
+                for ($i = 0; $i -lt $columns.Count; $i++) { $record[$columns[$i]] = $row[$i] }
+                $rows += $record
+            }
+        }
+    }
+
+    if ($rows.Count -eq 0) {
+        return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
+            -Caveat 'The Log Analytics query returned no rows for this window. Ingestion latency of several minutes is normal; an empty result is not evidence of health.'
+    }
+
+    return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Values $rows -Query $query
+}
+
+# -- Orchestration ---------------------------------------------------------
+
+function Invoke-ChaosSignalCollection {
+    <#
+    .SYNOPSIS
+        Collect every configured signal for one phase window.
+
+    .DESCRIPTION
+        Collection never throws. A source that fails produces a null result
+        with a caveat, so a partial outage in observability degrades the
+        study's confidence rather than destroying the run.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][object]$Window,
+        [string[]]$Sources = @(),
+        [switch]$DryRun
+    )
+
+    $results = @()
+    $specs = @()
+
+    # Kubernetes readiness is always collected: it is the only signal that can
+    # prove an in-cluster fault landed at all.
+    $specs += [pscustomobject]@{ kind = 'k8s'; id = 'k8s'; raw = 'k8s' }
+    foreach ($source in @($Sources)) {
+        if ([string]::IsNullOrWhiteSpace($source)) { continue }
+        if ($source -eq 'k8s' -or $source -eq 'kubernetes') { continue }
+        try {
+            $specs += ConvertFrom-ChaosSignalSourceSpec -Spec $source
+        } catch {
+            $results += New-ChaosSignalResult -Source $source -Window $Window.name `
+                -Caveat (Protect-ChaosSecret -Text $_.Exception.Message)
+        }
+    }
+
+    foreach ($spec in $specs) {
+        if ($DryRun) {
+            $results += New-ChaosSignalResult -Source $spec.id -Window $Window.name `
+                -Caveat 'Dry run: no query was issued, so no measurement exists for this window.'
+            continue
+        }
+
+        switch ($spec.kind) {
+            'k8s' {
+                $results += Get-ChaosK8sReadinessSignal -Namespace $Plan.target.namespace `
+                    -LabelSelector ([string]$Plan.target.selector) -Window $Window
+            }
+            'metrics' {
+                $results += Get-ChaosMetricSignal -Spec $spec -ResourceId $Plan.target.resourceId -Window $Window
+            }
+            'logs' {
+                $results += Get-ChaosLogSignal -Spec $spec -Window $Window
+            }
+            default {
+                $results += New-ChaosSignalResult -Source $spec.id -Window $Window.name `
+                    -Caveat "No collector is implemented for source kind '$($spec.kind)'."
+            }
+        }
+    }
+
+    return ,@($results)
+}
+
+function Test-ChaosSignalCoverage {
+    <#
+    .SYNOPSIS
+        Summarise how much of the evidence is real, so the report can be honest
+        about it rather than presenting gaps as results.
+    #>
+    param([Parameter(Mandatory)][object[]]$Signals)
+
+    $all = @($Signals)
+    $measured = @($all | Where-Object { $null -ne $_.values })
+    return [pscustomobject]@{
+        total       = $all.Count
+        measured    = $measured.Count
+        missing     = $all.Count - $measured.Count
+        caveats     = @($all | Where-Object { $_.caveat } | ForEach-Object { $_.caveat } | Select-Object -Unique)
+        anyMeasured = ($measured.Count -gt 0)
+    }
+}

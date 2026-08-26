@@ -1,0 +1,81 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+<#
+.SYNOPSIS
+    API-version pins for the chaos-study skill suite.
+
+.DESCRIPTION
+    One file, one pin per surface, so version drift is a one-line change.
+
+    These values intentionally mirror the shipped
+    `skills/chaos-impact/scripts/Constants.ps1`. They are declared here rather
+    than dot-sourced from that file because it declares its pins with
+    `$script:` scope, which does not survive a nested dot-source chain
+    reliably. If the plugin later promotes a shared `scripts/Constants.ps1`,
+    this file becomes a dot-source shim to it.
+
+    Every version below is recorded in the sealed study manifest, so a study
+    stays reproducible after the pins move.
+#>
+
+Set-StrictMode -Version Latest
+
+$ChaosStudyApiVersions = [ordered]@{
+    # Chaos Studio v2 - Microsoft.Chaos/workspaces (scenario path)
+    chaosStudio              = '2026-05-01-preview'
+    # Chaos Studio classic - Microsoft.Chaos/experiments, targets, capabilities
+    chaosClassic             = '2024-01-01'
+    # Azure Monitor metrics - Microsoft.Insights/metrics
+    metrics                  = '2024-02-01'
+    # Log Analytics query API
+    logAnalytics             = 'v1'
+    # Activity Log
+    activityLog              = '2015-04-01'
+    # Alerts Management, with the documented fallback
+    alertsManagement         = '2023-05-01-preview'
+    alertsManagementFallback = '2018-05-05'
+    # AKS managed clusters
+    managedClusters          = '2024-09-01'
+    # Azure Monitor workspace (managed Prometheus)
+    monitorWorkspace         = '2023-04-03'
+    # Data collection rules - used to detect a Prometheus pipeline
+    dataCollectionRules      = '2022-06-01'
+    # Diagnostic settings
+    diagnosticSettings       = '2021-05-01-preview'
+}
+
+$ChaosStudyEndpoints = [ordered]@{
+    logAnalytics = 'https://api.loganalytics.io'
+}
+
+function Get-ChaosApiVersion {
+    <#
+    .SYNOPSIS
+        Resolve a pinned api-version by name. Unknown names fail loudly so a
+        typo can never silently fall back to some default version.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    if (-not $ChaosStudyApiVersions.Contains($Name)) {
+        throw "Unknown api-version pin '$Name'. Known: $(($ChaosStudyApiVersions.Keys) -join ', ')"
+    }
+    return $ChaosStudyApiVersions[$Name]
+}
+
+function Get-ChaosApiVersionTable {
+    <#
+    .SYNOPSIS
+        The full pin table, for the study manifest and the report appendix.
+    #>
+    $copy = [ordered]@{}
+    foreach ($key in $ChaosStudyApiVersions.Keys) { $copy[$key] = $ChaosStudyApiVersions[$key] }
+    return $copy
+}
+
+function Get-ChaosEndpoint {
+    param([Parameter(Mandatory)][string]$Name)
+    if (-not $ChaosStudyEndpoints.Contains($Name)) {
+        throw "Unknown endpoint '$Name'. Known: $(($ChaosStudyEndpoints.Keys) -join ', ')"
+    }
+    return $ChaosStudyEndpoints[$Name]
+}

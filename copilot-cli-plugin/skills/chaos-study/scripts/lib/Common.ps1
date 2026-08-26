@@ -1,0 +1,422 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+<#
+.SYNOPSIS
+    Shared primitives for the chaos-study skill suite.
+
+.DESCRIPTION
+    Dot-source this file at the TOP LEVEL of a study script:
+
+        . "$PSScriptRoot/lib/Common.ps1"
+
+    Dot-sourcing at top level is required: functions defined inside a function
+    scope vanish when that function returns.
+
+    This file owns four things and nothing else:
+
+      1. Locating the plugin root and read-only dot-sourcing the SHIPPED
+         plugin scripts (Render.ps1, Invoke-AzChaos.ps1, Invoke-AzRest.ps1,
+         Ensure-AzLogin.ps1). The study suite never modifies them.
+      2. Deterministic serialisation - canonical JSON and SHA-256 - so a study
+         can be hashed, sealed and byte-compared.
+      3. Crash-safe writes - temp file plus rename, never a partial artifact.
+      4. Redaction, HTML escaping, and the study exit-code contract.
+
+    Nothing here calls Azure. Nothing here has a clock dependency other than
+    Get-ChaosUtcNow, which is the single place time enters the suite.
+#>
+
+Set-StrictMode -Version Latest
+
+# -- Roots ------------------------------------------------
+# $PSScriptRoot is per-file, so this resolves correctly no matter which skill
+# dot-sourced us.  lib -> scripts -> chaos-study -> skills -> copilot-cli-plugin
+$ChaosStudyLibDir = $PSScriptRoot
+$ChaosStudyPluginRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..' '..' '..' '..'))
+$ChaosStudySkillRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..' '..'))
+$ChaosStudyReferenceRoot = Join-Path $ChaosStudySkillRoot 'references'
+
+function Get-ChaosStudyPluginRoot { return $ChaosStudyPluginRoot }
+function Get-ChaosStudyReferenceRoot { return $ChaosStudyReferenceRoot }
+function Get-ChaosStudyLibDir { return $ChaosStudyLibDir }
+
+# -- Read-only reuse of the shipped plugin scripts --------
+# These are dot-sourced, never edited. If one is missing (a trimmed install),
+# the study suite still loads; the callers degrade explicitly rather than
+# failing at import time.
+$ChaosStudySharedScriptDir = Join-Path $ChaosStudyPluginRoot 'scripts'
+$ChaosStudyLoadedSharedScripts = @()
+foreach ($sharedName in @('Render.ps1', 'Invoke-AzRest.ps1', 'Invoke-AzChaos.ps1', 'Ensure-AzLogin.ps1')) {
+    $sharedPath = Join-Path $ChaosStudySharedScriptDir $sharedName
+    if (Test-Path -LiteralPath $sharedPath) {
+        try {
+            . $sharedPath
+            $ChaosStudyLoadedSharedScripts += $sharedName
+        } catch {
+            [Console]::Error.WriteLine("[chaos-study] WARNING: could not load shared script '$sharedName': $($_.Exception.Message)")
+        }
+    }
+}
+
+function Get-ChaosSharedScriptStatus {
+    <#
+    .SYNOPSIS
+        Which shipped plugin scripts were available at load time.
+    #>
+    return [pscustomobject]@{
+        directory = $ChaosStudySharedScriptDir
+        loaded    = @($ChaosStudyLoadedSharedScripts | Sort-Object)
+    }
+}
+
+# -- Exit-code contract (additive; the shipped skills own 0-4) --
+$ChaosStudyExit = @{
+    Success              = 0
+    Error                = 1
+    BroadFixUnconsented  = 4
+    ReadinessFailed      = 10
+    ConsentDeclined      = 11
+    ConfigurationDrift   = 12
+    StudyAlreadySealed   = 13
+    FaultPathUnavailable = 14
+    StudyIncomparable    = 15
+}
+
+function Get-ChaosStudyExitCode {
+    <#
+    .SYNOPSIS
+        Resolve a named study exit code. Fails loudly on an unknown name so a
+        typo can never silently become exit 0.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    if (-not $ChaosStudyExit.ContainsKey($Name)) {
+        throw "Unknown study exit code '$Name'. Known: $(($ChaosStudyExit.Keys | Sort-Object) -join ', ')"
+    }
+    return $ChaosStudyExit[$Name]
+}
+
+# -- Output helpers ---------------------------------------
+function Write-ChaosStudyNote {
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [ValidateSet('info', 'warn')][string]$Level = 'info'
+    )
+    $prefix = if ($Level -eq 'warn') { '[chaos-study] WARNING:' } else { '[chaos-study]' }
+    [Console]::Error.WriteLine("$prefix $Message")
+}
+
+function Write-ChaosStudyFailure {
+    <#
+    .SYNOPSIS
+        Loud, structured failure. Never swallow - this is the only sanctioned
+        way for a study script to report that it could not do its job.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][string]$Message,
+        [string]$Remediation
+    )
+    if (Get-Command Write-Error-Card -ErrorAction SilentlyContinue) {
+        Write-Error-Card -Title $Title -ErrorMessage $Message -RemediationCommand $Remediation
+    } else {
+        Write-Output "## ERROR: $Title"
+        Write-Output ''
+        Write-Output $Message
+        if ($Remediation) {
+            Write-Output ''
+            Write-Output "Remediation: $Remediation"
+        }
+    }
+}
+
+# -- Time -------------------------------------------------
+function Get-ChaosUtcNow {
+    <#
+    .SYNOPSIS
+        The single clock in the suite. ISO-8601, UTC, 'Z' suffix (NFR-2).
+    #>
+    param([datetime]$Instant = [datetime]::UtcNow)
+    return $Instant.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
+function ConvertTo-ChaosUtcIso {
+    param([Parameter(Mandatory)][datetime]$Instant)
+    return $Instant.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+}
+
+function ConvertFrom-ChaosUtcIso {
+    param([Parameter(Mandatory)][string]$Text)
+    $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+    return [datetime]::Parse($Text, [System.Globalization.CultureInfo]::InvariantCulture, $styles)
+}
+
+function New-ChaosWindow {
+    <#
+    .SYNOPSIS
+        A half-open [start, end) window (NFR-2). There is no other window shape
+        in this suite.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][datetime]$Start,
+        [Parameter(Mandatory)][datetime]$End
+    )
+    if ($End -le $Start) { throw "Window '$Name' is not forward-ordered: start=$Start end=$End" }
+    return [pscustomobject]@{
+        name            = $Name
+        startUtc        = ConvertTo-ChaosUtcIso -Instant $Start
+        endUtc          = ConvertTo-ChaosUtcIso -Instant $End
+        durationSeconds = [int][math]::Round(($End - $Start).TotalSeconds)
+        interval        = 'half-open [start, end)'
+    }
+}
+
+# -- Redaction (NFR-5) ------------------------------------
+$ChaosStudyRedactKeyPattern = '(?i)(password|passwd|secret|token|apikey|api_key|accountkey|primarykey|secondarykey|connectionstring|sharedaccess|sas|credential|authorization|bearer|clientsecret|certificate|thumbprint|private_key|privatekey)'
+$ChaosStudyRedactValuePatterns = @(
+    '(?i)\bBearer\s+[A-Za-z0-9\-\._~\+\/]+=*',
+    '(?i)\bey[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}',
+    '(?i)(AccountKey|SharedAccessSignature|sig)=[^;&\s"]+'
+)
+
+function Protect-ChaosSecret {
+    <#
+    .SYNOPSIS
+        Redact secret-shaped values from a string. Applied to every command
+        trail entry and every value that reaches an artifact or the report.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return $Text }
+    $result = $Text
+    foreach ($pattern in $ChaosStudyRedactValuePatterns) {
+        $result = [regex]::Replace($result, $pattern, '[REDACTED]')
+    }
+    return $result
+}
+
+function Protect-ChaosObject {
+    <#
+    .SYNOPSIS
+        Recursively redact an object by key name and by value shape.
+    #>
+    param([AllowNull()][object]$InputObject, [int]$Depth = 0)
+    if ($Depth -gt 32) { return '[TRUNCATED]' }
+    if ($null -eq $InputObject) { return $null }
+
+    if ($InputObject -is [string]) { return Protect-ChaosSecret -Text $InputObject }
+    if ($InputObject -is [bool] -or $InputObject -is [int] -or $InputObject -is [long] -or
+        $InputObject -is [double] -or $InputObject -is [decimal] -or $InputObject -is [datetime]) {
+        return $InputObject
+    }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $out = [ordered]@{}
+        foreach ($key in @($InputObject.Keys)) {
+            if ("$key" -match $ChaosStudyRedactKeyPattern) { $out["$key"] = '[REDACTED]' }
+            else { $out["$key"] = Protect-ChaosObject -InputObject $InputObject[$key] -Depth ($Depth + 1) }
+        }
+        return $out
+    }
+
+    if ($InputObject -is [pscustomobject]) {
+        $out = [ordered]@{}
+        foreach ($prop in $InputObject.PSObject.Properties) {
+            if ($prop.Name -match $ChaosStudyRedactKeyPattern) { $out[$prop.Name] = '[REDACTED]' }
+            else { $out[$prop.Name] = Protect-ChaosObject -InputObject $prop.Value -Depth ($Depth + 1) }
+        }
+        return $out
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        # The leading comma stops PowerShell unrolling the result, which would
+        # otherwise turn a one-element array into a scalar and an empty array
+        # into $null - both of which change the JSON shape.
+        return ,@(foreach ($item in $InputObject) { Protect-ChaosObject -InputObject $item -Depth ($Depth + 1) })
+    }
+
+    return Protect-ChaosSecret -Text ([string]$InputObject)
+}
+
+# -- Deterministic serialisation (FR-17, NFR-6) -----------
+function ConvertTo-ChaosCanonical {
+    <#
+    .SYNOPSIS
+        Recursively rewrite an object with keys in ordinal-sorted order so that
+        two logically identical objects serialise byte-identically.
+    #>
+    param([AllowNull()][object]$InputObject, [int]$Depth = 0)
+    if ($Depth -gt 32) { return '[TRUNCATED]' }
+    if ($null -eq $InputObject) { return $null }
+
+    if ($InputObject -is [string] -or $InputObject -is [bool] -or $InputObject -is [int] -or
+        $InputObject -is [long] -or $InputObject -is [double] -or $InputObject -is [decimal]) {
+        return $InputObject
+    }
+
+    if ($InputObject -is [datetime]) { return ConvertTo-ChaosUtcIso -Instant $InputObject }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        $out = [ordered]@{}
+        foreach ($key in (@($InputObject.Keys) | Sort-Object -CaseSensitive)) {
+            $out["$key"] = ConvertTo-ChaosCanonical -InputObject $InputObject[$key] -Depth ($Depth + 1)
+        }
+        return $out
+    }
+
+    if ($InputObject -is [pscustomobject]) {
+        $out = [ordered]@{}
+        foreach ($prop in ($InputObject.PSObject.Properties | Sort-Object -Property Name -CaseSensitive)) {
+            $out[$prop.Name] = ConvertTo-ChaosCanonical -InputObject $prop.Value -Depth ($Depth + 1)
+        }
+        return $out
+    }
+
+    if ($InputObject -is [System.Collections.IEnumerable]) {
+        # See Protect-ChaosObject: the leading comma preserves array-ness.
+        return ,@(foreach ($item in $InputObject) { ConvertTo-ChaosCanonical -InputObject $item -Depth ($Depth + 1) })
+    }
+
+    return [string]$InputObject
+}
+
+function ConvertTo-ChaosCanonicalJson {
+    <#
+    .SYNOPSIS
+        Canonical, compact JSON. The input to every hash in this suite.
+    #>
+    param([AllowNull()][object]$InputObject)
+    $canonical = ConvertTo-ChaosCanonical -InputObject $InputObject
+    return ($canonical | ConvertTo-Json -Depth 32 -Compress)
+}
+
+function Get-ChaosSha256 {
+    <#
+    .SYNOPSIS
+        Lowercase hex SHA-256 over a string or a file.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Text')]
+    param(
+        [Parameter(ParameterSetName = 'Text', Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(ParameterSetName = 'File', Mandatory)][string]$Path
+    )
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = if ($PSCmdlet.ParameterSetName -eq 'File') {
+            [System.IO.File]::ReadAllBytes($Path)
+        } else {
+            [System.Text.UTF8Encoding]::new($false).GetBytes($Text)
+        }
+        return -join ($sha.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') })
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-ChaosDigest {
+    <#
+    .SYNOPSIS
+        Short (16 hex) digest of an object's canonical form. Used for
+        queryDigest, frozenConfigHash and findingKey.
+    #>
+    param([AllowNull()][object]$InputObject)
+    return (Get-ChaosSha256 -Text (ConvertTo-ChaosCanonicalJson -InputObject $InputObject)).Substring(0, 16)
+}
+
+# -- Crash-safe file writes (NFR-6) -----------------------
+function Write-ChaosTextFile {
+    <#
+    .SYNOPSIS
+        Atomic write: temp file in the same directory, flushed, then renamed
+        over the target. A crash leaves either the old file or the new one,
+        never half of either.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Content
+    )
+    $directory = Split-Path -Parent $Path
+    if ($directory -and -not (Test-Path -LiteralPath $directory)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    $temp = Join-Path $directory ('.{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $stream = [System.IO.File]::Create($temp)
+    try {
+        $bytes = $encoding.GetBytes($Content)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    } finally {
+        $stream.Dispose()
+    }
+    [System.IO.File]::Move($temp, $Path, $true)
+    return $Path
+}
+
+function Write-ChaosJsonFile {
+    <#
+    .SYNOPSIS
+        Atomically write an object as pretty, canonically-ordered, redacted JSON.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowNull()][object]$InputObject,
+        [switch]$SkipRedaction
+    )
+    $payload = if ($SkipRedaction) { $InputObject } else { Protect-ChaosObject -InputObject $InputObject }
+    $canonical = ConvertTo-ChaosCanonical -InputObject $payload
+    $json = ($canonical | ConvertTo-Json -Depth 32)
+    return Write-ChaosTextFile -Path $Path -Content ($json + "`n")
+}
+
+function Read-ChaosJsonFile {
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $raw = [System.IO.File]::ReadAllText($Path)
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    return $raw | ConvertFrom-Json
+}
+
+# -- Evidence shape (NFR-3) -------------------------------
+function New-ChaosSignalResult {
+    <#
+    .SYNOPSIS
+        The one shape every signal collector returns.
+
+    .DESCRIPTION
+        A missing measurement is `values: $null` plus a caveat. A reported 0
+        must be a measured zero. Conflating the two is a contract violation,
+        so this helper refuses to build a null result that does not say why.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Source,
+        [Parameter(Mandatory)][string]$Window,
+        [AllowNull()][object]$Values = $null,
+        [AllowNull()][AllowEmptyString()][string]$Caveat = $null,
+        [AllowNull()][object]$Query = $null
+    )
+    if ($null -eq $Values -and [string]::IsNullOrWhiteSpace($Caveat)) {
+        throw "New-ChaosSignalResult: a null result for source '$Source' must carry a caveat explaining why."
+    }
+    return [pscustomobject]@{
+        source      = $Source
+        window      = $Window
+        requestedAt = Get-ChaosUtcNow
+        values      = $Values
+        caveat      = if ([string]::IsNullOrWhiteSpace($Caveat)) { $null } else { $Caveat }
+        queryDigest = if ($null -ne $Query) { Get-ChaosDigest -InputObject $Query } else { $null }
+    }
+}
+
+# -- HTML escaping (NFR-8) --------------------------------
+function ConvertTo-ChaosHtmlText {
+    <#
+    .SYNOPSIS
+        Escape a value for HTML text content. Every value drawn from Azure or
+        from the model passes through here before it reaches the report.
+    #>
+    param([AllowNull()][object]$Value)
+    if ($null -eq $Value) { return '' }
+    $text = if ($Value -is [string]) { $Value } else { [string]$Value }
+    return $text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;').Replace("'", '&#39;')
+}
