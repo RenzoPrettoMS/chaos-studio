@@ -1,7 +1,8 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Execute a frozen chaos study plan and record what happened.
+    Execute a frozen chaos study plan as a Chaos Studio V2 scenario run, and
+    record what happened.
 
 .DESCRIPTION
     This is the only script in the suite that changes production. It is
@@ -10,7 +11,9 @@
       * It refuses to run a plan that changed after it was frozen.
       * It does nothing without an explicit, plan-specific consent phrase.
       * It defaults to a dry run, so the unarmed path is the default path.
-      * It cancels and deletes the experiment it created, even on failure.
+      * It refuses to execute a scenario configuration that did not validate.
+      * It cancels the scenario run and deletes the configuration it created,
+        even on failure.
 
     Evidence is collected in three windows - before, during and after - and
     written verbatim. A signal that could not be read is recorded as null with
@@ -21,7 +24,7 @@
     Previews the latest planned study without touching anything.
 
 .EXAMPLE
-    ./Invoke-ChaosStudyRun.ps1 -DryRun:$false -Consent 'inject microsoft-virtualmachine-shutdown into payments-vm 3d1f87dd'
+    ./Invoke-ChaosStudyRun.ps1 -DryRun:$false -Consent 'inject <action> into <workspace> 3d1f87dd'
     Runs it.
 #>
 
@@ -31,10 +34,10 @@ param(
     [string]$StudyRoot,
     [bool]$DryRun = $true,
     [string]$Consent,
-    [string]$Location,
     [string[]]$SignalSource = @(),
     [int]$PollSeconds = 20,
-    [switch]$KeepExperiment,
+    [switch]$FixPermissions,
+    [switch]$KeepConfiguration,
     [switch]$Force
 )
 
@@ -67,9 +70,9 @@ $plan = Read-ChaosJsonFile -Path (Join-Path $studyPath 'study-plan.v1.json')
 
 if (-not $plan) {
     Write-ChaosStudyFailure -Title 'Study has no plan' -Message @"
-Study $($study.studyId) exists but contains no study-plan.v1.json, so there is
-nothing to execute.
-"@ -Remediation 'Re-run the chaos-study-scope skill for this target.'
+Study $($study.studyId) exists but contains no study plan, so there is nothing
+to execute.
+"@ -Remediation 'Re-run the chaos-study-scope skill for this workspace.'
     exit (Get-ChaosStudyExitCode -Name 'Error')
 }
 
@@ -91,35 +94,48 @@ overwrite evidence from the first execution.
 
 Assert-ChaosPlanIntegrity -Plan $plan | Out-Null
 
-$experimentName = Get-ChaosStudyExperimentName -StudyId $study.studyId
+$configurationName = Get-ChaosStudyConfigurationName -StudyId $study.studyId
 $sources = @($SignalSource)
 if ($sources.Count -eq 0 -and $plan.signals.configuredSources) {
     $sources = @($plan.signals.configuredSources)
 }
 
+$projectedCount = $plan.scope.projectedResourceCount
+$projectedText = if ($null -eq $projectedCount) { '(not resolved)' } else { "$projectedCount of $($plan.scope.discoveredResourceCount) discovered" }
+
 # -- Dry run ---------------------------------------------------------------
 
 if ($DryRun) {
     $phrase = Get-ChaosConsentPhrase -Plan $plan
-    $definition = New-ChaosExperimentDefinition -Plan $plan -Location ($Location ? $Location : ($plan.target.region ?? '<region>'))
     $previewWindow = New-ChaosWindow -Name 'preview' -Start (ConvertTo-ChaosUtcIso -Instant (Get-Date).ToUniversalTime().AddMinutes(-1)) -End (Get-ChaosUtcNow)
     $preview = Invoke-ChaosSignalCollection -Plan $plan -Window $previewWindow -Sources $sources -DryRun
+
+    $blast = Get-ChaosBlastRadiusArgument -Plan $plan
+    $configPreview = [ordered]@{
+        workspace     = $plan.workspace.name
+        resourceGroup = $plan.workspace.resourceGroup
+        scenario      = $plan.scenario.name
+        configuration = $configurationName
+        parameters    = @(Get-ChaosScenarioParameterList -Plan $plan)
+        filters       = $blast.filters
+        exclusions    = $blast.exclusions
+    }
 
     Write-Card -Title "Dry run - study $($study.studyId)" -Status 'info' -Body @"
 Nothing has been injected. This is what would happen.
 
 $($plan.question.hypothesis)
 "@ -Properties ([ordered]@{
-        'Target'        = $plan.target.resourceName
-        'Target type'   = if ($plan.fault.targetType) { $plan.fault.targetType } else { '(not resolved)' }
-        'Region'        = if ($plan.target.region) { $plan.target.region } else { '(not resolved)' }
-        'Action'        = $plan.fault.displayName
-        'Action URN'    = $plan.fault.faultUrn
-        'Injection'     = "$($plan.windows.injectMinutes) minutes"
-        'Baseline'      = "$($plan.windows.baselineMinutes) minutes before injection"
-        'Recovery'      = "$($plan.windows.recoveryMinutes) minutes after injection"
-        'Experiment'    = $experimentName
-        'Delivery path' = $plan.readiness.deliveryPath.verdict
+        'Workspace'          = "$($plan.workspace.name) ($($plan.workspace.resourceGroup))"
+        'Region'             = if ($plan.scope.region) { $plan.scope.region } else { '(not resolved)' }
+        'Scoped resources'   = $projectedText
+        'Scenario'           = $plan.scenario.name
+        'Action'             = $plan.action.displayName
+        'Action URN'         = $(if ([string]::IsNullOrWhiteSpace($plan.action.canonicalId)) { '(not resolved - discovery skipped)' } else { [string]$plan.action.canonicalId })
+        'Injection'          = "$($plan.windows.injectMinutes) minutes"
+        'Baseline'           = "$($plan.windows.baselineMinutes) minutes before injection"
+        'Recovery'           = "$($plan.windows.recoveryMinutes) minutes after injection"
+        'Configuration'      = $configurationName
     })
 
     Write-Table -Title 'Evidence that would be collected' -Data @(
@@ -142,9 +158,9 @@ Injection requires a consent phrase that names the blast radius and pins this
 exact plan. Type it exactly:
 
   $phrase
-"@ -JsonPreview ($definition | ConvertTo-Json -Depth 20)
+"@ -JsonPreview ($configPreview | ConvertTo-Json -Depth 20)
 
-    Write-ChaosStudyNote -Message "Dry run complete. Nothing was changed."
+    Write-ChaosStudyNote -Message 'Dry run complete. Nothing was changed.'
     exit (Get-ChaosStudyExitCode -Name 'Success')
 }
 
@@ -152,34 +168,33 @@ exact plan. Type it exactly:
 
 Assert-ChaosConsent -Plan $plan -Consent $Consent | Out-Null
 
-if ($plan.readiness.deliveryPath.verdict -ne 'open' -and -not $Force) {
-    Write-ChaosStudyFailure -Title 'Delivery path was never verified as open' -Message @"
-The plan records the delivery path as '$($plan.readiness.deliveryPath.verdict)'. Injecting
-without a verified path usually produces a failed experiment and no evidence,
-which costs a production window for nothing.
-"@ -Remediation 'Re-run chaos-study-scope without -SkipDiscovery, or pass -Force to proceed anyway.'
-    exit (Get-ChaosStudyExitCode -Name 'FaultPathUnavailable')
+if ($plan.discovery.region -and $plan.scope.region -and -not $Force) {
+    # Discovery and the resolved scope must agree, or the action list this plan
+    # was chosen from describes a different region than the one that will run.
+    if ($plan.discovery.region -ne $plan.scope.region) {
+        Write-ChaosStudyFailure -Title 'Plan region is inconsistent' -Message @"
+This plan discovered actions in region '$($plan.discovery.region)' but its scope
+resolves to '$($plan.scope.region)'. The action chosen may not exist in the
+region that would actually run.
+"@ -Remediation 'Re-run chaos-study-scope so discovery and scope agree, or pass -Force to proceed anyway.'
+        exit (Get-ChaosStudyExitCode -Name 'ScopeUnverified')
+    }
+}
+
+if ($plan.scope.projectedResourceCount -eq 0 -and -not $Force) {
+    Write-ChaosStudyFailure -Title 'Nothing is in scope' -Message @"
+After filters and exclusions this plan reaches zero resources. A scenario run
+against an empty scope succeeds without touching anything, which would produce a
+report claiming resilience that was never tested.
+"@ -Remediation 'Re-run chaos-study-scope with a wider scope or fewer exclusions, or pass -Force to record the empty run deliberately.'
+    exit (Get-ChaosStudyExitCode -Name 'ScopeUnverified')
 }
 
 if (Get-Command Ensure-AzLogin -ErrorAction SilentlyContinue) { Ensure-AzLogin | Out-Null }
 
-if (-not $Location -and $plan.target.PSObject.Properties.Name -contains 'region') {
-    $Location = [string]$plan.target.region
-}
-
-if (-not $Location) {
-    $Location = (az resource show --ids $plan.target.resourceId --query location -o tsv 2>$null)
-    if (-not $Location) {
-        Write-ChaosStudyFailure -Title 'Could not determine the target region' -Message @"
-The experiment resource must be created in a region, and the target resource's
-region could not be read.
-"@ -Remediation 'Pass -Location <region> explicitly.'
-        exit (Get-ChaosStudyExitCode -Name 'Error')
-    }
-}
-
 $startedAt = Get-ChaosUtcNow
-Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'Invoke-ChaosStudyRun' -Note "consented; experiment $experimentName in $Location"
+Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'Invoke-ChaosStudyRun' `
+    -Note "consented; configuration $configurationName in workspace $($plan.workspace.name)" | Out-Null
 
 # Baseline is read retrospectively over the window that just ended, so the
 # study does not have to idle for it.
@@ -188,27 +203,56 @@ Write-ChaosStudyNote -Message "Collecting baseline evidence over the last $($pla
 $preEvidence = Invoke-ChaosSignalCollection -Plan $plan -Window $preWindow -Sources $sources
 Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'evidence/pre/signals.json' -Content $preEvidence | Out-Null
 
-$statusObservations = @()
 $injectStart = $null
 $injectEnd = $null
-$experimentCreated = $false
+$configurationCreated = $false
+$runId = $null
+$runObservation = $null
+$validationStatus = $null
+$permissionFix = $null
 $outcome = 'unknown'
 $failureMessage = $null
 
 try {
-    Write-ChaosStudyNote -Message "Creating experiment $experimentName."
-    New-ChaosStudyExperiment -Plan $plan -ExperimentName $experimentName -Location $Location | Out-Null
-    $experimentCreated = $true
-    Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'PUT Microsoft.Chaos/experiments' -Arguments @($experimentName) -ExitCode 0
+    Write-ChaosStudyNote -Message "Creating scenario configuration $configurationName."
+    New-ChaosStudyConfiguration -Plan $plan -ConfigurationName $configurationName | Out-Null
+    $configurationCreated = $true
+    Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config create' `
+        -Arguments @($configurationName) -ExitCode 0 | Out-Null
 
-    Write-ChaosStudyNote -Message 'Starting injection.'
+    Write-ChaosStudyNote -Message 'Validating the configuration against the live scope.'
+    $validation = Get-ChaosConfigurationValidation -Plan $plan -ConfigurationName $configurationName
+    $validationStatus = Get-ChaosValidationStatus -Validation $validation
+
+    if ($validationStatus -ne 'Succeeded' -and $FixPermissions) {
+        Write-ChaosStudyNote -Message 'Validation did not succeed. Applying the role assignments Chaos Studio reports as missing.' -Level 'warn'
+        $permissionFix = Repair-ChaosConfigurationPermission -Plan $plan -ConfigurationName $configurationName
+        Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config fix-permissions' `
+            -Arguments @($configurationName) -ExitCode 0 | Out-Null
+
+        $validation = Get-ChaosConfigurationValidation -Plan $plan -ConfigurationName $configurationName
+        $validationStatus = Get-ChaosValidationStatus -Validation $validation
+    }
+
+    Assert-ChaosConfigurationValidated -Validation $validation -ConfigurationName $configurationName | Out-Null
+
+    Write-ChaosStudyNote -Message 'Starting the scenario run.'
     $injectStart = Get-ChaosUtcNow
-    Start-ChaosStudyExperiment -Plan $plan -ExperimentName $experimentName | Out-Null
-    Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'POST experiments/start' -Arguments @($experimentName) -ExitCode 0
+    $started = Start-ChaosStudyScenarioRun -Plan $plan -ConfigurationName $configurationName
+    $runId = $started.runId
+    Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario run start' `
+        -Arguments @($configurationName, $runId) -ExitCode 0 | Out-Null
 
-    $statusObservations = Wait-ChaosExperimentWindow -Plan $plan -ExperimentName $experimentName -Minutes $plan.windows.injectMinutes -PollSeconds $PollSeconds
+    $waited = Wait-ChaosScenarioRunWindow -Plan $plan -RunId $runId -Minutes $plan.windows.injectMinutes -PollSeconds $PollSeconds `
+        -OnPoll { param($status) Write-ChaosStudyNote -Message "Scenario run $runId is $status." }
+
     $injectEnd = Get-ChaosUtcNow
-    $outcome = ([string](@($statusObservations)[-1].status))
+    $runObservation = Get-ChaosScenarioRunObservation -Run $waited.run
+    $outcome = if ($runObservation.status) { $runObservation.status } else { 'unknown' }
+
+    if ($waited.endedEarly -and $outcome -ne 'Succeeded') {
+        Write-ChaosStudyNote -Message "The scenario run reached '$outcome' before the injection window elapsed." -Level 'warn'
+    }
 
     Write-ChaosStudyNote -Message 'Collecting evidence from the injection window.'
     $duringWindow = New-ChaosWindow -Name 'during' -Start $injectStart -End $injectEnd
@@ -219,12 +263,12 @@ try {
     $outcome = 'Failed'
     Write-ChaosStudyNote -Message "Injection failed: $failureMessage" -Level 'warn'
 } finally {
-    if ($experimentCreated) {
-        Write-ChaosStudyNote -Message 'Cancelling experiment.'
-        Stop-ChaosStudyExperiment -Plan $plan -ExperimentName $experimentName | Out-Null
-        if (-not $KeepExperiment) {
-            Remove-ChaosStudyExperiment -Plan $plan -ExperimentName $experimentName | Out-Null
-        }
+    if ($runId) {
+        Write-ChaosStudyNote -Message "Cancelling scenario run $runId."
+        Stop-ChaosStudyScenarioRun -Plan $plan -RunId $runId
+    }
+    if ($configurationCreated -and -not $KeepConfiguration) {
+        Remove-ChaosStudyConfiguration -Plan $plan -ConfigurationName $configurationName
     }
 }
 
@@ -248,43 +292,59 @@ $allSignals = @($preEvidence) + @($duringEvidence) + @($postEvidence)
 $coverage = Test-ChaosSignalCoverage -Signals $allSignals
 
 $runRecord = [ordered]@{
-    recordVersion  = 'run-record.v1'
-    studyId        = $study.studyId
-    scopeHash      = $study.scopeHash
-    planHash       = $plan.frozenConfigHash
-    startedAt      = $startedAt
-    completedAt    = Get-ChaosUtcNow
-    experiment     = [ordered]@{
-        name        = $experimentName
-        location    = $Location
+    recordVersion = 'run-record.v2'
+    studyId       = $study.studyId
+    scopeHash     = $study.scopeHash
+    planHash      = $plan.frozenConfigHash
+    startedAt     = $startedAt
+    completedAt   = Get-ChaosUtcNow
+    workspace     = [ordered]@{
+        subscriptionId = $plan.workspace.subscriptionId
+        resourceGroup  = $plan.workspace.resourceGroup
+        name           = $plan.workspace.name
+        id             = $plan.workspace.id
+    }
+    configuration = [ordered]@{
+        name             = $configurationName
+        scenario         = $plan.scenario.name
+        scenarioId       = $plan.scenario.id
+        validationStatus = $validationStatus
+        permissionFix    = $permissionFix
+        retained         = [bool]$KeepConfiguration
+    }
+    scenarioRun   = [ordered]@{
+        runId       = $runId
         outcome     = $outcome
-        observations = @($statusObservations)
-        retained    = [bool]$KeepExperiment
+        observation = $runObservation
         failure     = $failureMessage
     }
-    windows        = [ordered]@{
+    windows       = [ordered]@{
         pre    = $preWindow
         during = New-ChaosWindow -Name 'during' -Start $injectStart -End $injectEnd
         post   = $postWindow
     }
-    evidence       = [ordered]@{
+    evidence      = [ordered]@{
         pre    = 'evidence/pre/signals.json'
         during = 'evidence/during/signals.json'
         post   = 'evidence/post/signals.json'
     }
-    coverage       = $coverage
+    coverage      = $coverage
 }
 
 Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'run-record.v1.json' -Content $runRecord | Out-Null
 
 $status = if ($failureMessage) { 'error' } elseif ($coverage.missing -gt 0) { 'warning' } else { 'success' }
+$touched = if ($null -ne $runObservation -and $null -ne $runObservation.resourcesTouched) { $runObservation.resourcesTouched } else { 'not reported' }
+
 Write-Card -Title "Run complete - study $($study.studyId)" -Status $status -Body @"
-Injection has stopped and the experiment has been cleaned up. Evidence is
-recorded; it has not yet been interpreted.
+The scenario run has stopped and the configuration has been cleaned up. Evidence
+is recorded; it has not yet been interpreted.
 "@ -Properties ([ordered]@{
-    'Experiment outcome' = $outcome
-    'Signals measured'   = "$($coverage.measured) of $($coverage.total)"
-    'Study directory'    = $studyPath
+    'Scenario run'      = if ($runId) { $runId } else { '(never started)' }
+    'Outcome'           = $outcome
+    'Resources touched' = $touched
+    'Signals measured'  = "$($coverage.measured) of $($coverage.total)"
+    'Study directory'   = $studyPath
 })
 
 if ($coverage.missing -gt 0) {
@@ -293,7 +353,7 @@ if ($coverage.missing -gt 0) {
     )
 }
 
-Write-ChaosStudyNote -Message "Next: run the chaos-study-report skill to interpret this run."
+Write-ChaosStudyNote -Message 'Next: run the chaos-study-report skill to interpret this run.'
 
 if ($failureMessage) { exit (Get-ChaosStudyExitCode -Name 'Error') }
 exit (Get-ChaosStudyExitCode -Name 'Success')

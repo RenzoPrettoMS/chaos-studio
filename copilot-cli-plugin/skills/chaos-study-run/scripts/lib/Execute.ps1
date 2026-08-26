@@ -1,30 +1,36 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Consent, plan integrity, and the Chaos Studio experiment lifecycle.
+    Consent, plan integrity, and the Chaos Studio V2 scenario lifecycle.
 
 .DESCRIPTION
-    Three ideas govern this file.
+    Four ideas govern this file.
 
     Nothing runs without consent. Consent is a phrase the operator types, and
-    the phrase contains the action, the target resource and a hash of the plan.
-    It cannot be given by accident, it cannot be given in advance, and it cannot
-    be inherited from an environment variable - this suite deliberately ignores
-    STARTCHAOS_NONINTERACTIVE, because "unattended" is not a reason to skip the
-    one gate that bounds production risk.
+    the phrase names the action, the workspace it lands in and a hash of the
+    plan. It cannot be given by accident, it cannot be given in advance, and it
+    cannot be inherited from an environment variable - this suite deliberately
+    ignores STARTCHAOS_NONINTERACTIVE, because "unattended" is not a reason to
+    skip the one gate that bounds production risk.
 
     Consent applies to a specific plan. If the plan changed after it was shown,
     the hash no longer matches and execution stops. The thing consented to is
     provably the thing that runs.
 
-    Injection is always reversible. The experiment is created with a bounded
-    duration, and cleanup runs in a finally block so an interrupted study still
-    cancels the experiment it started.
+    Nothing executes on an unvalidated configuration. Chaos Studio validates a
+    scenario configuration against the live scope and the workspace identity's
+    permissions. A configuration that is not `Succeeded` will start a run that
+    fails within seconds with an opaque error, so this file refuses to execute
+    until validation succeeds - after offering the permission fix the service
+    itself recommends.
 
-    Fault injection uses the Microsoft.Chaos/experiments surface through the
-    shared Invoke-AzRest helper (az rest under the hood). The `az chaos`
-    extension covers the newer workspace/scenario surface, which is a different
-    resource model from the experiment used here.
+    Injection is bounded and abortable. The configuration carries the filters
+    and exclusions frozen at scope time, and cancellation runs in a finally
+    block so an interrupted study still cancels the run it started.
+
+    Everything here goes through the `az chaos` seam (Invoke-AzChaos), which is
+    the Chaos Studio V2 surface: workspaces, scopes, scenarios, scenario
+    configurations and scenario runs.
 #>
 
 Set-StrictMode -Version Latest
@@ -42,7 +48,7 @@ function Get-ChaosPlanFingerprint {
     param([Parameter(Mandatory)][object]$Plan)
 
     $copy = [ordered]@{}
-    $names = if ($Plan -is [System.Collections.IDictionary]) { @($Plan.Keys) } else { @($Plan.PSObject.Properties.Name) }
+    $names = if ($Plan -is [System.Collections.IDictionary]) { @($Plan.Keys) } else { @($Plan.PSObject.Properties | ForEach-Object { $_.Name }) }
     foreach ($name in $names) {
         if ($name -eq 'frozenConfigHash') { continue }
         $copy["$name"] = if ($Plan -is [System.Collections.IDictionary]) { $Plan[$name] } else { $Plan.$name }
@@ -79,14 +85,14 @@ function Get-ChaosConsentPhrase {
         The exact phrase the operator must type to authorise injection.
 
     .DESCRIPTION
-        The phrase names the action and the resource it lands on so it cannot be
-        typed without reading it, and carries the plan hash so it cannot be
+        The phrase names the action and the workspace it lands in so it cannot
+        be typed without reading it, and carries the plan hash so it cannot be
         reused for a different plan.
     #>
     param([Parameter(Mandatory)][object]$Plan)
 
     $shortHash = ([string]$Plan.frozenConfigHash).Substring(0, 8)
-    return "inject $($Plan.fault.action) into $($Plan.target.resourceName) $shortHash"
+    return "inject $($Plan.action.name) into $($Plan.workspace.name) $shortHash"
 }
 
 function Assert-ChaosConsent {
@@ -113,15 +119,17 @@ function Assert-ChaosConsent {
         'The consent phrase did not match this plan exactly (comparison is case-sensitive).'
     }
 
-    $targetTypeText = if ($Plan.fault.targetType) { $Plan.fault.targetType } else { '(target type not resolved)' }
+    $count = $Plan.scope.projectedResourceCount
+    $countText = if ($null -eq $count) { 'an unknown number of' } else { "$count" }
+    $regionText = if ([string]::IsNullOrWhiteSpace($Plan.scope.region)) { '(not resolved)' } else { [string]$Plan.scope.region }
 
     Write-ChaosStudyFailure -Title 'Injection not authorised' -Message @"
 $reason
 
-This study would inject $($Plan.fault.displayName) into
-  resource    $($Plan.target.resourceName)
-  resource id $($Plan.target.resourceId)
-  target type $targetTypeText
+This study would run scenario $($Plan.scenario.name) - action $($Plan.action.displayName) -
+  workspace   $($Plan.workspace.name) ($($Plan.workspace.resourceGroup))
+  region      $regionText
+  reaching    $countText scoped resource(s) after filters and exclusions
 for $($Plan.windows.injectMinutes) minutes.
 
 To authorise it, pass this phrase exactly:
@@ -131,278 +139,567 @@ To authorise it, pass this phrase exactly:
     exit (Get-ChaosStudyExitCode -Name 'ConsentDeclined')
 }
 
-# -- Experiment definition -------------------------------------------------
+# -- Scenario configuration ------------------------------------------------
 
-function ConvertTo-ChaosFaultParameters {
+function Get-ChaosStudyConfigurationName {
     <#
     .SYNOPSIS
-        Turn a plan's parameter map into the key/value list the experiment API
-        expects.
+        Deterministic configuration name derived from the study id.
 
     .DESCRIPTION
-        The shape is driven by the action's own parameter schema, captured live
-        at scope time. Scalars go through as strings; anything structured is
-        JSON-encoded, because the experiment API carries every parameter value
-        as a string.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Plan
-    )
-
-    $parameters = $Plan.fault.parameters
-    if ($null -eq $parameters) { return @() }
-
-    # Member enumeration over an empty property collection throws under
-    # Set-StrictMode -Version Latest, so the names are projected explicitly.
-    $names = if ($parameters -is [System.Collections.IDictionary]) {
-        @($parameters.Keys)
-    } else {
-        @($parameters.PSObject.Properties | ForEach-Object { $_.Name })
-    }
-
-    $pairs = @()
-    foreach ($name in $names) {
-        $value = if ($parameters -is [System.Collections.IDictionary]) { $parameters[$name] } else { $parameters.$name }
-        $encoded = if ($value -is [string]) {
-            $value
-        } elseif ($value -is [bool]) {
-            $value.ToString().ToLowerInvariant()
-        } elseif ($value -is [System.Collections.IEnumerable]) {
-            ConvertTo-ChaosCanonicalJson -InputObject $value
-        } else {
-            [string]$value
-        }
-        $pairs += @{ key = "$name"; value = $encoded }
-    }
-    return $pairs
-}
-
-function Get-ChaosExperimentActionType {
-    <#
-    .SYNOPSIS
-        Map the action type the service reported onto the experiment schema's
-        action type.
-
-    .DESCRIPTION
-        The actions endpoint reports Continuous, Cancelable or Discrete. The
-        experiment body understands 'continuous' and 'discrete'. Cancelable
-        actions run for a window and can be stopped, so they are continuous as
-        far as the experiment body is concerned; discrete actions are a single
-        act with no duration.
-    #>
-    param([AllowNull()][string]$ActionType)
-
-    if ([string]::IsNullOrWhiteSpace($ActionType)) { return 'continuous' }
-    if ($ActionType -ieq 'Discrete') { return 'discrete' }
-    return 'continuous'
-}
-
-function New-ChaosExperimentDefinition {
-    <#
-    .SYNOPSIS
-        Build the experiment body for this plan.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$Location
-    )
-
-    # The target URI is the one the delivery probe actually walked at scope
-    # time, so the experiment addresses exactly what was verified. Only when no
-    # probe ran at all does this fall back to the documented convention.
-    $targetId = $null
-    if ($Plan.PSObject.Properties.Name -contains 'readiness' -and
-        $Plan.readiness.PSObject.Properties.Name -contains 'deliveryPath' -and
-        $null -ne $Plan.readiness.deliveryPath -and
-        $Plan.readiness.deliveryPath.PSObject.Properties.Name -contains 'targetUri') {
-        $targetId = [string]$Plan.readiness.deliveryPath.targetUri
-    }
-    if ([string]::IsNullOrWhiteSpace($targetId)) {
-        # No probe confirmed a Chaos Studio target on this resource. Emitting a
-        # plausible-looking resource id here would be inventing evidence, so the
-        # preview carries an obviously unusable placeholder instead. Arming is
-        # already refused while the delivery path is anything but 'open'.
-        $targetId = "$($Plan.target.resourceId)/providers/Microsoft.Chaos/targets/<unresolved: re-scope without -SkipDiscovery>"
-    }
-
-    $experimentActionType = Get-ChaosExperimentActionType -ActionType ([string]$Plan.fault.actionType)
-
-    $action = [ordered]@{
-        type       = $experimentActionType
-        name       = $Plan.fault.faultUrn
-        selectorId = 'studySelector'
-    }
-    if ($experimentActionType -eq 'continuous') {
-        $action['duration'] = "PT$($Plan.windows.injectMinutes)M"
-    }
-    $action['parameters'] = @(ConvertTo-ChaosFaultParameters -Plan $Plan | Where-Object { $null -ne $_ })
-
-    return [ordered]@{
-        location   = $Location
-        identity   = [ordered]@{ type = 'SystemAssigned' }
-        properties = [ordered]@{
-            selectors = @(
-                [ordered]@{
-                    type    = 'List'
-                    id      = 'studySelector'
-                    targets = @([ordered]@{ type = 'ChaosTarget'; id = $targetId })
-                }
-            )
-            steps     = @(
-                [ordered]@{
-                    name     = 'inject'
-                    branches = @(
-                        [ordered]@{
-                            name    = 'primary'
-                            actions = @($action)
-                        }
-                    )
-                }
-            )
-        }
-    }
-}
-
-# -- Experiment lifecycle --------------------------------------------------
-
-function Get-ChaosExperimentUri {
-    param(
-        [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ExperimentName
-    )
-    return "/subscriptions/$($Plan.target.subscriptionId)/resourceGroups/$($Plan.target.resourceGroup)/providers/Microsoft.Chaos/experiments/$ExperimentName"
-}
-
-function New-ChaosStudyExperiment {
-    <#
-    .SYNOPSIS
-        Create (or replace) the experiment resource for this study.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ExperimentName,
-        [Parameter(Mandatory)][string]$Location
-    )
-    $body = New-ChaosExperimentDefinition -Plan $Plan -Location $Location
-    $uri = Get-ChaosExperimentUri -Plan $Plan -ExperimentName $ExperimentName
-    $response = Invoke-AzRest -Method PUT -Uri $uri -Body $body -ApiVersion (Get-ChaosApiVersion -Name 'chaosClassic')
-    return $response.body
-}
-
-function Start-ChaosStudyExperiment {
-    param(
-        [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ExperimentName
-    )
-    $uri = "$(Get-ChaosExperimentUri -Plan $Plan -ExperimentName $ExperimentName)/start"
-    $response = Invoke-AzRest -Method POST -Uri $uri -ApiVersion (Get-ChaosApiVersion -Name 'chaosClassic')
-    return $response.body
-}
-
-function Stop-ChaosStudyExperiment {
-    <#
-    .SYNOPSIS
-        Cancel a running experiment. Best effort by design: this runs on the
-        failure path, where throwing again would hide the original fault.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ExperimentName
-    )
-    try {
-        $uri = "$(Get-ChaosExperimentUri -Plan $Plan -ExperimentName $ExperimentName)/cancel"
-        Invoke-AzRest -Method POST -Uri $uri -ApiVersion (Get-ChaosApiVersion -Name 'chaosClassic') | Out-Null
-        return $true
-    } catch {
-        Write-ChaosStudyNote -Message "Could not cancel experiment '$ExperimentName': $($_.Exception.Message)" -Level 'warn'
-        return $false
-    }
-}
-
-function Remove-ChaosStudyExperiment {
-    param(
-        [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ExperimentName
-    )
-    try {
-        $uri = Get-ChaosExperimentUri -Plan $Plan -ExperimentName $ExperimentName
-        Invoke-AzRest -Method DELETE -Uri $uri -ApiVersion (Get-ChaosApiVersion -Name 'chaosClassic') | Out-Null
-        return $true
-    } catch {
-        Write-ChaosStudyNote -Message "Could not delete experiment '$ExperimentName': $($_.Exception.Message)" -Level 'warn'
-        return $false
-    }
-}
-
-function Get-ChaosExperimentExecution {
-    <#
-    .SYNOPSIS
-        The latest execution's status, or $null when it cannot be read.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ExperimentName
-    )
-    try {
-        $uri = "$(Get-ChaosExperimentUri -Plan $Plan -ExperimentName $ExperimentName)/executions"
-        $response = Invoke-AzRest -Method GET -Uri $uri -ApiVersion (Get-ChaosApiVersion -Name 'chaosClassic')
-        $executions = @($response.body.value)
-        if ($executions.Count -eq 0) { return $null }
-        return ($executions | Sort-Object -Property { $_.properties.startedAt } -Descending | Select-Object -First 1)
-    } catch {
-        return $null
-    }
-}
-
-function Wait-ChaosExperimentWindow {
-    <#
-    .SYNOPSIS
-        Hold for the injection window, watching the experiment as it runs.
-
-    .DESCRIPTION
-        Returns the observed status transitions. A status that cannot be read
-        is recorded as unknown rather than assumed healthy - the report needs to
-        be able to say "we could not see it" instead of implying success.
-    #>
-    param(
-        [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ExperimentName,
-        [Parameter(Mandatory)][int]$Minutes,
-        [int]$PollSeconds = 20
-    )
-
-    $deadline = (Get-Date).ToUniversalTime().AddMinutes($Minutes)
-    $observations = @()
-    $seen = @{}
-
-    while ((Get-Date).ToUniversalTime() -lt $deadline) {
-        $execution = Get-ChaosExperimentExecution -Plan $Plan -ExperimentName $ExperimentName
-        $status = if ($execution -and $execution.properties) { [string]$execution.properties.status } else { 'unknown' }
-        if (-not $seen.ContainsKey($status)) {
-            $seen[$status] = $true
-            $observations += [ordered]@{ at = Get-ChaosUtcNow; status = $status }
-            Write-ChaosStudyNote -Message "Experiment status: $status"
-        }
-        if ($status -in @('Failed', 'Cancelled')) { break }
-
-        $remaining = ($deadline - (Get-Date).ToUniversalTime()).TotalSeconds
-        if ($remaining -le 0) { break }
-        Start-Sleep -Seconds ([Math]::Min($PollSeconds, [Math]::Max(1, [int]$remaining)))
-    }
-
-    if ($observations.Count -eq 0) {
-        $observations += [ordered]@{ at = Get-ChaosUtcNow; status = 'unknown' }
-    }
-    return ,@($observations)
-}
-
-function Get-ChaosStudyExperimentName {
-    <#
-    .SYNOPSIS
-        A deterministic, collision-resistant experiment name for a study.
+        Deriving it means an interrupted study can find and cancel the
+        configuration it created, rather than leaking a resource whose name it
+        no longer knows.
     #>
     param([Parameter(Mandatory)][string]$StudyId)
     $suffix = ($StudyId -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
     if ($suffix.Length -gt 40) { $suffix = $suffix.Substring($suffix.Length - 40) }
-    return "chaos-study-$suffix"
+    return "study-$suffix"
+}
+
+function Get-ChaosScenarioParameterList {
+    <#
+    .SYNOPSIS
+        The scenario parameters frozen at scope time, in the {key,value} shape
+        `az chaos scenario config create --parameters` expects.
+
+    .DESCRIPTION
+        Scope already normalised and sorted these, so this only re-projects
+        them after the JSON round-trip through the store. Values are carried as
+        strings because that is what the configuration API accepts; anything
+        structured is canonically JSON-encoded so the same input always
+        produces the same configuration.
+    #>
+    param([Parameter(Mandatory)][object]$Plan)
+
+    $frozen = $null
+    if ($Plan.scenario.PSObject.Properties.Name -contains 'parameters') { $frozen = $Plan.scenario.parameters }
+    if ($null -eq $frozen) { return @() }
+
+    $pairs = @()
+    foreach ($entry in @($frozen)) {
+        if ($null -eq $entry) { continue }
+        $key = [string]$entry.key
+        if ([string]::IsNullOrWhiteSpace($key)) { continue }
+        $value = $entry.value
+        $encoded = if ($value -is [string]) {
+            $value
+        } elseif ($value -is [bool]) {
+            $value.ToString().ToLowerInvariant()
+        } elseif ($null -ne $value -and $value -isnot [string] -and $value -is [System.Collections.IEnumerable]) {
+            ConvertTo-ChaosCanonicalJson -InputObject $value
+        } else {
+            [string]$value
+        }
+        $pairs += @{ key = $key; value = $encoded }
+    }
+    return $pairs
+}
+
+function Get-ChaosBlastRadiusArgument {
+    <#
+    .SYNOPSIS
+        Project the plan's frozen blast radius into --filters / --exclusions
+        objects, omitting anything empty.
+
+    .DESCRIPTION
+        Empty is not the same as absent here. `--filters '{"locations":[]}'`
+        means "no locations", which matches nothing; omitting locations means
+        "every location in scope". Sending an empty collection would silently
+        turn a real study into a no-op that still reports success, so empty
+        members are dropped rather than serialised.
+    #>
+    param([Parameter(Mandatory)][object]$Plan)
+
+    $result = [ordered]@{ filters = $null; exclusions = $null }
+    $blast = $null
+    if ($Plan.scope.PSObject.Properties.Name -contains 'blastRadius') { $blast = $Plan.scope.blastRadius }
+    if ($null -eq $blast) { return [pscustomobject]$result }
+
+    foreach ($side in @('filters', 'exclusions')) {
+        if ($blast.PSObject.Properties.Name -notcontains $side) { continue }
+        $source = $blast.$side
+        if ($null -eq $source) { continue }
+
+        $projected = [ordered]@{}
+        foreach ($property in @($source.PSObject.Properties)) {
+            $value = $property.Value
+            if ($null -eq $value) { continue }
+            if ($value -is [string]) {
+                if ([string]::IsNullOrWhiteSpace($value)) { continue }
+            } elseif ($value -is [System.Collections.IDictionary]) {
+                if ($value.Count -eq 0) { continue }
+            } elseif ($value -is [System.Collections.IEnumerable]) {
+                if (@($value).Count -eq 0) { continue }
+            }
+            $projected[$property.Name] = $value
+        }
+        if ($projected.Count -gt 0) { $result[$side] = [pscustomobject]$projected }
+    }
+
+    return [pscustomobject]$result
+}
+
+function New-ChaosStudyConfiguration {
+    <#
+    .SYNOPSIS
+        Create the scenario configuration this study will execute.
+
+    .DESCRIPTION
+        The configuration is the frozen plan expressed as a Chaos Studio
+        resource: which scenario, with which parameters, constrained by which
+        filters and exclusions. Creating it changes nothing in the target
+        system - execution is a separate, separately-consented step.
+
+        Structured arguments go through Invoke-AzChaos -JsonArg, which writes
+        them to a temp file. On Windows `az` is a .cmd shim that mangles
+        unquoted JSON braces, so passing them inline is not reliable.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    $chaosArgs = @(
+        'scenario', 'config', 'create',
+        '-n', $ConfigurationName,
+        '-g', $Plan.workspace.resourceGroup,
+        '--workspace-name', $Plan.workspace.name,
+        '--scenario-name', $Plan.scenario.name
+    )
+
+    $jsonArg = @{}
+
+    $parameters = @(Get-ChaosScenarioParameterList -Plan $Plan)
+    if ($parameters.Count -gt 0) { $jsonArg['parameters'] = $parameters }
+
+    $blast = Get-ChaosBlastRadiusArgument -Plan $Plan
+    if ($null -ne $blast.filters) { $jsonArg['filters'] = $blast.filters }
+    if ($null -ne $blast.exclusions) { $jsonArg['exclusions'] = $blast.exclusions }
+
+    $created = if ($jsonArg.Count -gt 0) {
+        Invoke-AzChaos -ChaosArgs $chaosArgs -JsonArg $jsonArg
+    } else {
+        Invoke-AzChaos -ChaosArgs $chaosArgs
+    }
+
+    if ($null -eq $created) {
+        throw "Chaos Studio did not return a scenario configuration for '$ConfigurationName'. The configuration was not created, so nothing was executed."
+    }
+    return $created
+}
+
+function Remove-ChaosStudyConfiguration {
+    <#
+    .SYNOPSIS
+        Delete a scenario configuration, tolerating one that is already gone.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    Invoke-AzChaos -AllowFailure -ChaosArgs @(
+        'scenario', 'config', 'delete',
+        '-n', $ConfigurationName,
+        '-g', $Plan.workspace.resourceGroup,
+        '--workspace-name', $Plan.workspace.name,
+        '--scenario-name', $Plan.scenario.name,
+        '--yes'
+    ) | Out-Null
+}
+
+# -- Validation and permissions --------------------------------------------
+
+function Get-ChaosConfigurationValidation {
+    <#
+    .SYNOPSIS
+        Run validation and return the latest validation result.
+
+    .DESCRIPTION
+        `validate` is long-running and its own response is sometimes thinner
+        than the stored result, so the stored result is read back and preferred.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    $scoping = @(
+        '-n', $ConfigurationName,
+        '-g', $Plan.workspace.resourceGroup,
+        '--workspace-name', $Plan.workspace.name,
+        '--scenario-name', $Plan.scenario.name
+    )
+
+    Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'validate') + $scoping) | Out-Null
+    return Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'show-validation') + $scoping)
+}
+
+function Get-ChaosValidationStatus {
+    <#
+    .SYNOPSIS
+        Read the status out of a validation result, whatever shape it arrives in.
+    #>
+    param([AllowNull()][object]$Validation)
+
+    if ($null -eq $Validation) { return $null }
+    if ($Validation.PSObject.Properties.Name -contains 'properties' -and $null -ne $Validation.properties) {
+        if ($Validation.properties.PSObject.Properties.Name -contains 'status') { return [string]$Validation.properties.status }
+    }
+    if ($Validation.PSObject.Properties.Name -contains 'status') { return [string]$Validation.status }
+    return $null
+}
+
+function Get-ChaosValidationError {
+    <#
+    .SYNOPSIS
+        Project validation errors into a flat, reportable list.
+    #>
+    param([AllowNull()][object]$Validation)
+
+    if ($null -eq $Validation) { return @() }
+    $container = if ($Validation.PSObject.Properties.Name -contains 'properties' -and $null -ne $Validation.properties) { $Validation.properties } else { $Validation }
+
+    $errors = @()
+    foreach ($field in @('validationErrors', 'errors')) {
+        if ($container.PSObject.Properties.Name -notcontains $field) { continue }
+        foreach ($item in @($container.$field)) {
+            if ($null -eq $item) { continue }
+            $errors += [ordered]@{
+                code     = if ($item.PSObject.Properties.Name -contains 'errorCode') { [string]$item.errorCode } else { $null }
+                message  = if ($item.PSObject.Properties.Name -contains 'errorMessage') { [string]$item.errorMessage } else { [string]$item }
+                resource = if ($item.PSObject.Properties.Name -contains 'resourceId') { [string]$item.resourceId } else { $null }
+            }
+        }
+    }
+    return $errors
+}
+
+function Repair-ChaosConfigurationPermission {
+    <#
+    .SYNOPSIS
+        Ask Chaos Studio to grant the workspace identity the roles it says the
+        run needs, then report what it did.
+
+    .DESCRIPTION
+        The service decides the grants; this only requests and reports them.
+        Callers show the what-if result to the operator before applying, so a
+        study never silently widens an identity's access.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [switch]$WhatIf
+    )
+
+    $scoping = @(
+        '-n', $ConfigurationName,
+        '-g', $Plan.workspace.resourceGroup,
+        '--workspace-name', $Plan.workspace.name,
+        '--scenario-name', $Plan.scenario.name
+    )
+
+    $chaosArgs = @('scenario', 'config', 'fix-permissions') + $scoping
+    if ($WhatIf) { $chaosArgs += '--what-if' }
+
+    Invoke-AzChaos -AllowFailure -ChaosArgs $chaosArgs | Out-Null
+    return Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'show-permission-fix') + $scoping)
+}
+
+function Assert-ChaosConfigurationValidated {
+    <#
+    .SYNOPSIS
+        Refuse to execute a configuration that did not validate cleanly.
+
+    .DESCRIPTION
+        This is a hard gate, not a warning. A configuration in any state other
+        than Succeeded produces a run that fails in seconds with an error that
+        names neither the resource nor the missing permission, which is far
+        harder to diagnose than a refusal here. When the failure looks like a
+        permissions problem the caller is told to use -FixPermissions, because
+        granting roles is a mutation and belongs to the operator.
+    #>
+    param(
+        [AllowNull()][object]$Validation,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    $status = Get-ChaosValidationStatus -Validation $Validation
+    if ($status -eq 'Succeeded') { return $true }
+
+    $errors = @(Get-ChaosValidationError -Validation $Validation)
+    $detail = if ($errors.Count -gt 0) {
+        ($errors | ForEach-Object {
+            $where = if ($_.resource) { " on $($_.resource)" } else { '' }
+            "  - $($_.code)$where`: $($_.message)"
+        }) -join "`n"
+    } else {
+        '  (the service reported no error detail)'
+    }
+
+    $looksLikePermissions = @($errors | Where-Object {
+        "$($_.code) $($_.message)" -match '(?i)(permission|authoriz|forbidden|rbac|roleassignment)'
+    }).Count -gt 0
+
+    $remediation = if ($looksLikePermissions) {
+        'Re-run with -FixPermissions to let Chaos Studio grant the workspace identity the roles it reports as missing, then run again.'
+    } else {
+        'Re-run chaos-study-scope against a scope the workspace can actually reach, then plan again.'
+    }
+
+    Write-ChaosStudyFailure -Title 'Scenario configuration did not validate' -Message @"
+Configuration '$ConfigurationName' validated as $(if ($status) { $status } else { 'an unreported status' }).
+
+$detail
+
+Chaos Studio validates a configuration against the live scope and the workspace
+identity's permissions. Executing an unvalidated configuration produces a run
+that fails within seconds without naming the cause, so this study stops here
+instead.
+"@ -Remediation $remediation
+    exit (Get-ChaosStudyExitCode -Name 'ValidationFailed')
+}
+
+# -- Scenario run ----------------------------------------------------------
+
+function Start-ChaosStudyScenarioRun {
+    <#
+    .SYNOPSIS
+        Execute a validated configuration and return the run id.
+
+    .DESCRIPTION
+        Validation is never skipped from here. The run id is read from the
+        response, falling back to the resource id, because everything the study
+        does afterwards - polling, cancelling, evidence correlation - is keyed
+        on it, and a run that started but cannot be identified is a run that
+        cannot be stopped.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    $started = Invoke-AzChaos -ChaosArgs @(
+        'scenario', 'run', 'start',
+        '-g', $Plan.workspace.resourceGroup,
+        '--workspace-name', $Plan.workspace.name,
+        '--scenario-name', $Plan.scenario.name,
+        '--config-name', $ConfigurationName
+    )
+
+    if ($null -eq $started) {
+        throw "Chaos Studio did not return a scenario run for configuration '$ConfigurationName'."
+    }
+
+    $runId = $null
+    if ($started.PSObject.Properties.Name -contains 'name' -and $started.name) {
+        $runId = [string]$started.name
+    } elseif ($started.PSObject.Properties.Name -contains 'id' -and $started.id -match '/runs/([^/?]+)') {
+        $runId = $Matches[1]
+    }
+
+    if ([string]::IsNullOrWhiteSpace($runId)) {
+        throw 'A scenario run was started but Chaos Studio returned no run id, so it cannot be tracked or cancelled. Cancel it from the portal.'
+    }
+
+    return [pscustomobject]@{
+        runId    = $runId
+        response = $started
+    }
+}
+
+function Get-ChaosStudyScenarioRun {
+    <#
+    .SYNOPSIS
+        Read the current state of a scenario run.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$RunId
+    )
+
+    return Invoke-AzChaos -AllowFailure -ChaosArgs @(
+        'scenario', 'run', 'show',
+        '-n', $RunId,
+        '-g', $Plan.workspace.resourceGroup,
+        '--workspace-name', $Plan.workspace.name,
+        '--scenario-name', $Plan.scenario.name
+    )
+}
+
+function Stop-ChaosStudyScenarioRun {
+    <#
+    .SYNOPSIS
+        Cancel a scenario run, tolerating one that already finished.
+
+    .DESCRIPTION
+        Called from a finally block, so it must never throw: an exception here
+        would mask whatever caused the study to unwind in the first place.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$RunId
+    )
+
+    Invoke-AzChaos -AllowFailure -ChaosArgs @(
+        'scenario', 'run', 'cancel',
+        '-n', $RunId,
+        '-g', $Plan.workspace.resourceGroup,
+        '--workspace-name', $Plan.workspace.name,
+        '--scenario-name', $Plan.scenario.name
+    ) | Out-Null
+}
+
+function Get-ChaosScenarioRunStatus {
+    <#
+    .SYNOPSIS
+        Read the run status, whatever shape the response arrives in.
+    #>
+    param([AllowNull()][object]$Run)
+
+    if ($null -eq $Run) { return $null }
+    if ($Run.PSObject.Properties.Name -contains 'properties' -and $null -ne $Run.properties) {
+        if ($Run.properties.PSObject.Properties.Name -contains 'status') { return [string]$Run.properties.status }
+    }
+    if ($Run.PSObject.Properties.Name -contains 'status') { return [string]$Run.status }
+    return $null
+}
+
+function Test-ChaosScenarioRunTerminal {
+    <#
+    .SYNOPSIS
+        True when a run has reached a state it will not leave.
+    #>
+    param([AllowNull()][string]$Status)
+    return ($Status -in @('Succeeded', 'Failed', 'Canceled', 'Cancelled'))
+}
+
+function Get-ChaosScenarioRunObservation {
+    <#
+    .SYNOPSIS
+        Flatten a scenario run into what the report needs: which actions ran,
+        against which resources, and what went wrong.
+
+    .DESCRIPTION
+        Absent detail is recorded as null rather than as an empty success. A
+        report that cannot say what happened must say so.
+    #>
+    param([AllowNull()][object]$Run)
+
+    $observation = [ordered]@{
+        status          = Get-ChaosScenarioRunStatus -Run $Run
+        startedAt       = $null
+        completedAt     = $null
+        actions         = @()
+        errors          = @()
+        resourcesTouched = $null
+    }
+    if ($null -eq $Run) { return $observation }
+
+    $props = if ($Run.PSObject.Properties.Name -contains 'properties' -and $null -ne $Run.properties) { $Run.properties } else { $Run }
+
+    if ($props.PSObject.Properties.Name -contains 'startTime') { $observation['startedAt'] = [string]$props.startTime }
+    if ($props.PSObject.Properties.Name -contains 'endTime') { $observation['completedAt'] = [string]$props.endTime }
+
+    $resourceCount = 0
+    $sawResources = $false
+    if ($props.PSObject.Properties.Name -contains 'scenarioRunSummary') {
+        foreach ($entry in @($props.scenarioRunSummary)) {
+            if ($null -eq $entry) { continue }
+            $resources = @()
+            if ($entry.PSObject.Properties.Name -contains 'resources' -and $null -ne $entry.resources) {
+                $sawResources = $true
+                $resources = @($entry.resources | ForEach-Object { [string]$_ })
+                $resourceCount += $resources.Count
+            }
+            $observation['actions'] += [ordered]@{
+                actionUrn   = if ($entry.PSObject.Properties.Name -contains 'actionUrn') { [string]$entry.actionUrn } else { $null }
+                state       = if ($entry.PSObject.Properties.Name -contains 'state') { [string]$entry.state } else { $null }
+                startedAt   = if ($entry.PSObject.Properties.Name -contains 'startedAt') { [string]$entry.startedAt } else { $null }
+                completedAt = if ($entry.PSObject.Properties.Name -contains 'completedAt') { [string]$entry.completedAt } else { $null }
+                resources   = $resources
+            }
+        }
+    }
+    if ($sawResources) { $observation['resourcesTouched'] = $resourceCount }
+
+    if ($props.PSObject.Properties.Name -contains 'errors') {
+        foreach ($item in @($props.errors)) {
+            if ($null -eq $item) { continue }
+            $observation['errors'] += [ordered]@{
+                code    = if ($item.PSObject.Properties.Name -contains 'errorCode') { [string]$item.errorCode } else { $null }
+                message = if ($item.PSObject.Properties.Name -contains 'errorMessage') { [string]$item.errorMessage } else { [string]$item }
+            }
+        }
+    }
+
+    if ($props.PSObject.Properties.Name -contains 'executionErrors' -and $null -ne $props.executionErrors) {
+        foreach ($kind in @('permission', 'resource')) {
+            if ($props.executionErrors.PSObject.Properties.Name -notcontains $kind) { continue }
+            foreach ($item in @($props.executionErrors.$kind)) {
+                if ($null -eq $item) { continue }
+                $observation['errors'] += [ordered]@{
+                    code    = $kind
+                    message = ConvertTo-ChaosCanonicalJson -InputObject $item
+                }
+            }
+        }
+    }
+
+    return $observation
+}
+
+function Wait-ChaosScenarioRunWindow {
+    <#
+    .SYNOPSIS
+        Hold for the injection window, polling the run and returning early if
+        it reaches a terminal state.
+
+    .DESCRIPTION
+        Returning early matters: a run that failed on the first resource should
+        not be reported as "injected for ten minutes". The last observed run is
+        returned so the caller records what actually happened rather than what
+        was planned.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$RunId,
+        [Parameter(Mandatory)][int]$Minutes,
+        [int]$PollSeconds = 20,
+        [scriptblock]$OnPoll
+    )
+
+    $deadline = [datetime]::UtcNow.AddMinutes($Minutes)
+    $last = $null
+    $terminal = $false
+
+    while ([datetime]::UtcNow -lt $deadline) {
+        $last = Get-ChaosStudyScenarioRun -Plan $Plan -RunId $RunId
+        $status = Get-ChaosScenarioRunStatus -Run $last
+        if ($OnPoll) { & $OnPoll $status }
+        if (Test-ChaosScenarioRunTerminal -Status $status) { $terminal = $true; break }
+
+        $remaining = ($deadline - [datetime]::UtcNow).TotalSeconds
+        if ($remaining -le 0) { break }
+        Start-Sleep -Seconds ([Math]::Min($PollSeconds, [Math]::Ceiling($remaining)))
+    }
+
+    if (-not $terminal -and $null -eq $last) {
+        $last = Get-ChaosStudyScenarioRun -Plan $Plan -RunId $RunId
+    }
+
+    return [pscustomobject]@{
+        run              = $last
+        endedEarly       = $terminal
+        observedAt       = Get-ChaosUtcNow
+    }
 }

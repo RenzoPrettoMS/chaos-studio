@@ -135,21 +135,22 @@ function Get-ChaosScopeHash {
     .DESCRIPTION
         Two studies are comparable only if this matches. It deliberately
         excludes anything that changes run to run - times, study ids, which
-        action was chosen, fault parameters - and includes only the identity of
-        the system under test.
+        scenario or action was chosen, scenario parameters - and includes only
+        the identity of the system under test, which in V2 is the workspace and
+        the scopes it observes.
     #>
     param(
         [Parameter(Mandatory)][string]$SubscriptionId,
         [Parameter(Mandatory)][string]$ResourceGroup,
-        [Parameter(Mandatory)][string]$ResourceName,
-        [AllowNull()][AllowEmptyString()][string]$ResourceType,
+        [Parameter(Mandatory)][string]$WorkspaceName,
+        [AllowNull()][AllowEmptyCollection()][string[]]$Scope = @(),
         [AllowNull()][AllowEmptyString()][string]$Region
     )
     $identity = [ordered]@{
         subscriptionId = $SubscriptionId.ToLowerInvariant()
         resourceGroup  = $ResourceGroup.ToLowerInvariant()
-        resourceName   = $ResourceName.ToLowerInvariant()
-        resourceType   = if ($ResourceType) { $ResourceType.ToLowerInvariant() } else { $null }
+        workspaceName  = $WorkspaceName.ToLowerInvariant()
+        scopes         = @(@($Scope) | Where-Object { $_ } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Sort-Object)
         region         = if ($Region) { $Region.ToLowerInvariant() } else { $null }
     }
     return Get-ChaosDigest -InputObject $identity

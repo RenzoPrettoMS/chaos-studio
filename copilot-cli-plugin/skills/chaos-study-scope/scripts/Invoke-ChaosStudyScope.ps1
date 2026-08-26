@@ -4,58 +4,84 @@
     Turn a reliability question into a frozen, executable study plan.
 
 .DESCRIPTION
-    Scoping is the step that decides whether a study is worth running, and it
-    does that before anything is injected. Three questions in order:
+    Scoping decides whether a study is worth running, and it does that before
+    anything is injected. Four questions in order:
 
-      1. What can the platform actually do here?
-         The action list is read live from Chaos Studio for the target's
+      1. What is the lifecycle root?
+         A Chaos Studio workspace. Its scopes decide which resources exist as
+         far as this study is concerned. Reused when it is already there,
+         created only when you ask for it.
+
+      2. What did the platform actually find in that scope?
+         The workspace's discovered resources. An empty scope is a blocking
+         failure, because a run against nothing succeeds and reads like proof
+         of resilience.
+
+      3. What can the platform actually do here?
+         Scenarios and actions are read live from Chaos Studio for the scope's
          region. This suite ships no catalogue of faults and never falls back
          to one - if discovery fails, scoping stops.
 
-      2. Can the chosen action reach this resource?
-         Advertised is not the same as deliverable. The Chaos Studio target
-         and the capability behind the action are probed on the resource.
-
-      3. Would the result mean anything?
+      4. Would the result mean anything?
          A study with no numeric objective, no signal, or an action whose
          schema is unsatisfied produces a document, not evidence.
 
-    Only when all three hold is a plan written, and the plan is hashed so the
+    Only when all four hold is a plan written, and the plan is hashed so the
     consent given later provably refers to it.
 
     Nothing here injects anything.
 
 .EXAMPLE
-    ./Invoke-ChaosStudyScope.ps1 -SubscriptionId <sub> -ResourceGroup rg -ResourceName svc -ListActions
+    ./Invoke-ChaosStudyScope.ps1 -SubscriptionId <sub> -ResourceGroup rg `
+        -WorkspaceName ws -ListScenarios
 
 .EXAMPLE
     ./Invoke-ChaosStudyScope.ps1 -SubscriptionId <sub> -ResourceGroup rg `
-        -ResourceName svc -ResourceType 'Microsoft.Compute/virtualMachines' `
-        -Action 'urn:csci:microsoft:virtualMachine:shutdown/1.0.0' `
-        -SteadyState 'successRate >= 99.5' -SignalSource 'metrics:Availability'
+        -WorkspaceName ws -Scenario 'zone-down' -Action 'shutdown' `
+        -SteadyState 'successRate >= 99.5' -SignalSource 'metrics:Availability' `
+        -FilterZone 1
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Plan')]
 param(
     [Parameter(Mandatory)][string]$SubscriptionId,
+
+    # The resource group holding the Chaos Studio workspace.
     [Parameter(Mandatory)][string]$ResourceGroup,
-    [Parameter(Mandatory)][string]$ResourceName,
 
-    # The ARM type of the resource under study, e.g.
-    # 'Microsoft.Compute/virtualMachines'. Used to build the resource id and to
-    # narrow the live action list.
-    [string]$ResourceType,
+    # The workspace under which this study runs. Workspaces are the lifecycle
+    # root: scopes, discovered resources, scenarios and runs all hang off one.
+    [Parameter(Mandatory)][string]$WorkspaceName,
 
-    # Azure region. Resolved from the target resource when omitted; the actions
-    # list is region-scoped, so this has to be right.
-    [string]$Region,
+    # Create the workspace when it does not exist. Without this, a missing
+    # workspace is an error rather than an implicit provisioning action.
+    [switch]$CreateWorkspace,
 
-    # Print the actions Chaos Studio reports for this region and target type,
-    # then exit without planning.
-    [Parameter(ParameterSetName = 'List')][switch]$ListActions,
+    # ARM resource ids the workspace should observe. Required with
+    # -CreateWorkspace; ignored when the workspace already exists.
+    [string[]]$Scope = @(),
 
-    # The action to study: its name, canonical URN, or display name, as
-    # returned by -ListActions. Matched against the live list.
+    # Region for a workspace being created. Defaults to the region of the
+    # first scoped resource id when it can be resolved.
+    [string]$Location,
+
+    # Use a user-assigned managed identity instead of a system-assigned one.
+    [string]$UserAssignedIdentity,
+
+    # Print the scenarios the workspace recommends, then exit without planning.
+    [Parameter(ParameterSetName = 'ListScenarios')][switch]$ListScenarios,
+
+    # Print the actions Chaos Studio reports for the scope's region, then exit.
+    [Parameter(ParameterSetName = 'ListActions')][switch]$ListActions,
+
+    # The scenario to configure and execute: its name or id, as returned by
+    # -ListScenarios. Matched against the live list.
+    [Parameter(ParameterSetName = 'Plan', Mandatory)][string]$Scenario,
+
+    # The action this study is about: its name, canonical URN, or display name,
+    # as returned by -ListActions. Matched against the live list. The scenario
+    # is what executes; the action is what the study claims to have tested, and
+    # the readiness gates are evaluated against it.
     [Parameter(ParameterSetName = 'Plan', Mandatory)][string]$Action,
 
     # The numeric objective this study tries to break, e.g. 'successRate >= 99.5'.
@@ -65,13 +91,23 @@ param(
     [ValidateRange(0, 240)][int]$BaselineMinutes = 5,
     [ValidateRange(0, 240)][int]$RecoveryMinutes = 10,
 
-    # Action parameters, keyed by the names in the action's live schema.
+    # Scenario parameters, keyed by the names in the scenario's live parameter
+    # list. Frozen onto the plan as the {key,value} pairs the service takes.
     [hashtable]$Parameters,
 
     [string]$Hypothesis,
 
     # Signal sources: 'metrics:<name>' or 'logs:<workspaceId>#<kql>'.
     [string[]]$SignalSource = @(),
+
+    # Blast radius. These become the scenario configuration's filters and
+    # exclusions, which is the only mechanism V2 offers for bounding a run.
+    [string[]]$FilterLocation = @(),
+    [ValidateSet('1', '2', '3', 'zone-redundant')][string[]]$FilterZone = @(),
+    [string]$FilterPhysicalZone,
+    [string[]]$ExcludeResource = @(),
+    [string[]]$ExcludeType = @(),
+    [hashtable]$ExcludeTag,
 
     [string]$StudyRoot,
 
@@ -87,10 +123,10 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'ApiVersions.ps1')
 . (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Study.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'ActionDiscovery.ps1')
-. (Join-Path $PSScriptRoot 'lib' 'TargetPath.ps1')
+. (Join-Path $PSScriptRoot 'lib' 'Workspace.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'Readiness.ps1')
 
-$ChaosStudyPlanVersion = 'study-plan.v1'
+$ChaosStudyPlanVersion = 'study-plan.v2'
 
 # -- Steady state ----------------------------------------------------------
 
@@ -120,343 +156,422 @@ function ConvertFrom-ChaosSteadyState {
     }
 }
 
-# -- Resource identity -----------------------------------------------------
+function ConvertTo-ChaosScenarioParameter {
+    <#
+    .SYNOPSIS
+        Turn a parameter hashtable into the {key,value} pairs the service takes.
 
-function Get-ChaosResourceId {
-    param(
-        [Parameter(Mandatory)][string]$SubscriptionId,
-        [Parameter(Mandatory)][string]$ResourceGroup,
-        [Parameter(Mandatory)][string]$ResourceName,
-        [AllowNull()][AllowEmptyString()][string]$ResourceType
-    )
-    $base = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup"
-    if ([string]::IsNullOrWhiteSpace($ResourceType)) { return $base }
-    return "$base/providers/$($ResourceType.Trim('/'))/$ResourceName"
+    .DESCRIPTION
+        Sorted by key so that two plans built from the same intent hash the
+        same. Without that, the consent hash would drift on hashtable
+        enumeration order alone.
+    #>
+    param([AllowNull()][object]$Table)
+
+    if ($null -eq $Table) { return , @() }
+
+    $names = @()
+    if ($Table -is [System.Collections.IDictionary]) {
+        $names = @($Table.Keys | ForEach-Object { [string]$_ })
+    }
+    else {
+        $names = @($Table.PSObject.Properties | ForEach-Object { $_.Name })
+    }
+
+    $pairs = @()
+    foreach ($name in ($names | Sort-Object)) {
+        $value = if ($Table -is [System.Collections.IDictionary]) { $Table[$name] } else { $Table.$name }
+        $pairs += [ordered]@{ key = $name; value = $value }
+    }
+    return , @($pairs)
 }
 
-$resourceId = Get-ChaosResourceId -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
-    -ResourceName $ResourceName -ResourceType $ResourceType
+# -- Workspace -------------------------------------------------------------
+#
+# The workspace is the lifecycle root. Everything after this point is scoped by
+# it, so it is resolved first and its absence is fatal unless the operator
+# explicitly asked for one to be created.
+
+$workspaceId = Get-ChaosWorkspaceId -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName
+
+$workspace = $null
+$workspaceCreated = $false
+$scopedResources = @()
+$evaluation = $null
+$region = $null
+
+if ($SkipDiscovery) {
+    Write-ChaosStudyNote -Message 'Discovery skipped. The plan will record what you asked for, not what the platform confirmed, and will carry limitation L10.'
+}
+else {
+    if (-not (Test-ChaosCliAvailable)) {
+        Assert-ChaosActionDiscovery -Reason 'The az CLI (or the shared Invoke-AzChaos helper) is unavailable, so the workspace could not be resolved.' `
+            -Remediation 'Install the Azure CLI and sign in with az login, then re-run scoping.'
+    }
+
+    $resolved = Resolve-ChaosStudyWorkspace -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
+        -WorkspaceName $WorkspaceName -Scopes $Scope -Location $Location `
+        -UserAssignedIdentityId $UserAssignedIdentity -CreateWorkspace:$CreateWorkspace
+    $workspace = $resolved.workspace
+    $workspaceCreated = [bool]$resolved.created
+
+    $scopedResources = ConvertTo-ChaosList (Get-ChaosStudyScopedResource -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName)
+    $evaluation = Assert-ChaosWorkspaceEvaluation -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName
+
+    $region = Get-ChaosScopeRegion -Workspace $workspace -ScopedResources $scopedResources
+    if (-not $region) {
+        Assert-ChaosActionDiscovery -Reason 'The workspace scope spans more than one region, so there is no single region whose action inventory applies to it.' `
+            -Remediation 'Narrow the workspace scopes to one region, or pass -FilterLocation to bound the run and re-scope against that region.'
+    }
+}
 
 # -- Live discovery --------------------------------------------------------
 #
 # This block is the reason the suite has no bundled fault list. Everything the
-# plan says about the fault originates here, in a response the service produced
-# moments ago.
+# plan says about the action originates here, in a response the service
+# produced moments ago.
 
-$liveActions = @()
-$effectiveRegion = $Region
+$availableActions = @()
+$scenarios = @()
+$discoveryPerformedAt = $null
 
 if (-not $SkipDiscovery) {
-    Ensure-AzLogin | Out-Null
-
-    if ([string]::IsNullOrWhiteSpace($effectiveRegion)) {
-        if ([string]::IsNullOrWhiteSpace($ResourceType)) {
-            Assert-ChaosActionDiscovery -Reason 'No region was supplied and none could be resolved, because -ResourceType was not given so the target resource could not be read.' `
-                -Remediation 'Pass -Region <region>, or pass -ResourceType so the region can be read from the resource.'
-        }
-        $effectiveRegion = Resolve-ChaosTargetRegion -ResourceId $resourceId
-        if ([string]::IsNullOrWhiteSpace($effectiveRegion)) {
-            Assert-ChaosActionDiscovery -Reason "The region of '$resourceId' could not be read from ARM, and the action list is region-scoped." `
-                -Remediation 'Confirm the resource exists and the principal has Reader on it, or pass -Region explicitly.'
-        }
-    }
-
     try {
-        $liveActions = @(Get-ChaosAvailableAction -SubscriptionId $SubscriptionId -Region $effectiveRegion)
-    } catch {
-        Assert-ChaosActionDiscovery -Reason "Chaos Studio's action list for region '$effectiveRegion' could not be read: $($_.Exception.Message)"
+        $availableActions = ConvertTo-ChaosList (Get-ChaosAvailableAction -SubscriptionId $SubscriptionId -Region $region)
+    }
+    catch {
+        Assert-ChaosActionDiscovery -Reason "The live action list for region '$region' could not be read: $($_.Exception.Message)" `
+            -Remediation 'Confirm the subscription is registered for Microsoft.Chaos and that you can reach management.azure.com, then re-run scoping.'
     }
 
-    if ($liveActions.Count -eq 0) {
-        Assert-ChaosActionDiscovery -Reason "Chaos Studio reports no actions for region '$effectiveRegion'." `
-            -Remediation 'Confirm the subscription is onboarded to Chaos Studio and that the region is one it serves.'
+    if ($availableActions.Count -eq 0) {
+        Assert-ChaosActionDiscovery -Reason "Chaos Studio reports no actions for region '$region'." `
+            -Remediation 'Pick a region where Chaos Studio publishes actions, or move the scoped resources.'
     }
+
+    $scenarios = ConvertTo-ChaosList (Get-ChaosStudyScenario -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName)
+    $discoveryPerformedAt = Get-ChaosUtcNow
 }
 
-# -- -ListActions: show what the service says, then stop -------------------
+# -- Listing modes ---------------------------------------------------------
 
-if ($ListActions) {
+if ($ListScenarios) {
     if ($SkipDiscovery) {
-        Assert-ChaosActionDiscovery -Reason '-ListActions cannot be combined with -SkipDiscovery: the list has no offline source.' `
-            -Remediation 'Drop -SkipDiscovery and re-run.'
+        Write-ChaosStudyFailure -Title 'Nothing to list' `
+            -Message '-ListScenarios reads the workspace recommendations from the service, so it cannot be combined with -SkipDiscovery.'
+        exit (Get-ChaosStudyExitCode -Name 'Error')
     }
 
-    $candidates = @(Select-ChaosActionForTarget -Actions $liveActions -TargetType $ResourceType)
-
-    $heading = if ([string]::IsNullOrWhiteSpace($ResourceType)) {
-        "$($liveActions.Count) action(s) available in $effectiveRegion"
-    } else {
-        "$($candidates.Count) of $($liveActions.Count) action(s) in $effectiveRegion apply to $ResourceType"
+    $lines = @("Scenarios recommended for workspace '$WorkspaceName'", '')
+    if ($scenarios.Count -eq 0) {
+        $lines += 'The workspace has no scenarios yet. Run az chaos workspace refresh-recommendation, wait for the evaluation to finish, then list again.'
     }
-
-    Write-Output "## $heading"
-    Write-Output ''
-    Write-Output 'Read live from Microsoft.Chaos/locations/{region}/actions. This list is the service''s, not the plugin''s.'
-    Write-Output ''
-
-    if ($candidates.Count -eq 0) {
-        Write-Output "No action in $effectiveRegion declares support for '$ResourceType'."
-        Write-Output 'Re-run without -ResourceType to see every action the region offers.'
-        exit (Get-ChaosStudyExitCode -Name 'Success')
-    }
-
-    foreach ($candidate in ($candidates | Sort-Object -Property 'name')) {
-        Write-Output "### $($candidate.name)"
-        Write-Output ''
-        Write-Output "- URN: ``$($candidate.canonicalId)``"
-        Write-Output "- Type: $($candidate.actionType)"
-        if ($candidate.description) { Write-Output "- $($candidate.description)" }
-        Write-Output "- Target types: $(@($candidate.supportedTargetTypes | ForEach-Object { $_.targetType }) -join ', ')"
-
-        $specs = @(Get-ChaosActionParameterSpec -Schema $candidate.parametersSchema)
-        if ($specs.Count -gt 0) {
-            Write-Output '- Parameters:'
-            foreach ($spec in $specs) {
-                $flag = if ($spec.required) { 'required' } else { 'optional' }
-                $enum = if ($spec.enum.Count -gt 0) { " one of: $($spec.enum -join ', ')" } else { '' }
-                Write-Output "  - ``$($spec.name)`` ($($spec.type), $flag)$enum"
-            }
+    else {
+        foreach ($item in $scenarios) {
+            $flag = if ($item.recommendationStatus -eq 'Recommended') { 'recommended' } else { [string]$item.recommendationStatus }
+            $lines += "- $($item.name)  [$flag]"
+            if ($item.description) { $lines += "    $($item.description)" }
+            $required = @($item.parameters | Where-Object { $_.required } | ForEach-Object { $_.name })
+            if ($required.Count -gt 0) { $lines += ("    required parameters: " + ($required -join ', ')) }
         }
-        Write-Output ''
     }
+    $lines += ''
+    $lines += "Read from the workspace at $discoveryPerformedAt. Discovered resources in scope: $(@($scopedResources).Count)."
 
+    Write-ChaosStudyCard -Title 'Live scenario recommendations' -Body ($lines -join "`n")
     exit (Get-ChaosStudyExitCode -Name 'Success')
 }
 
-# -- 1. Resolve the action against the live list --------------------------
+if ($ListActions) {
+    if ($SkipDiscovery) {
+        Write-ChaosStudyFailure -Title 'Nothing to list' `
+            -Message '-ListActions reads the live action inventory from the service, so it cannot be combined with -SkipDiscovery.'
+        exit (Get-ChaosStudyExitCode -Name 'Error')
+    }
+
+    $scopeTypes = @(@($scopedResources) | ForEach-Object { [string]$_.resourceType } | Where-Object { $_ } | Select-Object -Unique)
+    $shown = $availableActions
+    if ($scopeTypes.Count -gt 0) {
+        $narrowed = @()
+        foreach ($type in $scopeTypes) {
+            $narrowed += ConvertTo-ChaosList (Select-ChaosActionForResourceType -Actions $availableActions -ResourceType $type)
+        }
+        $narrowed = @($narrowed | Sort-Object -Property name -Unique)
+        if ($narrowed.Count -gt 0) { $shown = $narrowed }
+    }
+
+    $lines = @("Actions Chaos Studio reports for region '$region'", '')
+    foreach ($item in $shown) {
+        $lines += "- $($item.name)  [$($item.actionType)]"
+        $lines += "    $([string]$item.canonicalId)"
+        if ($item.description) { $lines += "    $($item.description)" }
+    }
+    $lines += ''
+    $lines += "$($shown.Count) of $($availableActions.Count) action(s) shown, read live at $discoveryPerformedAt."
+    $lines += "Scoped resource types: $(if ($scopeTypes.Count) { $scopeTypes -join ', ' } else { 'none discovered' })."
+
+    Write-ChaosStudyCard -Title 'Live action inventory' -Body ($lines -join "`n")
+    exit (Get-ChaosStudyExitCode -Name 'Success')
+}
+
+# -- Resolve the scenario --------------------------------------------------
+
+$selectedScenario = $null
+
+if ($SkipDiscovery) {
+    $selectedScenario = [pscustomobject]@{
+        id                   = $null
+        name                 = $Scenario
+        displayName          = $Scenario
+        description          = $null
+        version              = $null
+        recommendationStatus = $null
+        parameters           = @()
+        discovered           = $false
+    }
+}
+else {
+    $found = Find-ChaosStudyScenario -Scenarios $scenarios -Name $Scenario
+    if (-not $found) {
+        $names = @($scenarios | ForEach-Object { $_.name })
+        Write-ChaosStudyFailure -Title 'Scenario not recommended for this workspace' `
+            -Message "The workspace does not offer a scenario matching '$Scenario'. It offers: $(if ($names.Count) { $names -join ', ' } else { 'nothing yet' })." `
+            -Remediation 'Run scoping with -ListScenarios, or refresh the workspace recommendations first.'
+        exit (Get-ChaosStudyExitCode -Name 'ScopeUnverified')
+    }
+    $selectedScenario = $found | Add-Member -NotePropertyName discovered -NotePropertyValue $true -PassThru
+}
+
+# -- Resolve the action ----------------------------------------------------
 
 $selectedAction = $null
 
 if ($SkipDiscovery) {
-    # Offline planning still refuses to invent metadata. The plan records the
-    # reference verbatim and carries L10 so nothing downstream mistakes it for
-    # a verified action.
     $selectedAction = [pscustomobject]@{
-        name                 = $Action
-        actionName           = $Action
-        canonicalId          = $Action
-        actionType           = $null
-        displayName          = $Action
-        description          = $null
-        version              = $null
-        parametersSchema     = $null
-        recommendedRoles     = @()
-        supportedTargetTypes = @()
-        discovered           = $false
-    }
-} else {
-    try {
-        $selectedAction = Find-ChaosAction -Actions $liveActions -Reference $Action
-    } catch {
-        Write-ChaosStudyFailure -Title 'Ambiguous action reference' -Message $_.Exception.Message `
-            -Remediation './Invoke-ChaosStudyScope.ps1 -ListActions'
-        exit (Get-ChaosStudyExitCode -Name 'Error')
-    }
-
-    if (-not $selectedAction) {
-        $names = @($liveActions | Select-Object -First 8 | ForEach-Object { $_.name }) -join ', '
-        Write-ChaosStudyFailure -Title 'Unknown action' `
-            -Message "Chaos Studio does not report an action matching '$Action' in region '$effectiveRegion'. This suite plans only what the service advertises, so there is nothing to fall back to.`n`nExamples from the live list: $names" `
-            -Remediation './Invoke-ChaosStudyScope.ps1 -ListActions'
-        exit (Get-ChaosStudyExitCode -Name 'Error')
-    }
-
-    $selectedAction | Add-Member -NotePropertyName 'discovered' -NotePropertyValue $true -Force
-}
-
-# -- 2. Parse the objective -----------------------------------------------
-
-try {
-    $predicate = ConvertFrom-ChaosSteadyState -Text $SteadyState
-} catch {
-    Write-ChaosStudyFailure -Title 'Steady state is not parseable' -Message $_.Exception.Message `
-        -Remediation "-SteadyState 'successRate >= 99.5'"
-    exit (Get-ChaosStudyExitCode -Name 'Error')
-}
-
-# -- 3. Can the action be delivered here? ---------------------------------
-
-$deliveryTargetType = $ResourceType
-if ($selectedAction.discovered -and @($selectedAction.supportedTargetTypes).Count -gt 0) {
-    $supported = @($selectedAction.supportedTargetTypes | ForEach-Object { $_.targetType })
-    if ([string]::IsNullOrWhiteSpace($deliveryTargetType) -and $supported.Count -eq 1) {
-        $deliveryTargetType = $supported[0]
+        name             = $Action
+        canonicalId      = $null
+        displayName      = $Action
+        description      = $null
+        actionType       = $null
+        version          = $null
+        parametersSchema = $null
+        recommendedRoles = @()
+        appliesTo        = @()
+        discovered       = $false
     }
 }
-
-if ($SkipDiscovery) {
-    $pathResolution = [pscustomobject]@{
-        targetType     = $deliveryTargetType
-        targetUri      = $null
-        targetVerified = $false
-        verdict        = 'unverified'
-        probes         = @(New-ChaosProbeResult -Check 'discovery-skipped' -Available $null `
-                -Detail 'Discovery was skipped, so neither the live action list nor the Chaos Studio target on this resource was verified.' `
-                -Remediation 'Re-run scoping without -SkipDiscovery before trusting this plan.')
-        blockingChecks = @()
-        unknownChecks  = @('discovery-skipped')
+else {
+    $match = Find-ChaosAction -Actions $availableActions -Reference $Action
+    if (-not $match) {
+        Write-ChaosStudyFailure -Title 'Action not available in this region' `
+            -Message "Chaos Studio reports $($availableActions.Count) action(s) for region '$region', none of which match '$Action'." `
+            -Remediation 'Run scoping with -ListActions to see what the service reports here.'
+        exit (Get-ChaosStudyExitCode -Name 'ActionDiscoveryUnavailable')
     }
-} elseif ([string]::IsNullOrWhiteSpace($deliveryTargetType)) {
-    $pathResolution = [pscustomobject]@{
-        targetType     = $null
-        targetUri      = $null
-        targetVerified = $false
-        verdict        = 'unverified'
-        probes         = @(New-ChaosProbeResult -Check 'target-type-unknown' -Available $null `
-                -Detail "Action '$($selectedAction.name)' declares more than one supported target type and none was supplied, so delivery could not be probed." `
-                -Remediation 'Pass -ResourceType to name the target type this study should use.')
-        blockingChecks = @()
-        unknownChecks  = @('target-type-unknown')
-    }
-} else {
-    $pathResolution = Resolve-ChaosDeliveryPath -Action $selectedAction -ResourceId $resourceId -TargetType $deliveryTargetType
-    Assert-ChaosDeliveryPathOpen -Resolution $pathResolution
+    $selectedAction = $match | Add-Member -NotePropertyName discovered -NotePropertyValue $true -PassThru
 }
 
-# -- 4. Would the result mean anything? -----------------------------------
+# -- Objective and blast radius --------------------------------------------
 
-if ($SkipDiscovery) {
-    $offlineGates = @(
-        Test-ChaosSteadyStatePredicate -Predicate $predicate
-        Test-ChaosInjectionWindow -InjectMinutes $DurationMinutes
-        Test-ChaosObservabilityCoverage -AvailableSources $SignalSource -SteadyState $predicate
-    )
-    $offlineBlocking = @($offlineGates | Where-Object { $_.severity -eq 'blocking' -and $_.status -eq 'fail' })
-    $offlineLimitations = @($offlineGates | Where-Object { $_.status -ne 'pass' -and $_.limitationCode } | ForEach-Object { $_.limitationCode })
-    $readiness = [pscustomobject]@{
-        gates            = $offlineGates
-        ready            = ($offlineBlocking.Count -eq 0)
-        blockingFailures = $offlineBlocking
-        limitationCodes  = @(@($offlineLimitations + @('L10')) | Select-Object -Unique)
-    }
-} else {
-    $readiness = Invoke-ChaosReadinessGates -Action $selectedAction -TargetType $deliveryTargetType `
-        -Parameters $Parameters -SteadyState $predicate `
-        -InjectMinutes $DurationMinutes -AvailableSources $SignalSource
+$predicate = ConvertFrom-ChaosSteadyState -Text $SteadyState
+
+$blastRadius = New-ChaosBlastRadius -Location $FilterLocation -Zone $FilterZone -PhysicalZone $FilterPhysicalZone `
+    -ExcludeResource $ExcludeResource -ExcludeType $ExcludeType -ExcludeTag $ExcludeTag
+
+$projected = ConvertTo-ChaosList (Resolve-ChaosBlastRadiusResource -ScopedResources $scopedResources -BlastRadius $blastRadius)
+
+# -- Readiness -------------------------------------------------------------
+
+$scopeTypesForGates = @(@($projected) | ForEach-Object { [string]$_.resourceType } | Where-Object { $_ } | Select-Object -Unique)
+
+$readiness = Invoke-ChaosReadinessGates -Action $selectedAction `
+    -ScopedResourceTypes $scopeTypesForGates `
+    -ScopedResources $projected `
+    -Parameters $Parameters `
+    -SteadyState $predicate `
+    -InjectMinutes $DurationMinutes `
+    -AvailableSources $SignalSource `
+    -DiscoverySkipped:$SkipDiscovery
+
+$limitationCodes = @($readiness.limitationCodes)
+if ($SkipDiscovery -and $limitationCodes -notcontains 'L10') { $limitationCodes += 'L10' }
+
+foreach ($gate in $readiness.gates) {
+    $marker = switch ($gate.status) { 'pass' { 'ok' } 'fail' { 'FAIL' } default { '??' } }
+    Write-ChaosStudyNote -Message "[$marker] $($gate.title)$(if ($gate.status -ne 'pass') { " - $($gate.detail)" })"
 }
+
 Assert-ChaosReadiness -Readiness $readiness
 
-# -- 5. Freeze the plan ---------------------------------------------------
+# -- Freeze the plan -------------------------------------------------------
+#
+# Everything above this line is discovery. Everything below is a commitment.
+# frozenConfigHash is computed last, over every field that precedes it, so the
+# consent captured at run time provably refers to this exact configuration.
+
+$effectiveScopes = if ($workspace) { @($workspace.scopes) } else { @($Scope) }
 
 $scopeHash = Get-ChaosScopeHash -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
-    -ResourceName $ResourceName -ResourceType $ResourceType -Region $effectiveRegion
-
-$actionParameters = if ($Parameters) { $Parameters } else { [ordered]@{} }
-
-$requiredPermissions = @()
-foreach ($entry in @($selectedAction.supportedTargetTypes)) {
-    if ($entry.targetType -eq $deliveryTargetType) { $requiredPermissions = @($entry.requiredPermissions) }
-}
-
-$defaultHypothesis = "Injecting $($selectedAction.displayName) does not breach the steady-state objective, and the system returns to steady state within the recovery window."
+    -WorkspaceName $WorkspaceName -Scope $effectiveScopes -Region $region
 
 $plan = [ordered]@{
     planVersion = $ChaosStudyPlanVersion
     createdAt   = Get-ChaosUtcNow
     scopeHash   = $scopeHash
+
     question    = [ordered]@{
-        hypothesis  = if ($Hypothesis) { $Hypothesis } else { $defaultHypothesis }
+        hypothesis  = if ($Hypothesis) { $Hypothesis } else { "The system holds $($predicate.raw) while '$($selectedAction.name)' is injected." }
         steadyState = $predicate
     }
-    target      = [ordered]@{
-        subscriptionId = $SubscriptionId
-        resourceGroup  = $ResourceGroup
-        resourceName   = $ResourceName
-        resourceId     = $resourceId
-        resourceType   = $ResourceType
-        region         = $effectiveRegion
+
+    workspace   = [ordered]@{
+        subscriptionId      = $SubscriptionId
+        resourceGroup       = $ResourceGroup
+        name                = $WorkspaceName
+        id                  = $workspaceId
+        location            = if ($workspace) { $workspace.location } else { $Location }
+        provisioningState   = if ($workspace) { $workspace.provisioningState } else { $null }
+        identityType        = if ($workspace) { $workspace.identityType } else { $null }
+        identityPrincipalId = if ($workspace) { $workspace.principalId } else { $null }
+        scopes              = @($effectiveScopes)
+        createdByThisStudy  = $workspaceCreated
     }
-    fault       = [ordered]@{
+
+    scope       = [ordered]@{
+        region                 = $region
+        # A skipped discovery means the counts are unknown, not zero. Recording 0
+        # would let the consent card, the report and the readiness gates all claim
+        # a verified-empty scope that nobody ever verified.
+        discoveredResourceCount = $(if ($SkipDiscovery) { $null } else { @($scopedResources).Count })
+        resourceTypes          = @(@($scopedResources) | ForEach-Object { [string]$_.resourceType } | Where-Object { $_ } | Select-Object -Unique)
+        resources              = @($scopedResources)
+        blastRadius            = [ordered]@{
+            filters    = $blastRadius.filters
+            exclusions = $blastRadius.exclusions
+        }
+        projectedResourceCount = $(if ($SkipDiscovery) { $null } else { @($projected).Count })
+        projectedResources     = @(@($projected) | ForEach-Object { [string]$_.resourceId })
+    }
+
+    scenario    = [ordered]@{
+        source               = if ($selectedScenario.discovered) { 'live-recommendation' } else { 'unverified-offline' }
+        id                   = $selectedScenario.id
+        name                 = $selectedScenario.name
+        displayName          = $selectedScenario.displayName
+        description          = $selectedScenario.description
+        version              = $selectedScenario.version
+        recommendationStatus = $selectedScenario.recommendationStatus
+        parameterSpec        = @($selectedScenario.parameters)
+        parameters           = ConvertTo-ChaosList (ConvertTo-ChaosScenarioParameter -Table $Parameters)
+    }
+
+    action      = [ordered]@{
         # Every field below came from the service's own action record.
-        source              = if ($selectedAction.discovered) { 'live-discovery' } else { 'unverified-offline' }
-        action              = $selectedAction.name
-        faultUrn            = $selectedAction.canonicalId
-        displayName         = $selectedAction.displayName
-        description         = $selectedAction.description
-        actionType          = $selectedAction.actionType
-        version             = $selectedAction.version
-        targetType          = $deliveryTargetType
-        parameters          = $actionParameters
-        parametersSchema    = $selectedAction.parametersSchema
-        requiredPermissions = $requiredPermissions
-        recommendedRoles    = @($selectedAction.recommendedRoles)
+        source           = if ($selectedAction.discovered) { 'live-discovery' } else { 'unverified-offline' }
+        name             = $selectedAction.name
+        canonicalId      = $selectedAction.canonicalId
+        displayName      = $selectedAction.displayName
+        description      = $selectedAction.description
+        actionType       = $selectedAction.actionType
+        version          = $selectedAction.version
+        appliesTo        = @($selectedAction.appliesTo)
+        recommendedRoles = @($selectedAction.recommendedRoles)
+        parametersSchema = $selectedAction.parametersSchema
     }
+
     windows     = [ordered]@{
         baselineMinutes = $BaselineMinutes
         injectMinutes   = $DurationMinutes
         recoveryMinutes = $RecoveryMinutes
-        interval        = 'half-open [start, end)'
+        interval        = 60
     }
+
     safety      = [ordered]@{
         reversible      = ($selectedAction.actionType -and $selectedAction.actionType -ine 'Discrete')
-        abortConditions = @(
-            'The steady-state signal degrades further than the study was authorised to accept.'
-            'An unrelated incident opens during the window.'
-        )
         requiresConsent = $true
+        abortConditions = @(
+            "Steady state $($predicate.raw) is breached beyond the recovery window."
+            'Any signal source stops reporting for longer than two intervals.'
+        )
     }
+
     signals     = [ordered]@{
         configuredSources = @($SignalSource)
     }
+
     readiness   = [ordered]@{
-        gates           = $readiness.gates
-        deliveryPath    = $pathResolution
-        limitationCodes = @(@($readiness.limitationCodes) + $(if ($pathResolution.verdict -eq 'unverified') { @('L10') } else { @() }) | Select-Object -Unique)
+        gates           = @($readiness.gates)
+        limitationCodes = @($limitationCodes)
     }
+
     discovery   = [ordered]@{
-        region       = $effectiveRegion
-        endpoint     = "/subscriptions/$SubscriptionId/providers/Microsoft.Chaos/locations/$effectiveRegion/actions"
-        apiVersion   = Get-ChaosApiVersion -Name 'chaosActions'
-        actionsFound = $liveActions.Count
-        performedAt  = if ($SkipDiscovery) { $null } else { Get-ChaosUtcNow }
+        region                  = $region
+        endpoint                = if ($region) { "Microsoft.Chaos/locations/$region/actions" } else { $null }
+        apiVersion              = Get-ChaosApiVersion -Name 'chaosActions'
+        actionsFound            = $availableActions.Count
+        scenariosFound          = @($scenarios).Count
+        discoveredResourceCount = $(if ($SkipDiscovery) { $null } else { @($scopedResources).Count })
+        workspaceEvaluation     = $evaluation
+        performedAt             = $discoveryPerformedAt
     }
 }
 
-# The hash covers everything above it. Anything edited afterwards invalidates
-# the consent that will be given against it.
 $plan['frozenConfigHash'] = Get-ChaosDigest -InputObject $plan
 
-# -- 6. Persist -----------------------------------------------------------
+# -- Persist ---------------------------------------------------------------
 
 $study = New-ChaosStudy -ScopeHash $scopeHash -StudyRoot $StudyRoot
 Save-ChaosStudyArtifact -StudyPath $study.path -RelativePath 'study-plan.v1.json' -Content $plan | Out-Null
-Add-ChaosCommandTrailEntry -StudyPath $study.path -Phase 'scope' `
-    -Command 'Invoke-ChaosStudyScope.ps1' `
-    -Arguments ([ordered]@{ action = $selectedAction.name; region = $effectiveRegion; skipDiscovery = [bool]$SkipDiscovery }) `
+
+Add-ChaosCommandTrailEntry -StudyPath $study.path -Command 'chaos-study-scope' `
+    -Arguments ([ordered]@{
+        workspace     = $WorkspaceName
+        scenario      = $selectedScenario.name
+        action        = $selectedAction.name
+        region        = $region
+        skipDiscovery = [bool]$SkipDiscovery
+    }) `
     -ExitCode 0 -Note "Plan frozen at $($plan['frozenConfigHash'])" | Out-Null
 
-# -- 7. Report to the operator --------------------------------------------
+# -- Report ----------------------------------------------------------------
 
-$advisories = @($readiness.gates | Where-Object { $_.status -ne 'pass' })
-$actionTypeText = if ($selectedAction.actionType) { $selectedAction.actionType } else { 'unknown type' }
 $planPath = Resolve-ChaosStudyPath -StudyRoot $study.studyRoot -ScopeHash $scopeHash -StudyId $study.studyId -Artifact 'plan'
+$actionTypeText = if ($selectedAction.actionType) { $selectedAction.actionType } else { 'unknown type' }
+$regionText = if ([string]::IsNullOrWhiteSpace($region)) { 'region not resolved' } else { $region }
+$urnText = if ([string]::IsNullOrWhiteSpace($selectedAction.canonicalId)) { 'not resolved (discovery skipped)' } else { $selectedAction.canonicalId }
+$resourceText = if ($SkipDiscovery) { 'not resolved (discovery skipped)' } else { "$(@($projected).Count) of $(@($scopedResources).Count) discovered resource(s) after filters" }
 
 $summary = @(
-    "Study      $($study.studyId)"
-    "Scope      $scopeHash"
-    "Action     $($selectedAction.displayName)  [$actionTypeText]"
-    "URN        $($selectedAction.canonicalId)"
-    "Target     $ResourceName ($(if ($deliveryTargetType) { $deliveryTargetType } else { 'target type not resolved' })) in $effectiveRegion"
-    "Objective  $($predicate.raw)"
-    "Windows    $BaselineMinutes m baseline, $DurationMinutes m inject, $RecoveryMinutes m recovery"
-    "Frozen at  $($plan['frozenConfigHash'])"
-    "Plan       $planPath"
+    "Study       $($study.studyId)"
+    "Scope       $scopeHash"
+    "Workspace   $WorkspaceName ($ResourceGroup) in $regionText"
+    "Resources   $resourceText"
+    "Scenario    $($selectedScenario.name)"
+    "Action      $($selectedAction.displayName)  [$actionTypeText]"
+    "URN         $urnText"
+    "Objective   $($predicate.raw)"
+    "Windows     $BaselineMinutes m baseline, $DurationMinutes m inject, $RecoveryMinutes m recovery"
+    "Frozen at   $($plan['frozenConfigHash'])"
+    "Plan        $planPath"
 ) -join "`n"
 
-if (Get-Command Write-Card -ErrorAction SilentlyContinue) {
-    Write-Card -Title 'Study planned - nothing has been injected' -Body $summary
-} else {
-    Write-Output '## Study planned - nothing has been injected'
-    Write-Output ''
-    Write-Output $summary
-}
+Write-ChaosStudyCard -Title 'Study planned - nothing has been injected' -Body $summary
 
+$advisories = @($readiness.gates | Where-Object { $_.status -ne 'pass' })
 if ($advisories.Count -gt 0) {
     Write-Output ''
     Write-Output '### Caveats carried into this study'
-    foreach ($gate in $advisories) {
-        Write-Output "- **$($gate.title)** ($($gate.status)): $($gate.detail)"
+    foreach ($advisory in $advisories) {
+        Write-Output "- **$($advisory.title)** ($($advisory.status)): $($advisory.detail)"
     }
+}
+
+if ($limitationCodes.Count -gt 0) {
+    Write-ChaosStudyNote -Message ('The report will carry limitations: ' + ($limitationCodes -join ', ') + '.')
+}
+
+if (@($SignalSource).Count -eq 0) {
+    Write-ChaosStudyNote -Message 'No signal source configured. This study can only show that the control plane accepted the scenario run, never that the fault reached the workload.' -Level 'warn'
 }
 
 Write-Output ''

@@ -28,8 +28,9 @@ function ConvertFrom-ChaosSignalSourceSpec {
 
     .DESCRIPTION
         Accepted forms:
-          metrics:<name>             Azure Monitor metric on the target resource
-          metrics:<name>@<resourceId>   ... on a different resource
+          metrics:<name>             Azure Monitor metric on the single scoped
+                                     resource, when the scope holds exactly one
+          metrics:<name>@<resourceId>   ... on a named resource
           metrics:<name>|<aggregation> ... with an explicit aggregation
           logs:<workspaceId>#<kql>   Log Analytics query
 
@@ -97,15 +98,23 @@ function Get-ChaosMetricSignal {
     #>
     param(
         [Parameter(Mandatory)][object]$Spec,
-        [Parameter(Mandatory)][string]$ResourceId,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ResourceId,
         [Parameter(Mandatory)][object]$Window
     )
 
     $windowName = $Window.name
-    $target = if ($Spec.resourceId) { $Spec.resourceId } else { $ResourceId }
+    $metricTarget = if ($Spec.resourceId) { $Spec.resourceId } else { $ResourceId }
+    if ([string]::IsNullOrWhiteSpace($metricTarget)) {
+        # A V2 study can span many scoped resources, so there is no single
+        # implied resource to charge a metric against. Rather than silently
+        # picking one and reporting its numbers as if they described the whole
+        # scope, say so and let the operator pin the resource explicitly.
+        return New-ChaosSignalResult -Source $Spec.id -Window $windowName `
+            -Caveat "No resource could be resolved for metric '$($Spec.metricName)'. Pin one with 'metrics:$($Spec.metricName)@<resourceId>' - a study over several scoped resources has no single implied resource."
+    }
     $timespan = "$(ConvertTo-ChaosUtcIso -Instant $Window.start)/$(ConvertTo-ChaosUtcIso -Instant $Window.end)"
     $query = [ordered]@{
-        resourceId  = $target
+        resourceId  = $metricTarget
         metric      = $Spec.metricName
         aggregation = $Spec.aggregation
         timespan    = $timespan
@@ -117,7 +126,7 @@ function Get-ChaosMetricSignal {
             -Caveat 'The shared Invoke-AzRest helper is unavailable, so Azure Monitor could not be queried.'
     }
 
-    $uri = "$target/providers/Microsoft.Insights/metrics?timespan=$timespan&interval=PT1M&metricnames=$($Spec.metricName)&aggregation=$($Spec.aggregation)"
+    $uri = "$metricTarget/providers/Microsoft.Insights/metrics?timespan=$timespan&interval=PT1M&metricnames=$($Spec.metricName)&aggregation=$($Spec.aggregation)"
     try {
         $response = Invoke-AzRest -Method GET -Uri $uri -ApiVersion (Get-ChaosApiVersion -Name 'metrics')
     } catch {
@@ -270,6 +279,12 @@ function Invoke-ChaosSignalCollection {
             -Caveat 'No signal sources were configured, so this window has no measurement of any kind.'
     }
 
+    # A study can span many scoped resources. Only an unambiguous scope - exactly
+    # one resource - implies a metric target; anything else must be pinned per
+    # signal, so a number is never attributed to the wrong resource.
+    $scopedResources = @($Plan.scope.projectedResources | Where-Object { $_ -and $_.resourceId })
+    $implicitResourceId = if ($scopedResources.Count -eq 1) { [string]$scopedResources[0].resourceId } else { $null }
+
     foreach ($spec in $specs) {
         if ($DryRun) {
             $results += New-ChaosSignalResult -Source $spec.id -Window $Window.name `
@@ -279,7 +294,7 @@ function Invoke-ChaosSignalCollection {
 
         switch ($spec.kind) {
             'metrics' {
-                $results += Get-ChaosMetricSignal -Spec $spec -ResourceId $Plan.target.resourceId -Window $Window
+                $results += Get-ChaosMetricSignal -Spec $spec -ResourceId $implicitResourceId -Window $Window
             }
             'logs' {
                 $results += Get-ChaosLogSignal -Spec $spec -Window $Window

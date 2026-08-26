@@ -11,10 +11,11 @@
 
     Two rules do most of the work.
 
-    A control-plane success is not proof. Chaos Studio reporting an experiment
-    as Succeeded means the fault was accepted, not that it reached the data
-    plane. Only a data-plane signal that actually moved can set mechanismProven,
-    and without it the verdict is Inconclusive rather than a pass.
+    A control-plane success is not proof. Chaos Studio reporting a scenario run
+    as Succeeded means the action was accepted and dispatched, not that it
+    reached the data plane. Only a data-plane signal that actually moved can set
+    mechanismProven, and without it the verdict is Inconclusive rather than a
+    pass.
 
     A gap is not a zero. A signal that could not be read is null with a caveat,
     and it lowers confidence instead of quietly becoming a healthy number.
@@ -23,15 +24,15 @@
 Set-StrictMode -Version Latest
 
 $script:ChaosLimitationText = [ordered]@{
-    L1 = 'Scope - this study covers one fault, one target and one window'
+    L1 = 'Scope - this study covers one action, one workspace scope and one window'
     L2 = 'Observability coverage - at least one signal source was unavailable'
-    L3 = 'Mechanism unproven - the control plane accepted the fault but no data-plane signal confirmed it landed'
+    L3 = 'Mechanism unproven - the control plane accepted the action but no data-plane signal confirmed it landed'
     L4 = 'Sampling resolution - metric granularity is coarser than the injection window'
     L5 = 'Environment - conditions were not representative of production load'
     L6 = 'Concurrency - other activity during the window could confound the result'
     L7 = 'Duration - the window may be too short to observe slow failure modes'
     L8 = 'Aborted - the run stopped before the planned window completed'
-    L9 = 'Configuration drift - the target changed between planning and execution'
+    L9 = 'Configuration drift - the scope changed between planning and execution'
     L10 = 'Discovery unverified - action metadata was not confirmed against the live Chaos Studio action list'
 }
 
@@ -192,13 +193,23 @@ function Get-ChaosFindingKey {
     .SYNOPSIS
         A stable identity for a finding, so the same issue matches across runs
         even when its wording changes.
+
+    .DESCRIPTION
+        The action URN is the preferred identity because it is what the service
+        itself calls the action. It is not always available - a plan scoped with
+        discovery skipped never learned it - so the key falls back to whatever
+        identity the plan does carry rather than refusing to build a key at all.
+        An unidentifiable action still gets a deterministic key, so findings
+        remain comparable within a study even when they cannot be matched to
+        another study's action.
     #>
     param(
-        [Parameter(Mandatory)][string]$FaultUrn,
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$ActionUrn,
         [Parameter(Mandatory)][string]$Signal,
         [Parameter(Mandatory)][string]$Predicate
     )
-    return Get-ChaosDigest -InputObject @($FaultUrn, $Signal, $Predicate)
+    $identity = if ([string]::IsNullOrWhiteSpace($ActionUrn)) { 'action-unidentified' } else { $ActionUrn }
+    return Get-ChaosDigest -InputObject @($identity, $Signal, $Predicate)
 }
 
 function Get-ChaosVerdict {
@@ -275,7 +286,11 @@ function Build-StudyFindings {
     $findings = @()
     $limitations = @('L1')
 
-    $predicateKey = Get-ChaosFindingKey -FaultUrn $Plan.fault.faultUrn -Signal $signalName -Predicate $predicate.raw
+    # Prefer the URN the service assigned; fall back to the plan's action name so
+    # a discovery-skipped study still produces stable, comparable finding keys.
+    $actionIdentity = if ([string]::IsNullOrWhiteSpace($Plan.action.canonicalId)) { [string]$Plan.action.name } else { [string]$Plan.action.canonicalId }
+
+    $predicateKey = Get-ChaosFindingKey -ActionUrn $actionIdentity -Signal $signalName -Predicate $predicate.raw
 
     if ($predicateDuring -eq $false) {
         # Severity is a function of recovery, not of how bad it looked at peak.
@@ -295,7 +310,7 @@ function Build-StudyFindings {
                 [ordered]@{ signal = $signalName; window = 'post'; kind = 'predicate' }
             ) `
             -Remediation @(
-                "Bound the blast radius of this failure mode for $($Plan.target.resourceName) - add redundancy, spread the workload across zones, or add a circuit breaker on the dependency the fault interrupted."
+                "Bound the blast radius of this failure mode across the $($Plan.scope.projectedResourceCount) resource(s) in scope - add redundancy, spread the workload across zones, or add a circuit breaker on the dependency the action interrupted."
                 'Add an alert on this predicate so the same degradation is detected without a chaos study.'
             )
     } elseif ($null -eq $predicateDuring) {
@@ -314,15 +329,15 @@ function Build-StudyFindings {
     if (-not $mechanismProven) {
         $limitations += 'L3'
         $evidenceRef = @([ordered]@{ signal = 'all-sources'; window = 'during'; kind = 'mechanism' })
-        $findings += New-ChaosFinding -Key (Get-ChaosFindingKey -FaultUrn $Plan.fault.faultUrn -Signal 'mechanism' -Predicate 'impact-proof') `
-            -Title 'Fault injection was not proven to reach the system' `
+        $findings += New-ChaosFinding -Key (Get-ChaosFindingKey -ActionUrn $actionIdentity -Signal 'mechanism' -Predicate 'impact-proof') `
+            -Title 'Injection was not proven to reach the system' `
             -Severity 'low' -Confidence $(if ($null -eq $delta.moved) { 'low' } else { 'medium' }) `
             -Observation $delta.detail `
-            -Interpretation 'Chaos Studio reporting success means the fault was accepted by the control plane. Without a signal that moved, a clean result may mean the service is resilient - or that nothing was ever injected. These are not the same, and this study cannot tell them apart.' `
+            -Interpretation 'Chaos Studio reporting a successful scenario run means the control plane accepted and dispatched the action. Without a signal that moved, a clean result may mean the service is resilient - or that nothing was ever injected. These are not the same, and this study cannot tell them apart.' `
             -Evidence $evidenceRef `
             -Remediation @(
-                'Add a signal that would be expected to move under this action, so a clean result can be distinguished from a fault that never landed.'
-                "Confirm the Chaos Studio target and capability for $($Plan.fault.faultUrn) are still enabled on the resource, then repeat the study."
+                'Add a signal that would be expected to move under this action, so a clean result can be distinguished from an injection that never landed.'
+                "Confirm '$($Plan.action.canonicalId)' is still offered for the resource types in this workspace scope, then repeat the study."
                 'Widen the blast radius within the bounds the action allows, so the effect is large enough to observe.'
             )
     }
@@ -330,7 +345,7 @@ function Build-StudyFindings {
     $missing = @(@($pre + $during + $post) | Where-Object { $null -eq $_.values })
     if ($missing.Count -gt 0 -and $limitations -notcontains 'L2') { $limitations += 'L2' }
     if ([int]$Plan.windows.injectMinutes -le 3) { $limitations += 'L7' }
-    if ($RunRecord.experiment.outcome -in @('Failed', 'Cancelled')) { $limitations += 'L8' }
+    if ($RunRecord.scenarioRun.outcome -in @('Failed', 'Cancelled')) { $limitations += 'L8' }
     if ($RunRecord.planHash -ne $Plan.frozenConfigHash) { $limitations += 'L9' }
     foreach ($code in @($Plan.readiness.limitationCodes)) {
         if ($code -and $limitations -notcontains $code) { $limitations += $code }

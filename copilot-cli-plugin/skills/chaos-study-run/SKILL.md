@@ -1,18 +1,19 @@
 ---
 name: chaos-study-run
-description: "Execute a frozen Chaos study plan against Azure: verify plan integrity, require an explicit typed consent phrase, collect baseline evidence, inject the fault, collect during and post-recovery evidence, and always clean up the experiment. Dry-run by default."
+description: "Execute a frozen Chaos study plan against Azure using Chaos Studio V2: verify plan integrity, create and validate a scenario configuration, require an explicit typed consent phrase, collect baseline evidence, execute the scenario run, collect during and post-recovery evidence, and always clean up the configuration. Dry-run by default."
 ---
 
 # chaos-study-run — the only phase that changes production
 
-Everything before this is analysis. This skill injects a real fault into a real
-Azure resource, so it is deliberately the most conservative script in the suite.
+Everything before this is analysis. This skill executes a real Chaos Studio
+scenario against real Azure resources, so it is deliberately the most
+conservative script in the suite.
 
 ## Principles
 
 **Dry run is the default.** `-DryRun` defaults to `$true`. A dry run walks the
-entire sequence — plan verification, consent rendering, the exact request body —
-and injects nothing. Read it before arming anything.
+entire sequence — plan verification, the configuration it would create, the
+consent phrase — and executes nothing. Read it before arming anything.
 
 **Consent is typed, not flagged.** Arming requires `-DryRun:$false` **and**
 `-Consent` matching the phrase the plan prints, exactly. A wrong phrase exits
@@ -20,10 +21,15 @@ and injects nothing. Read it before arming anything.
 variable that pre-approves it.
 
 **The plan is verified, not trusted.** The plan hash is recomputed before
-injection. Any drift since scoping exits `12`. If the blast radius changed after
-you approved it, this refuses rather than injecting something you did not review.
+execution. Any drift since scoping exits `12`. If the blast radius changed after
+you approved it, this refuses rather than running something you did not review.
 
-**Evidence is collected around the fault, not just during it.** Baseline, during,
+**Validation is a gate, not advice.** The scenario configuration is validated
+and the run is refused unless the service reports `Succeeded`. A configuration
+that only *probably* works is not executed. Permission gaps can be repaired with
+`-FixPermissions`, which previews the grants with `--what-if` first.
+
+**Evidence is collected around the run, not just during it.** Baseline, during,
 and post windows are all collected. Without baseline there is no "normal" to
 compare to; without post there is no way to tell degradation from damage.
 
@@ -31,16 +37,17 @@ compare to; without post there is no way to tell degradation from damage.
 reason. Nothing is interpolated, averaged, or inferred to fill a gap — the report
 would rather say *not measured* than mislead.
 
-**Cleanup is unconditional.** The experiment is deleted in a `finally` block, so
-a crash, a Ctrl-C, or a failed collection still tears the fault down. Use
-`-KeepExperiment` only when you intend to inspect it afterwards.
+**Cleanup is unconditional.** The scenario configuration is deleted in a
+`finally` block, so a crash, a Ctrl-C, or a failed collection still tears it
+down. A run still in flight is cancelled. Use `-KeepConfiguration` only when you
+intend to inspect it afterwards.
 
 **Sealed studies are immutable.** Re-running a sealed study exits `13`. Re-test
 by scoping a new one, so history stays comparable.
 
 ## Usage
 
-**Preview** (this is the default, and injects nothing):
+**Preview** (this is the default, and executes nothing):
 
 ```powershell
 ./scripts/Invoke-ChaosStudyRun.ps1 -StudyId latest
@@ -56,34 +63,40 @@ by scoping a new one, so history stays comparable.
 Switches worth knowing:
 
 - `-SignalSource` — add evidence sources beyond the plan's (`metrics:` / `logs:`)
-- `-Location` — where the experiment resource is created; defaults to the
-  target's region as recorded in the plan
-- `-PollSeconds` — experiment status poll interval
-- `-KeepExperiment` — leave the experiment for inspection (it stays stopped)
+- `-FixPermissions` — grant the workspace identity what validation says is
+  missing, after printing the `--what-if` preview
+- `-PollSeconds` — scenario run status poll interval
+- `-KeepConfiguration` — leave the configuration for inspection
 
 ## What actually happens
 
 1. Load the plan and re-verify its hash
-2. Re-verify the delivery path is still open — target onboarded, capability enabled
-3. Render the consent phrase and require it back verbatim
-4. Collect the **baseline** window
-5. Create and start the experiment; poll until it completes
-6. Collect the **during** window while the fault is live
-7. Wait out recovery, then collect the **post** window
-8. Delete the experiment (always), write `run-record.v1.json` and evidence
+2. Create the scenario configuration on the workspace, carrying the plan's
+   frozen parameters, filters and exclusions
+3. Validate it, and refuse to continue unless the service says `Succeeded`
+4. Render the consent phrase and require it back verbatim
+5. Collect the **baseline** window
+6. Execute the configuration; poll the scenario run until it reaches a terminal
+   state or the injection window closes
+7. Collect the **during** window while the run is live
+8. Wait out recovery, then collect the **post** window
+9. Cancel any in-flight run and delete the configuration (always), then write
+   `run-record.v1.json` and evidence
 
-The experiment body is built from the action metadata the plan captured live at
-scope time: the canonical URN, the parameters that satisfied the service's own
-schema, and the action type. A `Discrete` action is emitted as a discrete branch
-with no duration; everything else runs for the planned injection window.
+The configuration is built from what the plan captured live at scope time: the
+scenario, its parameters as the `{key,value}` pairs the service takes, and the
+blast radius as `filters` and `exclusions`. An empty blast-radius member is
+omitted rather than sent — `{"locations":[]}` means *no locations*, which would
+silently turn a real study into a no-op that still reports success.
 
 ## Implementation note
 
-Injection uses the `Microsoft.Chaos/experiments` resource surface via ARM, not
-the `az chaos` extension. The extension targets the newer workspace/scenario
-model; experiments are the surface that supports the direct fault injection this
-study method needs. Api-versions are pinned centrally so a service-side default
-change cannot silently alter behaviour.
+Execution uses Chaos Studio **V2** exclusively: workspaces are the lifecycle
+root, resource selection comes from workspace scopes and the resources the
+service discovered inside them, and the run is a scenario run against a
+validated scenario configuration. There is no V1 path and no fallback to one.
+Api-versions are pinned centrally so a service-side default change cannot
+silently alter behaviour.
 
 ## Exit codes
 
@@ -94,7 +107,7 @@ change cannot silently alter behaviour.
 | `11` | Consent declined or phrase mismatch |
 | `12` | Plan changed after it was frozen |
 | `13` | Study already sealed |
-| `14` | Delivery path no longer available |
+| `17` | Scenario configuration failed validation |
 
 ## If it fails partway
 

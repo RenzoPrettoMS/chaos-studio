@@ -155,7 +155,7 @@ function New-ChaosStudyReportHtml {
 
     $template = [System.IO.File]::ReadAllText((Get-ChaosReportTemplatePath))
     $visual = Get-ChaosVerdictVisual -Verdict $Findings.verdict
-    $target = [string]$Plan.target.resourceName
+    $systemUnderStudy = [string]$Plan.workspace.name
 
     $verdictDetail = switch ($Findings.verdict) {
         'Steady state held'      { "$($Plan.question.steadyState.raw) held throughout injection and recovery." }
@@ -164,9 +164,14 @@ function New-ChaosStudyReportHtml {
         default                  { 'This study cannot support a pass or a fail. Read the limitations before drawing a conclusion.' }
     }
 
+    # A discovery-skipped study has no verified count. Leaving it blank would put
+    # an empty cell in the delivered report; say plainly that it is unknown.
+    $scopedCountText = if ($null -eq $Plan.scope.projectedResourceCount) { 'not resolved (discovery skipped)' } else { [string]$Plan.scope.projectedResourceCount }
+
     $headerFacts = @(
-        New-ChaosReportRow -Label 'Target' -Value $target
-        New-ChaosReportRow -Label 'Action' -Value ([string]$Plan.fault.displayName)
+        New-ChaosReportRow -Label 'Workspace' -Value $systemUnderStudy
+        New-ChaosReportRow -Label 'Scoped resources' -Value $scopedCountText
+        New-ChaosReportRow -Label 'Action' -Value ([string]$Plan.action.displayName)
         New-ChaosReportRow -Label 'Steady state' -Value ([string]$Plan.question.steadyState.raw)
         New-ChaosReportRow -Label 'Injection window' -Value "$($Plan.windows.injectMinutes) minutes"
         New-ChaosReportRow -Label 'Run started' -Value ([string]$RunRecord.startedAt)
@@ -174,9 +179,9 @@ function New-ChaosStudyReportHtml {
     ) -join "`n"
 
     $mechanismSentence = if ($Findings.mechanismProven) {
-        'The fault was proven to reach the system: measured signals moved during injection.'
+        'The action was proven to reach the system: measured signals moved during injection.'
     } else {
-        'The fault was not proven to reach the system, so a clean result cannot be read as resilience.'
+        'The action was not proven to reach the system, so a clean result cannot be read as resilience.'
     }
 
     $summary = @"
@@ -189,16 +194,14 @@ $(ConvertTo-ChaosHtmlText -Text $mechanismSentence)</p>
 )</p>
 "@
 
+    # V2 scenario parameters arrive as an array of {key, value} pairs, which is
+    # the shape `az chaos scenario config create --parameters` accepts.
     $parameterRows = @()
-    $paramNames = if ($null -eq $Plan.fault.parameters) {
-        @()
-    } elseif ($Plan.fault.parameters -is [System.Collections.IDictionary]) {
-        @($Plan.fault.parameters.Keys)
-    } else {
-        @($Plan.fault.parameters.PSObject.Properties | ForEach-Object { $_.Name })
-    }
-    foreach ($name in ($paramNames | Sort-Object)) {
-        $value = if ($Plan.fault.parameters -is [System.Collections.IDictionary]) { $Plan.fault.parameters[$name] } else { $Plan.fault.parameters.$name }
+    foreach ($pair in @($Plan.scenario.parameters)) {
+        if ($null -eq $pair) { continue }
+        $name = if ($pair.PSObject.Properties.Name -contains 'key') { [string]$pair.key } else { $null }
+        if (-not $name) { continue }
+        $value = if ($pair.PSObject.Properties.Name -contains 'value') { $pair.value } else { $null }
         $rendered = if ($value -is [string] -or $value -is [bool] -or $value -is [int] -or $value -is [long] -or $value -is [double]) {
             ConvertTo-ChaosReportValue -Value $value
         } else {
@@ -207,38 +210,62 @@ $(ConvertTo-ChaosHtmlText -Text $mechanismSentence)</p>
         $parameterRows += "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text $name)</td><td>$rendered</td></tr>"
     }
 
+    $scopedTypes = @($Plan.scope.resourceTypes) | Where-Object { $_ }
+    $blastRows = @()
+    foreach ($side in @('filters', 'exclusions')) {
+        if ($Plan.scope.blastRadius.PSObject.Properties.Name -notcontains $side) { continue }
+        $value = $Plan.scope.blastRadius.$side
+        if ($null -eq $value) { continue }
+        $blastRows += "  <tr><td class=`"mono`">$side</td><td><code>$(ConvertTo-ChaosHtmlText -Text (ConvertTo-ChaosCanonicalJson -InputObject $value))</code></td></tr>"
+    }
+
     $tested = @"
 <dl class="kv">
-$(New-ChaosReportRow -Label 'Resource' -Value ([string]$Plan.target.resourceId))
-$(New-ChaosReportRow -Label 'Region' -Value ([string]$Plan.target.region))
-$(New-ChaosReportRow -Label 'Action URN' -Value ([string]$Plan.fault.faultUrn))
-$(New-ChaosReportRow -Label 'Action type' -Value ([string]$Plan.fault.actionType))
-$(New-ChaosReportRow -Label 'Target type' -Value ([string]$Plan.fault.targetType))
-$(New-ChaosReportRow -Label 'Action metadata' -Value $(if ([string]$Plan.fault.source -eq 'live-discovery') { 'discovered live from Microsoft.Chaos/locations/{region}/actions' } else { $null }))
+$(New-ChaosReportRow -Label 'Workspace' -Value ([string]$Plan.workspace.id))
+$(New-ChaosReportRow -Label 'Region' -Value ([string]$Plan.scope.region))
+$(New-ChaosReportRow -Label 'Workspace scopes' -Value (@($Plan.workspace.scopes) -join ', '))
+$(New-ChaosReportRow -Label 'Resources in scope' -Value "$($Plan.scope.projectedResourceCount) of $($Plan.scope.discoveredResourceCount) discovered")
+$(New-ChaosReportRow -Label 'Resource types' -Value $(if (@($scopedTypes).Count -gt 0) { @($scopedTypes) -join ', ' } else { $null }))
+$(New-ChaosReportRow -Label 'Scenario' -Value ([string]$Plan.scenario.name))
+$(New-ChaosReportRow -Label 'Action URN' -Value ([string]$Plan.action.canonicalId))
+$(New-ChaosReportRow -Label 'Action type' -Value ([string]$Plan.action.actionType))
+$(New-ChaosReportRow -Label 'Action metadata' -Value $(if ([string]$Plan.action.source -eq 'live-discovery') { 'discovered live from Microsoft.Chaos/locations/{region}/actions' } else { $null }))
 $(New-ChaosReportRow -Label 'Windows' -Value "baseline $($Plan.windows.baselineMinutes) min, injection $($Plan.windows.injectMinutes) min, recovery $($Plan.windows.recoveryMinutes) min")
 </dl>
-<h3>Action parameters</h3>
+<h3>Scenario parameters</h3>
 <table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>
 $($parameterRows -join "`n")
 </tbody></table>
+$(if (@($blastRows).Count -gt 0) { "<h3>Blast radius</h3>`n<table><thead><tr><th>Constraint</th><th>Value</th></tr></thead><tbody>`n$($blastRows -join "`n")`n</tbody></table>" } else { '' })
 <h3>Abort conditions</h3>
 $(New-ChaosReportList -Items $Plan.safety.abortConditions)
 "@
 
-    $statusRows = foreach ($observation in @($RunRecord.experiment.observations)) {
-        "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string]$observation.at))</td><td>$(ConvertTo-ChaosHtmlText -Text ([string]$observation.status))</td></tr>"
+    $actionRows = foreach ($entry in @($RunRecord.scenarioRun.observation.actions)) {
+        if ($null -eq $entry) { continue }
+        $touched = if ($null -ne $entry.resources) { @($entry.resources).Count } else { 'not reported' }
+        "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string]$entry.actionUrn))</td><td>$(ConvertTo-ChaosHtmlText -Text ([string]$entry.state))</td><td>$(ConvertTo-ChaosHtmlText -Text ([string]$touched))</td></tr>"
+    }
+
+    $errorRows = foreach ($entry in @($RunRecord.scenarioRun.observation.errors)) {
+        if ($null -eq $entry) { continue }
+        "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string]$entry.code))</td><td>$(ConvertTo-ChaosHtmlText -Text ([string]$entry.message))</td></tr>"
     }
 
     $happened = @"
 <dl class="kv">
-$(New-ChaosReportRow -Label 'Experiment' -Value ([string]$RunRecord.experiment.name))
-$(New-ChaosReportRow -Label 'Outcome' -Value ([string]$RunRecord.experiment.outcome))
+$(New-ChaosReportRow -Label 'Scenario run' -Value ([string]$RunRecord.scenarioRun.runId))
+$(New-ChaosReportRow -Label 'Outcome' -Value ([string]$RunRecord.scenarioRun.outcome))
+$(New-ChaosReportRow -Label 'Configuration' -Value ([string]$RunRecord.configuration.name))
+$(New-ChaosReportRow -Label 'Validation' -Value ([string]$RunRecord.configuration.validationStatus))
+$(New-ChaosReportRow -Label 'Resources touched' -Value $RunRecord.scenarioRun.observation.resourcesTouched)
 $(New-ChaosReportRow -Label 'Mechanism proven' -Value $Findings.mechanismProven)
 $(New-ChaosReportRow -Label 'Mechanism evidence' -Value ([string]$Findings.mechanismDetail))
 $(New-ChaosReportRow -Label 'Predicate during' -Value $Findings.predicate.during)
 $(New-ChaosReportRow -Label 'Predicate after' -Value $Findings.predicate.post)
 </dl>
-$(if (@($statusRows).Count -gt 0) { "<h3>Experiment status</h3>`n<table><thead><tr><th>At</th><th>Status</th></tr></thead><tbody>`n$($statusRows -join "`n")`n</tbody></table>" } else { '' })
+$(if (@($actionRows).Count -gt 0) { "<h3>Actions the service reported</h3>`n<table><thead><tr><th>Action URN</th><th>State</th><th>Resources</th></tr></thead><tbody>`n$($actionRows -join "`n")`n</tbody></table>" } else { '' })
+$(if (@($errorRows).Count -gt 0) { "<h3>Execution errors</h3>`n<table><thead><tr><th>Kind</th><th>Detail</th></tr></thead><tbody>`n$($errorRows -join "`n")`n</tbody></table>" } else { '' })
 <h3>Signals</h3>
 $(New-ChaosSignalTable -Evidence $Evidence)
 "@
@@ -265,7 +292,8 @@ $(New-ChaosSignalTable -Evidence $Evidence)
 $(New-ChaosReportRow -Label 'Study id' -Value ([string]$RunRecord.studyId))
 $(New-ChaosReportRow -Label 'Scope hash' -Value ([string]$RunRecord.scopeHash))
 $(New-ChaosReportRow -Label 'Frozen config hash' -Value ([string]$Plan.frozenConfigHash))
-$(New-ChaosReportRow -Label 'Chaos api-version' -Value (Get-ChaosApiVersion -Name 'chaosClassic'))
+$(New-ChaosReportRow -Label 'Chaos api-version' -Value (Get-ChaosApiVersion -Name 'chaosStudio'))
+$(New-ChaosReportRow -Label 'Actions api-version' -Value (Get-ChaosApiVersion -Name 'chaosActions'))
 $(New-ChaosReportRow -Label 'Metrics api-version' -Value (Get-ChaosApiVersion -Name 'metrics'))
 </dl>
 $(if (@($artifactRows).Count -gt 0) { "<h3>Artifact hashes</h3>`n<table><thead><tr><th>Artifact</th><th>SHA-256</th></tr></thead><tbody>`n$($artifactRows -join "`n")`n</tbody></table>" } else { '' })
@@ -273,7 +301,7 @@ $(if (@($trailRows).Count -gt 0) { "<h3>Command trail</h3>`n<table><thead><tr><t
 "@
 
     $tokens = [ordered]@{
-        '{{TITLE}}'          = ConvertTo-ChaosHtmlText -Text "Chaos study: $($Plan.fault.displayName) on $target"
+        '{{TITLE}}'          = ConvertTo-ChaosHtmlText -Text "Chaos study: $($Plan.action.displayName) on $systemUnderStudy"
         '{{STUDY_ID}}'       = ConvertTo-ChaosHtmlText -Text ([string]$RunRecord.studyId)
         '{{VERDICT}}'        = ConvertTo-ChaosHtmlText -Text ([string]$Findings.verdict)
         '{{VERDICT_CLASS}}'  = $visual.class

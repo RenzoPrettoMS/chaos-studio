@@ -109,19 +109,22 @@ if ($OutputPath) {
 
 if (-not $NoSeal) {
     $identity = [ordered]@{
-        target       = [string]$plan.target.resourceName
-        resourceId   = [string]$plan.target.resourceId
-        action       = [string]$plan.fault.action
-        faultUrn     = [string]$plan.fault.faultUrn
-        actionType   = [string]$plan.fault.actionType
-        targetType   = [string]$plan.fault.targetType
-        predicate    = [string]$plan.question.steadyState.raw
-        windows      = [ordered]@{
+        workspace     = [string]$plan.workspace.name
+        workspaceId   = [string]$plan.workspace.id
+        region        = [string]$plan.scope.region
+        scenario      = [string]$plan.scenario.name
+        scenarioId    = [string]$plan.scenario.id
+        action        = [string]$plan.action.name
+        actionUrn     = [string]$plan.action.canonicalId
+        actionType    = [string]$plan.action.actionType
+        scopeCount    = $plan.scope.projectedResourceCount
+        predicate     = [string]$plan.question.steadyState.raw
+        windows       = [ordered]@{
             baselineMinutes = $plan.windows.baselineMinutes
             injectMinutes   = $plan.windows.injectMinutes
             recoveryMinutes = $plan.windows.recoveryMinutes
         }
-        planHash     = [string]$plan.frozenConfigHash
+        planHash      = [string]$plan.frozenConfigHash
     }
     Complete-ChaosStudy -StudyPath $studyPath -Identity $identity -Summary ([ordered]@{
         verdict         = $findings.verdict
@@ -143,16 +146,16 @@ $status = switch ($findings.verdict) {
 # an "Inconclusive" verdict above a confident-sounding hypothesis reads as a pass.
 $conclusion = switch ($findings.verdict) {
     'Steady state held' {
-        'The fault was proven to have landed and the steady-state objective survived it.'
+        'The action was proven to have landed and the steady-state objective survived it.'
     }
     'Degraded but recovered' {
-        'The steady-state objective was breached while the fault was live, and recovered within the recovery window.'
+        'The steady-state objective was breached while the action was live, and recovered within the recovery window.'
     }
     'Steady state breached' {
         'The steady-state objective was breached and had not recovered by the end of the recovery window.'
     }
     default {
-        'The fault could not be proven to have reached the target, so this study cannot support any claim about resilience to it. Treat the result as untested rather than passed.'
+        'The action could not be proven to have reached the scoped resources, so this study cannot support any claim about resilience to it. Treat the result as untested rather than passed.'
     }
 }
 

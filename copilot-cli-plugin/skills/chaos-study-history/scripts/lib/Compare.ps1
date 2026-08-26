@@ -58,14 +58,16 @@ function Get-ChaosStudyIdentityFacts {
 
     $identity = $Study.identity
     return [pscustomobject]@{
-        studyId   = [string]$Study.studyId
-        scopeHash = [string]$Study.scopeHash
-        target     = [string]$identity.target
-        faultUrn   = [string]$identity.faultUrn
-        targetType = [string]$identity.targetType
-        predicate  = ConvertTo-ChaosNormalisedPredicate -Raw ([string]$identity.predicate)
-        windows    = $identity.windows
-        verdict    = [string]$Study.summary.verdict
+        studyId     = [string]$Study.studyId
+        scopeHash   = [string]$Study.scopeHash
+        workspace   = [string]$identity.workspace
+        workspaceId = [string]$identity.workspaceId
+        scenario    = [string]$identity.scenario
+        actionUrn   = [string]$identity.actionUrn
+        scopeCount  = $identity.scopeCount
+        predicate   = ConvertTo-ChaosNormalisedPredicate -Raw ([string]$identity.predicate)
+        windows     = $identity.windows
+        verdict     = [string]$Study.summary.verdict
     }
 }
 
@@ -87,9 +89,10 @@ function Test-ChaosStudyComparability {
     $reasons = @()
 
     if ($a.scopeHash -ne $b.scopeHash) { $reasons += "Different scope: $($a.scopeHash) vs $($b.scopeHash)." }
-    if ($a.target -ne $b.target) { $reasons += "Different target: $($a.target) vs $($b.target)." }
-    if ($a.faultUrn -ne $b.faultUrn) { $reasons += "Different action: $($a.faultUrn) vs $($b.faultUrn)." }
-    if ($a.targetType -ne $b.targetType) { $reasons += "Different target type: $($a.targetType) vs $($b.targetType). A fault delivered through a different target is a different experiment." }
+    if ($a.workspaceId -ne $b.workspaceId) { $reasons += "Different workspace: $($a.workspace) vs $($b.workspace)." }
+    if ($a.actionUrn -ne $b.actionUrn) { $reasons += "Different action: $($a.actionUrn) vs $($b.actionUrn)." }
+    if ($a.scenario -ne $b.scenario) { $reasons += "Different scenario: $($a.scenario) vs $($b.scenario). The same action driven by a different scenario is a different study." }
+    if ($a.scopeCount -ne $b.scopeCount) { $reasons += "Different number of scoped resources: $($a.scopeCount) vs $($b.scopeCount). A wider or narrower blast radius is a different study." }
     if ($a.predicate -ne $b.predicate) { $reasons += "Different steady-state objective: '$($Baseline.identity.predicate)' vs '$($Candidate.identity.predicate)'." }
 
     foreach ($window in @('baselineMinutes', 'injectMinutes', 'recoveryMinutes')) {

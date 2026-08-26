@@ -79,9 +79,10 @@ $ChaosStudyExit = @{
     ConsentDeclined            = 11
     ConfigurationDrift         = 12
     StudyAlreadySealed         = 13
-    FaultPathUnavailable       = 14
+    ScopeUnverified            = 14
     StudyIncomparable          = 15
     ActionDiscoveryUnavailable = 16
+    ValidationFailed           = 17
 }
 
 function Get-ChaosStudyExitCode {
@@ -107,28 +108,103 @@ function Write-ChaosStudyNote {
     [Console]::Error.WriteLine("$prefix $Message")
 }
 
+function Write-ChaosStudyCard {
+    <#
+    .SYNOPSIS
+        Present a block of operator-facing output, using the host's card
+        renderer when one is available and plain markdown when it is not.
+
+    .DESCRIPTION
+        Every skill in this suite reports the same way, so the fallback lives
+        here rather than being re-implemented at each call site where it can
+        drift.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Title,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Body
+    )
+    if (Get-Command Write-Card -ErrorAction SilentlyContinue) {
+        Write-Card -Title $Title -Body $Body
+    } else {
+        Write-Output "## $Title"
+        Write-Output ''
+        Write-Output $Body
+    }
+}
+
 function Write-ChaosStudyFailure {
     <#
     .SYNOPSIS
         Loud, structured failure. Never swallow - this is the only sanctioned
         way for a study script to report that it could not do its job.
+
+    .DESCRIPTION
+        The card is written to the host stream rather than the success stream.
+        That distinction matters: assertion helpers are routinely called as
+        `Assert-Something ... | Out-Null` to discard their boolean result, and a
+        card written with Write-Output would be discarded along with it - the
+        operator would see a bare exit code and no explanation. Rendering through
+        Write-Host makes the failure unsuppressible by a caller's pipeline, which
+        is what "never swallow" has to mean in practice.
     #>
     param(
         [Parameter(Mandatory)][string]$Title,
         [Parameter(Mandatory)][string]$Message,
         [string]$Remediation
     )
-    if (Get-Command Write-Error-Card -ErrorAction SilentlyContinue) {
-        Write-Error-Card -Title $Title -ErrorMessage $Message -RemediationCommand $Remediation
-    } else {
-        Write-Output "## ERROR: $Title"
-        Write-Output ''
-        Write-Output $Message
-        if ($Remediation) {
-            Write-Output ''
-            Write-Output "Remediation: $Remediation"
+    $lines = @(
+        if (Get-Command Write-Error-Card -ErrorAction SilentlyContinue) {
+            Write-Error-Card -Title $Title -ErrorMessage $Message -RemediationCommand $Remediation
+        } else {
+            "## ERROR: $Title"
+            ''
+            $Message
+            if ($Remediation) {
+                ''
+                "Remediation: $Remediation"
+            }
+        }
+    )
+    foreach ($line in $lines) { Write-Host $line }
+}
+
+# -- List normalisation -----------------------------------
+function ConvertTo-ChaosList {
+    <#
+    .SYNOPSIS
+        Normalise a library result into a flat, null-free array.
+
+    .DESCRIPTION
+        The list-returning functions in this suite end with ",@(...)" so that a
+        single-element result is not silently unwrapped into a scalar. That
+        idiom has one sharp edge: an *empty* result arrives as one pipeline
+        object that is itself an empty array, so the usual "@(...)" at the call
+        site produces @(@()) - a one-element list whose only member has no
+        properties at all.
+
+        Every downstream projection then throws under Set-StrictMode, which
+        turns a perfectly legitimate empty result - an exclusion that filtered
+        everything out, a region that offers no matching action - into a crash
+        instead of the clean, explained failure this suite promises. Callers use
+        this so "none" reads as an empty list rather than an exception.
+    #>
+    [CmdletBinding()]
+    param([AllowNull()][object]$InputObject)
+
+    if ($null -eq $InputObject) { return , @() }
+
+    $flat = [System.Collections.Generic.List[object]]::new()
+    foreach ($item in @($InputObject)) {
+        if ($null -eq $item) { continue }
+        if ($item -is [array] -or ($item -is [System.Collections.IList] -and $item -isnot [string])) {
+            foreach ($inner in $item) { if ($null -ne $inner) { $flat.Add($inner) } }
+        }
+        else {
+            $flat.Add($item)
         }
     }
+
+    return , @($flat.ToArray())
 }
 
 # -- Time -------------------------------------------------

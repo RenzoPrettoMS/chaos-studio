@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     A single chaos study is an anecdote. The value comes from the series - the
-    same question asked of the same target over time, so a change in the answer
-    means something changed in the system.
+    same question asked of the same workspace scope over time, so a change in
+    the answer means something changed in the system.
 
     This skill never mutates a sealed study. `-Action rerun` prints the plan
     needed to repeat one; it does not inject anything itself, because rerunning
@@ -61,12 +61,12 @@ function Resolve-Entry {
     .SYNOPSIS
         Resolve 'latest', 'previous' or an explicit id against the index.
     #>
-    param([Parameter(Mandatory)][string]$Selector, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Pool)
+    param([Parameter(Mandatory)][string]$Reference, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Pool)
     $ordered = @($Pool | Sort-Object -Property studyId -Descending)
-    switch ($Selector) {
+    switch ($Reference) {
         'latest'   { return ($ordered | Select-Object -First 1) }
         'previous' { return ($ordered | Select-Object -Skip 1 -First 1) }
-        default    { return ($ordered | Where-Object { $_.studyId -eq $Selector } | Select-Object -First 1) }
+        default    { return ($ordered | Where-Object { $_.studyId -eq $Reference } | Select-Object -First 1) }
     }
 }
 
@@ -83,13 +83,13 @@ switch ($Action) {
     'list' {
         $rows = foreach ($entry in ($index | Sort-Object -Property studyId -Descending)) {
             [pscustomobject]@{
-                Study    = $entry.studyId
-                State    = $entry.state
-                Target   = $(if ($entry.identity) { [string]$entry.identity.target } else { '-' })
-                Action   = $(if ($entry.identity) { [string]$entry.identity.action } else { '-' })
-                Verdict  = $(if ($entry.summary) { [string]$entry.summary.verdict } else { '-' })
-                Findings = $(if ($entry.summary) { $entry.summary.findingCount } else { '-' })
-                Scope    = $entry.scopeHash
+                Study     = $entry.studyId
+                State     = $entry.state
+                Workspace = $(if ($entry.identity) { [string]$entry.identity.workspace } else { '-' })
+                Action    = $(if ($entry.identity) { [string]$entry.identity.action } else { '-' })
+                Verdict   = $(if ($entry.summary) { [string]$entry.summary.verdict } else { '-' })
+                Findings  = $(if ($entry.summary) { $entry.summary.findingCount } else { '-' })
+                Scope     = $entry.scopeHash
             }
         }
         if ($Json) { $rows | ConvertTo-Json -Depth 6; exit (Get-ChaosStudyExitCode -Name 'Success') }
@@ -100,7 +100,7 @@ switch ($Action) {
     }
 
     'show' {
-        $entry = Resolve-Entry -Selector $StudyId -Pool $index
+        $entry = Resolve-Entry -Reference $StudyId -Pool $index
         if (-not $entry) {
             Write-ChaosStudyFailure -Title 'Study not found' -Message "No study matched '$StudyId'." -Remediation 'Run this skill with -Action list to see available studies.'
             exit (Get-ChaosStudyExitCode -Name 'Error')
@@ -110,13 +110,21 @@ switch ($Action) {
             [ordered]@{ study = $entry; findings = @($findings) } | ConvertTo-Json -Depth 8
             exit (Get-ChaosStudyExitCode -Name 'Success')
         }
+        # The URN is the precise identity, but a discovery-skipped study never
+        # learned one. Show the name rather than an empty row.
+        $shownAction = '-'
+        if ($entry.identity) {
+            $shownAction = if ([string]::IsNullOrWhiteSpace($entry.identity.actionUrn)) { [string]$entry.identity.action } else { [string]$entry.identity.actionUrn }
+            if ([string]::IsNullOrWhiteSpace($shownAction)) { $shownAction = '-' }
+        }
         Write-Card -Title "Study $($entry.studyId)" -Status 'info' -Body @"
 $(if ($entry.summary) { [string]$entry.summary.verdict } else { 'Not yet reported.' })
 "@ -Properties ([ordered]@{
             'State'     = $entry.state
             'Sealed'    = $entry.sealedAt
-            'Target'    = $(if ($entry.identity) { [string]$entry.identity.target } else { '-' })
-            'Action'    = $(if ($entry.identity) { [string]$entry.identity.faultUrn } else { '-' })
+            'Workspace' = $(if ($entry.identity) { [string]$entry.identity.workspace } else { '-' })
+            'Scenario'  = $(if ($entry.identity) { [string]$entry.identity.scenario } else { '-' })
+            'Action'    = $shownAction
             'Predicate' = $(if ($entry.identity) { [string]$entry.identity.predicate } else { '-' })
             'Report'    = (Join-Path $entry.path 'report.html')
         })
@@ -130,7 +138,7 @@ $(if ($entry.summary) { [string]$entry.summary.verdict } else { 'Not yet reporte
 
     'compare' {
         $sealed = @($index | Where-Object { $_.state -eq 'SEALED' })
-        $candidate = Resolve-Entry -Selector $StudyId -Pool $sealed
+        $candidate = Resolve-Entry -Reference $StudyId -Pool $sealed
         if (-not $candidate) {
             Write-ChaosStudyFailure -Title 'Nothing to compare' -Message "No sealed study matched '$StudyId'." -Remediation 'Seal a study by running the chaos-study-report skill.'
             exit (Get-ChaosStudyExitCode -Name 'Error')
@@ -138,7 +146,7 @@ $(if ($entry.summary) { [string]$entry.summary.verdict } else { 'Not yet reporte
         # Restrict the pool to the same scope before picking 'previous', otherwise
         # 'previous' would happily select an unrelated study.
         $pool = @($sealed | Where-Object { $_.scopeHash -eq $candidate.scopeHash -and $_.studyId -ne $candidate.studyId })
-        $baseline = Resolve-Entry -Selector $(if ($Against -eq 'previous') { 'latest' } else { $Against }) -Pool $pool
+        $baseline = Resolve-Entry -Reference $(if ($Against -eq 'previous') { 'latest' } else { $Against }) -Pool $pool
 
         if (-not $baseline) {
             Write-Card -Title 'Only one study in this scope' -Status 'info' -Body @"
@@ -162,7 +170,7 @@ $($baseline.studyId) and $($candidate.studyId) did not ask the same question, so
 any difference between them would be noise dressed as a signal.
 
 $(@($comparison.reasons | ForEach-Object { "  - $_" }) -join "`n")
-"@ -Remediation 'Compare studies that share a scope, a fault, a fault path, a steady-state objective and comparable window lengths.'
+"@ -Remediation 'Compare studies that share a scope, a workspace, a scenario, an action, a steady-state objective and comparable window lengths.'
             exit (Get-ChaosStudyExitCode -Name 'StudyIncomparable')
         }
 
@@ -201,7 +209,7 @@ $($baseline.studyId) ($($comparison.baseline.verdict))
     }
 
     'rerun' {
-        $entry = Resolve-Entry -Selector $StudyId -Pool $index
+        $entry = Resolve-Entry -Reference $StudyId -Pool $index
         if (-not $entry) {
             Write-ChaosStudyFailure -Title 'Study not found' -Message "No study matched '$StudyId'." -Remediation 'Run this skill with -Action list to see available studies.'
             exit (Get-ChaosStudyExitCode -Name 'Error')
@@ -212,15 +220,23 @@ $($baseline.studyId) ($($comparison.baseline.verdict))
             exit (Get-ChaosStudyExitCode -Name 'Error')
         }
         $scope = Join-Path $PSScriptRoot '..' '..' 'chaos-study-scope' 'scripts' 'Invoke-ChaosStudyScope.ps1'
-        $resourceTypeLine = if ($plan.target.resourceType) { "`n    -ResourceType '$($plan.target.resourceType)' ``" } else { '' }
-        $regionLine = if ($plan.target.PSObject.Properties.Name -contains 'region' -and $plan.target.region) { "`n    -Region '$($plan.target.region)' ``" } else { '' }
+        # The workspace already exists (this study ran against it), so the rerun
+        # command deliberately omits -CreateWorkspace: reruns observe, they do not
+        # provision. The scope is re-discovered live, so a resource that has since
+        # left the workspace is not silently carried forward from the old plan.
+        $regionLine = if ($plan.scope.region) { "`n    -Location '$($plan.scope.region)' ``" } else { '' }
+        # -Action accepts a URN or a name. Prefer the URN because it is exact, but
+        # a discovery-skipped plan never learned one, and emitting -Action '' would
+        # hand the operator a command that cannot run.
+        $actionRef = if ([string]::IsNullOrWhiteSpace($plan.action.canonicalId)) { [string]$plan.action.name } else { [string]$plan.action.canonicalId }
         $sourceLines = @($plan.signals.configuredSources | Where-Object { $_ } | ForEach-Object { "    -SignalSource '$_' ``" })
         $command = @(
             "& '$scope' ``"
-            "    -SubscriptionId '$($plan.target.subscriptionId)' ``"
-            "    -ResourceGroup '$($plan.target.resourceGroup)' ``"
-            "    -ResourceName '$($plan.target.resourceName)' ``$resourceTypeLine$regionLine"
-            "    -Action '$($plan.fault.faultUrn)' ``"
+            "    -SubscriptionId '$($plan.workspace.subscriptionId)' ``"
+            "    -ResourceGroup '$($plan.workspace.resourceGroup)' ``"
+            "    -WorkspaceName '$($plan.workspace.name)' ``$regionLine"
+            "    -Scenario '$($plan.scenario.name)' ``"
+            "    -Action '$actionRef' ``"
             "    -SteadyState '$($plan.question.steadyState.raw)' ``"
             $sourceLines
             "    -DurationMinutes $($plan.windows.injectMinutes) ``"
@@ -231,13 +247,14 @@ $($baseline.studyId) ($($comparison.baseline.verdict))
 
         Write-Card -Title "Rerun study $($entry.studyId)" -Status 'info' -Body @"
 Rerunning creates a new study rather than overwriting this one, so the pair can
-be compared afterwards. The action is resolved against the live action list
-again, so a rerun fails loudly if the platform no longer offers it. Nothing has
-been injected - run the command below, then the chaos-study-run skill with
-explicit consent.
+be compared afterwards. The workspace scope and the action are both resolved
+live again, so a rerun fails loudly if the platform no longer offers the action
+or the workspace no longer covers the same resources. Nothing has been injected
+- run the command below, then the chaos-study-run skill with explicit consent.
 "@ -Properties ([ordered]@{
-            'Target'    = [string]$plan.target.resourceName
-            'Action'    = [string]$plan.fault.displayName
+            'Workspace' = [string]$plan.workspace.name
+            'Scenario'  = [string]$plan.scenario.name
+            'Action'    = [string]$plan.action.displayName
             'Predicate' = [string]$plan.question.steadyState.raw
         })
         Write-Card -Title 'Command' -Status 'info' -Body $command

@@ -8,36 +8,54 @@ explains *why* each skill refuses certain things.
 A test asserts a known answer. A study asks a question whose answer you do not
 know, and produces evidence either way. That difference drives everything here:
 
-- We state a **hypothesis** before we inject anything, so we cannot rationalise
-  the result afterwards.
+- We state a **hypothesis** before anything runs, so we cannot rationalise the
+  result afterwards.
 - We measure a **steady state** first. Without it, "it looked fine" is an
   opinion.
 - We record **what we could not measure** as prominently as what we could.
   A study that hides its blind spots is worse than no study, because it
   manufactures confidence.
 
+## The V2 model this suite is built on
+
+Chaos Studio V2 makes the **workspace** the lifecycle root. A workspace observes
+one or more **scopes**, and the service discovers the resources inside them. You
+do not enumerate resources by hand and you do not onboard them one at a time:
+you point a workspace at a scope and read back what it found.
+
+Everything downstream hangs off that. Scenarios are recommended per workspace, a
+**scenario configuration** binds a scenario to a workspace with parameters and a
+blast radius, validation runs against that configuration, and execution produces
+a **scenario run**. This suite uses that model exclusively — there is no V1 path
+and no fallback to one.
+
 ## The five phases
 
 ### 1. Scope
 
-Decide *what system*, *what fault*, and *what would count as a failure* —
-before touching anything.
+Decide *what system*, *what action*, and *what would count as a failure* —
+before anything runs.
 
-The fault is not chosen from a list this suite carries. It is chosen from the
-list Chaos Studio returns for the target's region, live, at scope time. That
-response is authoritative for the action's identity, its type, its supported
-target types and its parameter schema. There is no bundled catalogue and no
-offline fallback: if the platform cannot be asked, scoping stops at exit code 16.
+The action is not chosen from a list this suite carries. It is chosen from the
+list Chaos Studio returns for the workspace's region, live, at scope time. That
+response is authoritative for the action's identity, its type, what it applies
+to and its parameter schema. There is no bundled catalogue and no offline
+fallback: if the platform cannot be asked, scoping stops at exit code 16.
 
-The output is a **study plan**: target, action metadata as discovered, steady
-state predicate, abort conditions, and the signals that will be collected.
-A plan is a written commitment. If the plan cannot be written, the study does
-not happen.
+What is *in* scope is read the same way. The resources a run can touch are the
+ones the workspace discovered, filtered by the blast radius the plan freezes.
+Reading them rather than asserting them is the point: a scope that quietly grew
+a resource, or a plan naming a resource that was never discovered, are exactly
+the surprises this catches.
 
-Scoping fails closed. If the delivery path is unavailable (resource not
-onboarded as a target, capability not enabled, permission missing), we stop at
-exit code 14 rather than substituting a different fault that answers a different
-question.
+The output is a **study plan**: workspace, scope and its discovered resources,
+action and scenario metadata as discovered, steady-state predicate, abort
+conditions, and the signals that will be collected. A plan is a written
+commitment. If the plan cannot be written, the study does not happen.
+
+Scoping fails closed. If nothing is in scope, or the action applies to no
+resource type present, we stop at exit code 14 rather than substituting a
+different action that answers a different question.
 
 ### 2. Readiness
 
@@ -45,9 +63,9 @@ Verify the plan is executable *and* observable.
 
 Two independent checks:
 
-- **Executable** — can Chaos Studio actually inject this fault at this target
-  right now? Does the target type the action supports match the resource, and do
-  the supplied parameters satisfy the schema the service published?
+- **Executable** — is there anything in scope for this action to act on, does
+  what the action applies to intersect the discovered resource types, and do the
+  supplied parameters satisfy the schema the service published?
 - **Observable** — will we be able to tell what happened? If no signal source
   covers the impact, the study can still run, but it will produce a finding
   with `confidence: low` and a mandatory limitation. We say so *before*
@@ -57,21 +75,26 @@ Readiness failure is exit code 10. It is not a warning.
 
 ### 3. Execute
 
-Inject the fault inside a bounded window, with the abort path armed.
+Run the scenario inside a bounded window, with the abort path armed.
 
 Rules that do not bend:
 
+- **Validation is a gate.** The scenario configuration is created and validated,
+  and execution is refused unless the service reports `Succeeded` (exit 17). A
+  configuration that only probably works is not executed.
 - **Dry run is the default.** Execution requires an explicit `-DryRun:$false`
   *and* a typed consent string bound to the frozen config hash. If the plan
   changed after consent was given, the consent is void (exit 12).
 - **Non-interactive escape hatches do not apply.** The study suite ignores
-  `STARTCHAOS_NONINTERACTIVE`. A human types the consent string or nothing is
-  injected.
-- **The blast radius is in the plan, not in the operator's head.** The target,
-  the action parameters and the duration are frozen at consent time.
+  `STARTCHAOS_NONINTERACTIVE`. A human types the consent string or nothing runs.
+- **The blast radius is in the plan, not in the operator's head.** The scope
+  filters and exclusions, the parameters and the duration are frozen at consent
+  time. An empty blast-radius member is omitted rather than sent as an empty
+  array, because `{"locations":[]}` selects nothing and would turn a real study
+  into a no-op that still reports success.
 - **Abort is not cleanup.** Abort conditions are evaluated during the run; if
-  one trips, the fault stops and the study records that it was aborted, which
-  is itself a finding.
+  one trips, the run is cancelled and the study records that it was aborted,
+  which is itself a finding. Cleanup of the configuration happens regardless.
 
 ### 4. Observe
 
@@ -83,15 +106,16 @@ Zero means "we measured, and it was zero". Null means "we did not measure",
 and it must carry a caveat saying why. Every signal collector returns the same
 shape so this cannot be fudged.
 
-Control-plane state — "the experiment reported Success" — is **not** proof that
-the fault reached the system under study. It proves Chaos Studio accepted the
-request. Only a data-plane signal can set `mechanismProven: true`.
+Control-plane state — "the scenario run reported Succeeded" — is **not** proof
+that the action reached the system under study. It proves Chaos Studio accepted
+and executed the request. Only a data-plane signal can set
+`mechanismProven: true`.
 
 ### 5. Conclude
 
 Turn evidence into findings, then seal.
 
-- **Severity** comes from behaviour, not from the fault's scariness:
+- **Severity** comes from behaviour, not from how alarming the action sounds:
   - `critical` — steady state breached and *not* recovered in the post window
   - `high` — breached, recovered, but later than the stated objective
   - `medium` — breached, recovered within the objective
@@ -99,7 +123,7 @@ Turn evidence into findings, then seal.
 - **Confidence** comes from `mechanismProven` and signal-source coverage.
   A finding drawn only from control-plane state is capped at `low`.
 - **Limitations are mandatory and never empty.** At minimum, L1 (scope) always
-  applies: this study tested one fault against one target in one window.
+  applies: this study ran one action over one scope in one window.
 
 Sealing makes the study immutable. The report is rendered, every file is
 hashed, the manifest records the hashes and the api-version pins, and then —
@@ -115,8 +139,8 @@ mode:
 | Skill | Owns | Produces |
 |---|---|---|
 | `chaos-study` | the opinionated end-to-end path | an orchestrated study |
-| `chaos-study-scope` | discovery, target, readiness | `study-plan.v1.json` |
-| `chaos-study-run` | consent, injection, observation | `run-record.v1.json` |
+| `chaos-study-scope` | workspace, scope, discovery, readiness | `study-plan.v1.json` |
+| `chaos-study-run` | configuration, consent, execution, observation | `run-record.v1.json` |
 | `chaos-study-report` | interpretation, rendering, sealing | `findings.v1.json`, `report.html` |
 | `chaos-study-history` | recall and comparison | listings, diffs, reruns |
 
@@ -125,6 +149,8 @@ want to think about the seams.
 
 ## What this suite deliberately does not do
 
+- **No V1.** No experiments, no targets, no capabilities, and no fallback to
+  them when V2 discovery or configuration is unavailable.
 - **No SRE Agent dependency.** The core path is `az chaos`.
 - **No required MCP dependency.** MCP may enrich, never gate.
 - **No auto-remediation.** A study reports; a human decides.

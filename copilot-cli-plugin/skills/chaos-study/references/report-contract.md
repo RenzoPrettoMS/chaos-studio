@@ -23,9 +23,9 @@ they read. This file defines what it must contain and what it must never do.
 
 ### 1. Header
 
-Study id, target, action, window, sealed timestamp, and the overall verdict.
-A reader must be able to answer "what was tested and did it hold?" without
-scrolling.
+Study id, workspace, scope, action, window, sealed timestamp, and the overall
+verdict. A reader must be able to answer "what was tested and did it hold?"
+without scrolling.
 
 ### 2. Executive summary
 
@@ -37,10 +37,10 @@ No jargon that is not defined later in the document.
 
 ### 3. What we tested
 
-The plan, rendered: target identity and region, the action as the platform
-described it — canonical URN, action type, supported target type — its
-parameters, the steady-state predicate, abort conditions, and the three window
-boundaries.
+The plan, rendered: workspace identity and region, the scoped resources and the
+blast radius applied to them, the action as the platform described it —
+canonical id, action type, what it applies to — its parameters, the steady-state
+predicate, abort conditions, and the three window boundaries.
 
 The report states that the action metadata was discovered live from
 `Microsoft.Chaos/locations/{region}/actions`, so a reader can tell the claim
@@ -51,11 +51,11 @@ worth answering.
 
 ### 4. What happened
 
-The run record, rendered: what was injected, when, whether it completed or
-aborted, and the observed signal values per window.
+The run record, rendered: which action ran and over what, when, whether the
+scenario run completed or aborted, and the observed signal values per window.
 
 Each signal row shows source, window, value, and caveat. `mechanismProven` is
-shown explicitly — a reader must be able to see whether the fault was proven to
+shown explicitly — a reader must be able to see whether the action was proven to
 reach the data plane, or only accepted by the control plane.
 
 ### 5. Findings
@@ -77,7 +77,7 @@ Mandatory and never empty. Drawn from the taxonomy:
 
 | Code | Limitation |
 |---|---|
-| L1 | Scope — one fault, one target, one window |
+| L1 | Scope — one action, one workspace scope, one window |
 | L2 | Observability coverage — a signal source was unavailable |
 | L3 | Mechanism unproven — control-plane success only |
 | L4 | Sampling resolution — metric granularity coarser than the window |
@@ -85,7 +85,7 @@ Mandatory and never empty. Drawn from the taxonomy:
 | L6 | Concurrency — other activity in the window could confound results |
 | L7 | Duration — window too short to observe slow failure modes |
 | L8 | Aborted — the run stopped early |
-| L9 | Configuration drift — target changed between plan and run |
+| L9 | Configuration drift — the plan changed between scope and run |
 | L10 | Discovery unverified — action metadata not confirmed against the live action list |
 
 L1 always applies. Others are added when their condition is detected.

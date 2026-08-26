@@ -10,9 +10,9 @@
       GET /subscriptions/{sub}/providers/Microsoft.Chaos
             /locations/{region}/actions?api-version=...
 
-    Everything downstream - the action a study plans, its parameters, the
-    target type it applies to, the roles it needs, whether it is continuous or
-    discrete - is read from that response at scope time and recorded in the
+    Everything downstream - the action a study records, its parameters, the
+    resource types it applies to, the roles it needs, whether it is continuous
+    or discrete - is read from that response at scope time and recorded in the
     plan. Nothing is inferred from a name and nothing is hardcoded.
 
     That constraint is deliberate rather than incidental. A bundled catalogue
@@ -35,17 +35,17 @@ Set-StrictMode -Version Latest
 
 # -- Region resolution -----------------------------------------------------
 
-function Resolve-ChaosTargetRegion {
+function Resolve-ChaosResourceRegion {
     <#
     .SYNOPSIS
         Read a resource's region from ARM.
 
     .DESCRIPTION
         The actions list is region-scoped, so the region has to be right before
-        anything else can be asked. It is read from the target resource rather
+        anything else can be asked. It is read from the scoped resource rather
         than guessed or defaulted, because a wrong region silently returns a
         different - usually smaller - set of actions, and the study would then
-        plan against a catalogue that does not describe where it will run.
+        plan against an inventory that does not describe where it will run.
 
         Returns $null when the region cannot be read. Callers treat that as a
         hard stop, not as permission to pick one.
@@ -95,18 +95,23 @@ function ConvertTo-ChaosActionRecord {
         return $properties.$name
     }
 
-    $targetTypes = @()
+    # `supportedTargetTypes` is the actions endpoint's own field name in the V2
+    # response. It is read verbatim because inventing a different source would
+    # be inventing evidence, but it is projected onto V2 vocabulary - a list of
+    # ARM resource types this action applies to - so nothing downstream has to
+    # reason about resource kinds the workspace does not model.
+    $appliesTo = @()
     $supported = & $read 'supportedTargetTypes'
     foreach ($entry in @($supported)) {
         if ($null -eq $entry) { continue }
-        $targetType = if ($entry.PSObject.Properties.Name -contains 'targetType') { [string]$entry.targetType } else { $null }
-        if ([string]::IsNullOrWhiteSpace($targetType)) { continue }
+        $resourceType = if ($entry.PSObject.Properties.Name -contains 'targetType') { [string]$entry.targetType } else { $null }
+        if ([string]::IsNullOrWhiteSpace($resourceType)) { continue }
         $permissions = @()
         if ($entry.PSObject.Properties.Name -contains 'requiredPermissions') {
             $permissions = @($entry.requiredPermissions | Where-Object { $null -ne $_ })
         }
-        $targetTypes += [pscustomobject]@{
-            targetType          = $targetType
+        $appliesTo += [pscustomobject]@{
+            resourceType        = $resourceType
             requiredPermissions = $permissions
         }
     }
@@ -114,16 +119,16 @@ function ConvertTo-ChaosActionRecord {
     $name = if ($Action.PSObject.Properties.Name -contains 'name') { [string]$Action.name } else { $null }
 
     return [pscustomobject]@{
-        name                = $name
-        actionName          = [string](& $read 'actionName')
-        canonicalId         = [string](& $read 'canonicalId')
-        actionType          = [string](& $read 'actionType')
-        displayName         = [string](& $read 'displayName')
-        description         = [string](& $read 'description')
-        version             = [string](& $read 'version')
-        parametersSchema    = & $read 'parametersSchema'
-        recommendedRoles    = @((& $read 'recommendedRoles') | Where-Object { $null -ne $_ })
-        supportedTargetTypes = @($targetTypes)
+        name             = $name
+        actionName       = [string](& $read 'actionName')
+        canonicalId      = [string](& $read 'canonicalId')
+        actionType       = [string](& $read 'actionType')
+        displayName      = [string](& $read 'displayName')
+        description      = [string](& $read 'description')
+        version          = [string](& $read 'version')
+        parametersSchema = & $read 'parametersSchema'
+        recommendedRoles = @((& $read 'recommendedRoles') | Where-Object { $null -ne $_ })
+        appliesTo        = @($appliesTo)
     }
 }
 
@@ -183,20 +188,20 @@ function Get-ChaosAvailableAction {
     return , @($actions.ToArray())
 }
 
-function Select-ChaosActionForTarget {
+function Select-ChaosActionForResourceType {
     <#
     .SYNOPSIS
-        Narrow the live list to the actions that apply to one target type.
+        Narrow the live list to the actions that apply to one ARM resource type.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Actions,
-        [AllowNull()][AllowEmptyString()][string]$TargetType
+        [AllowNull()][AllowEmptyString()][string]$ResourceType
     )
 
-    if ([string]::IsNullOrWhiteSpace($TargetType)) { return , @($Actions) }
+    if ([string]::IsNullOrWhiteSpace($ResourceType)) { return , @($Actions) }
 
     $matched = @($Actions | Where-Object {
-            @($_.supportedTargetTypes | ForEach-Object { $_.targetType }) -contains $TargetType
+            @($_.appliesTo | ForEach-Object { $_.resourceType }) -contains $ResourceType
         })
     return , @($matched)
 }
@@ -300,10 +305,11 @@ function Test-ChaosActionParameters {
 
     .DESCRIPTION
         Two failures matter and they are different. A missing required
-        parameter means the platform will reject the experiment - better to
-        find that now than in a change window. An unrecognised parameter means
-        the operator believes they configured something they did not, which is
-        the more dangerous of the two because the study still runs.
+        parameter means the platform will reject the scenario configuration -
+        better to find that now than in a change window. An unrecognised
+        parameter means the operator believes they configured something they
+        did not, which is the more dangerous of the two because the study still
+        runs.
 
         Returns the problems rather than throwing, so the caller can present
         them together instead of one per attempt.
@@ -314,7 +320,7 @@ function Test-ChaosActionParameters {
     )
 
     $problems = @()
-    $specs = @(Get-ChaosActionParameterSpec -Schema $Schema)
+    $specs = ConvertTo-ChaosList (Get-ChaosActionParameterSpec -Schema $Schema)
     if ($specs.Count -eq 0) { return , @($problems) }
 
     $supplied = @()
@@ -328,7 +334,7 @@ function Test-ChaosActionParameters {
 
     foreach ($spec in $specs) {
         if ($spec.required -and $supplied -notcontains $spec.name) {
-            $problems += "Required parameter '$($spec.name)' was not supplied. The service schema for this action marks it required, so the experiment would be rejected."
+            $problems += "Required parameter '$($spec.name)' was not supplied. The service schema for this action marks it required, so the scenario configuration would be rejected."
         }
     }
 

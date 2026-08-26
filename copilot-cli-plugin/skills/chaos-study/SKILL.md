@@ -1,17 +1,18 @@
 ---
 name: chaos-study
-description: "Run a complete Chaos reliability study against an Azure resource: frame a falsifiable steady-state question, discover the faults Chaos Studio actually offers for that resource live, freeze a plan, inject with explicit consent, collect before/during/after evidence, and produce a self-contained HTML report. Start here for 'is my service actually resilient to X?' questions."
+description: "Run a complete Chaos reliability study against an Azure workspace scope: frame a falsifiable steady-state question, discover the actions Chaos Studio actually offers for that region live, freeze a plan, execute a validated scenario configuration with explicit consent, collect before/during/after evidence, and produce a self-contained HTML report. Start here for 'is my service actually resilient to X?' questions."
 ---
 
 # chaos-study — reliability studies, end to end
 
-Chaos engineering is an experiment, not a stunt. This skill runs the experiment:
-it asks a question that can be proven **wrong**, injects a fault, and reports
-what the evidence actually showed.
+Chaos engineering is an experiment in the scientific sense, not a stunt. This
+skill runs it: it asks a question that can be proven **wrong**, executes a real
+action against real resources, and reports what the evidence actually showed.
 
 ## The question this suite answers
 
-> Does **`<steady state>`** hold when I inject **`<action>`** into **`<target>`**?
+> Does **`<steady state>`** hold when I execute **`<action>`** across
+> **`<workspace scope>`**?
 
 If you cannot phrase the goal that way, stop and reframe it. "Test resilience"
 is not a study — there is no way for it to fail, so it cannot teach you anything.
@@ -19,27 +20,33 @@ is not a study — there is no way for it to fail, so it cannot teach you anythi
 ## Principles
 
 **A study is a falsifiable claim.** Every study needs a steady-state predicate
-that is measurable before injection and could plausibly break during it.
+that is measurable beforehand and could plausibly break during the run.
 
-**The platform decides what is possible, not this plugin.** The available faults
-are read live from Chaos Studio for the target's region, every time. This suite
-ships **no** fault catalogue, and there is no offline fallback: if the service
-cannot be asked, scoping stops with exit `16` rather than guessing.
+**The platform decides what is possible, not this plugin.** The available
+actions are read live from Chaos Studio for the workspace's region, every time.
+This suite ships **no** action catalogue, and there is no offline fallback: if
+the service cannot be asked, scoping stops with exit `16` rather than guessing.
+
+**What is in scope is read from the service.** The resources a run will touch
+come from the workspace's discovered resources, not from an assertion in the
+plan. If the scope is empty, or the action applies to nothing in it, the study
+is refused before anything runs.
 
 **Evidence beats vibes.** A verdict is only as good as the signals behind it. If
 a signal was not collected, the report says *not measured* — never `0`, never a
 plausible-looking guess. Absent evidence is reported as absent.
 
-**Nothing is injected without consent.** `-DryRun` defaults to `$true`. Arming a
-study takes both `-DryRun:$false` and typing back the exact phrase the plan
-prints. There is no flag that skips this.
+**Nothing runs without consent.** `-DryRun` defaults to `$true`. Arming a study
+takes both `-DryRun:$false` and typing back the exact phrase the plan prints.
+There is no flag that skips this.
 
-**Blast radius is bounded before it is armed.** Target, action, parameters and
-duration are frozen into the plan and hashed. If the plan changed after you
-approved it, the run refuses rather than injecting something you did not review.
+**Blast radius is bounded before it is armed.** Workspace, scope, filters,
+exclusions, action, parameters and duration are frozen into the plan and hashed.
+If the plan changed after you approved it, the run refuses rather than executing
+something you did not review.
 
-**A clean result is not automatically good news.** If the fault never actually
-reached the target, "steady state held" means nothing. The report says
+**A clean result is not automatically good news.** If the action never actually
+reached the resources, "steady state held" means nothing. The report says
 *Inconclusive* rather than claiming a pass it cannot support.
 
 ## The five skills
@@ -49,8 +56,8 @@ This is a suite, not a monolith. Use the front door unless you need one phase.
 | Skill | Owns |
 | --- | --- |
 | **chaos-study** | chains the phases below; the default entry point |
-| **chaos-study-scope** | live action discovery, readiness, freezing the plan |
-| **chaos-study-run** | consent, injection, evidence collection |
+| **chaos-study-scope** | workspace, scope, live action discovery, freezing the plan |
+| **chaos-study-run** | configuration, validation, consent, execution, evidence |
 | **chaos-study-report** | interpretation, findings, the HTML report |
 | **chaos-study-history** | list, compare, and re-run past studies |
 
@@ -60,29 +67,31 @@ from that phase — you never have to restart from scratch.
 ## Usage
 
 **1. Ask the platform what it can do here.** The answer depends on the region and
-the resource type, and it changes as Chaos Studio ships new actions:
+what is in scope, and it changes as Chaos Studio ships new actions:
 
 ```powershell
 ./scripts/Invoke-ChaosStudy.ps1 -ListActions `
-    -SubscriptionId $sub -ResourceGroup rg-prod -ResourceName payments-vm `
-    -ResourceType 'Microsoft.Compute/virtualMachines'
+    -SubscriptionId $sub -ResourceGroup rg-prod -WorkspaceName ws-payments
+
+./scripts/Invoke-ChaosStudy.ps1 -ListScenarios `
+    -SubscriptionId $sub -ResourceGroup rg-prod -WorkspaceName ws-payments
 ```
 
-Each action is printed with its canonical URN, its type, its supported target
-types and its parameter schema — all as the service reported them.
+Each action is printed with its canonical id, its type, what it applies to and
+its parameter schema — all as the service reported them.
 
-**2. Plan and preview.** This injects nothing:
+**2. Plan and preview.** This executes nothing:
 
 ```powershell
 ./scripts/Invoke-ChaosStudy.ps1 `
-    -SubscriptionId $sub -ResourceGroup rg-prod -ResourceName payments-vm `
-    -ResourceType 'Microsoft.Compute/virtualMachines' `
-    -Action 'urn:csci:microsoft:virtualMachine:shutdown/1.0.0' `
+    -SubscriptionId $sub -ResourceGroup rg-prod -WorkspaceName ws-payments `
+    -Scenario '<scenario from -ListScenarios>' `
+    -Action '<action from -ListActions>' `
     -SteadyState 'successRate >= 99.5' -SignalSource 'metrics:Availability'
 ```
 
-Read the preview. It shows the exact blast radius, the windows, and the request
-that would be sent.
+Read the preview. It shows what is in scope after filters and exclusions, the
+windows, and the configuration that would be created.
 
 **3. Arm it.** Only after the preview matches your intent:
 
@@ -90,17 +99,17 @@ that would be sent.
 ./scripts/Invoke-ChaosStudy.ps1 ... -DryRun:$false -Consent '<phrase from the preview>'
 ```
 
-The run collects baseline, injects, collects during, waits out recovery, then
-reports and seals the study.
+The run creates and validates the scenario configuration, collects baseline,
+executes, collects during, waits out recovery, then reports and seals the study.
 
 ## Reading the verdict
 
 | Verdict | Means |
 | --- | --- |
-| **Steady state held** | The fault landed and the objective survived it |
-| **Degraded but recovered** | Breached during injection, recovered afterwards |
+| **Steady state held** | The action landed and the objective survived it |
+| **Degraded but recovered** | Breached during the run, recovered afterwards |
 | **Steady state breached** | Breached and still breached after recovery |
-| **Inconclusive** | The fault could not be proven to have landed |
+| **Inconclusive** | The action could not be proven to have landed |
 
 Severity follows recovery, not drama: a breach that never recovers is `critical`;
 the same breach that self-heals is `medium`.
@@ -110,21 +119,22 @@ the same breach that self-heals is `medium`.
 The suite collects only what you name, because what counts as evidence depends
 on the system under study. Two forms:
 
-- `metrics:<name>` — an Azure Monitor metric on the target (or `@<resourceId>`
-  for a different resource, `|<aggregation>` to override the aggregation)
+- `metrics:<name>` — an Azure Monitor metric on the single scoped resource, or
+  `@<resourceId>` to pin one, `|<aggregation>` to override the aggregation. A
+  scope holding several resources has no implied metric target, so pin it.
 - `logs:<workspaceId>#<kql>` — a Log Analytics query
 
 Name at least one signal that would be expected to *move* under the action. That
-is what separates "resilient" from "the fault never landed".
+is what separates "resilient" from "the action never landed".
 
 ## Before you run against production
 
 Scoping checks readiness first. A study whose objective cannot be measured, or
-whose action parameters do not satisfy the live schema, teaches nothing — so
-readiness failure (exit `10`) is a real answer, not a gate to bypass. Exit `14`
-means the Chaos Studio target or capability is not enabled on the resource;
-injecting anyway would produce a false pass. Exit `16` means the platform could
-not be asked what it offers, and the suite refuses to substitute its own list.
+whose parameters do not satisfy the live schema, teaches nothing — so readiness
+failure (exit `10`) is a real answer, not a gate to bypass. Exit `14` means
+nothing is in scope or the action does not apply to what is; running anyway
+would produce a false pass. Exit `16` means the platform could not be asked what
+it offers, and the suite refuses to substitute its own list.
 
 ## Progressive discovery
 
@@ -149,16 +159,19 @@ available from the actions endpoint yet. When they ship, they appear in
 | `11` | Consent declined or phrase mismatch |
 | `12` | Plan changed after it was frozen |
 | `13` | Study already sealed |
-| `14` | Delivery path unavailable — target or capability not enabled |
+| `14` | Scope unverified — nothing in scope, or the action does not fit it |
 | `15` | Studies not comparable |
 | `16` | Live action discovery unavailable — there is no fallback |
+| `17` | Scenario configuration failed validation |
 
 ## Notes
 
+- Chaos Studio **V2** only: workspaces are the lifecycle root and resource
+  selection flows through workspace scopes. There is no V1 path and no fallback.
 - Core is `az` / Azure Resource Manager. There is no SRE Agent dependency and no
   required MCP dependency.
 - Studies persist under a dated store, so later chats can list, compare, and
   re-run them. Sealed studies are immutable — re-testing scopes a **new** study
   rather than overwriting the record.
-- Parameterised actions (`-Parameters`) are planned via `chaos-study-scope`
+- Parameterised scenarios (`-Parameters`) are planned via `chaos-study-scope`
   directly; hashtables cannot cross the chained entry point.

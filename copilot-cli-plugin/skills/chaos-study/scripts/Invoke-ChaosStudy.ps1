@@ -5,7 +5,7 @@
 .DESCRIPTION
     This is the opinionated front door. It answers one question end to end:
 
-        "Does <steady state> hold when I inject <fault> into <target>?"
+        "Does <steady state> hold when I execute <action> across <workspace scope>?"
 
     It does not reimplement any phase. It chains the three focused entry points,
     each of which remains independently usable:
@@ -29,11 +29,12 @@
 
 .EXAMPLE
     ./Invoke-ChaosStudy.ps1 -SubscriptionId $sub -ResourceGroup rg-prod `
-        -ResourceName payments-vm -ResourceType 'Microsoft.Compute/virtualMachines' `
-        -Action 'urn:csci:microsoft:virtualMachine:shutdown/1.0.0' `
+        -WorkspaceName ws-payments `
+        -Scenario 'zone-down' -Action 'urn:csci:microsoft:...' `
         -SteadyState 'successRate >= 99.5'
 
-    Plans the study and previews the run. Injects nothing.
+    Plans the study against an existing workspace and previews the run.
+    Executes nothing.
 
 .EXAMPLE
     ./Invoke-ChaosStudy.ps1 ... -DryRun:$false -Consent '<phrase the dry run prints>'
@@ -41,39 +42,57 @@
     Runs the study for real, then reports and seals it.
 
 .EXAMPLE
-    ./Invoke-ChaosStudy.ps1 -ListActions -SubscriptionId $sub -ResourceGroup rg-prod -ResourceName payments-vm
+    ./Invoke-ChaosStudy.ps1 -ListActions -SubscriptionId $sub -ResourceGroup rg-prod `
+        -WorkspaceName ws-payments
 
-    Lists the actions Chaos Studio actually offers for that resource's region,
-    read live from the service. This suite ships no fault catalogue.
+    Lists the actions Chaos Studio actually offers for that workspace's region,
+    read live from the service. This suite ships no action catalogue.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Study')]
 param(
-    [Parameter(ParameterSetName = 'List', Mandatory)][switch]$ListActions,
+    [Parameter(ParameterSetName = 'ListActions', Mandatory)][switch]$ListActions,
+    [Parameter(ParameterSetName = 'ListScenarios', Mandatory)][switch]$ListScenarios,
 
-    [Parameter(ParameterSetName = 'List', Mandatory)]
+    [Parameter(ParameterSetName = 'ListActions', Mandatory)]
+    [Parameter(ParameterSetName = 'ListScenarios', Mandatory)]
     [Parameter(ParameterSetName = 'Study', Mandatory)][string]$SubscriptionId,
-    [Parameter(ParameterSetName = 'List', Mandatory)]
+    [Parameter(ParameterSetName = 'ListActions', Mandatory)]
+    [Parameter(ParameterSetName = 'ListScenarios', Mandatory)]
     [Parameter(ParameterSetName = 'Study', Mandatory)][string]$ResourceGroup,
-    [Parameter(ParameterSetName = 'List', Mandatory)]
-    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$ResourceName,
-    [Parameter(ParameterSetName = 'List')]
-    [Parameter(ParameterSetName = 'Study')][string]$ResourceType,
-    [Parameter(ParameterSetName = 'List')]
-    [Parameter(ParameterSetName = 'Study')][string]$Region,
 
+    # The workspace is the lifecycle root: scopes, discovered resources,
+    # scenarios and runs all hang off one.
+    [Parameter(ParameterSetName = 'ListActions', Mandatory)]
+    [Parameter(ParameterSetName = 'ListScenarios', Mandatory)]
+    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$WorkspaceName,
+
+    # Create the workspace when it does not exist, over the given ARM scopes.
+    [Parameter(ParameterSetName = 'Study')][switch]$CreateWorkspace,
+    [Parameter(ParameterSetName = 'Study')][string[]]$Scope = @(),
+    [Parameter(ParameterSetName = 'ListActions')]
+    [Parameter(ParameterSetName = 'Study')][string]$Location,
+
+    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$Scenario,
     [Parameter(ParameterSetName = 'Study', Mandatory)][string]$Action,
-    [Parameter(ParameterSetName = 'Study')][string]$SteadyState,
-    [Parameter(ParameterSetName = 'Study')][ValidateRange(1, 60)][int]$DurationMinutes = 3,
-    [Parameter(ParameterSetName = 'Study')][ValidateRange(1, 60)][int]$BaselineMinutes = 5,
-    [Parameter(ParameterSetName = 'Study')][ValidateRange(1, 60)][int]$RecoveryMinutes = 5,
+    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$SteadyState,
+    [Parameter(ParameterSetName = 'Study')][ValidateRange(1, 240)][int]$DurationMinutes = 10,
+    [Parameter(ParameterSetName = 'Study')][ValidateRange(0, 240)][int]$BaselineMinutes = 5,
+    [Parameter(ParameterSetName = 'Study')][ValidateRange(0, 240)][int]$RecoveryMinutes = 10,
     [Parameter(ParameterSetName = 'Study')][hashtable]$Parameters,
     [Parameter(ParameterSetName = 'Study')][string]$Hypothesis,
     [Parameter(ParameterSetName = 'Study')][string[]]$SignalSource = @(),
+
+    # Blast radius, forwarded to the scenario configuration.
+    [Parameter(ParameterSetName = 'Study')][string[]]$FilterLocation = @(),
+    [Parameter(ParameterSetName = 'Study')][string[]]$ExcludeResource = @(),
+    [Parameter(ParameterSetName = 'Study')][string[]]$ExcludeType = @(),
+
     [Parameter(ParameterSetName = 'Study')][string]$StudyRoot,
-    [Parameter(ParameterSetName = 'Study')][string]$Location,
     [Parameter(ParameterSetName = 'Study')][bool]$DryRun = $true,
     [Parameter(ParameterSetName = 'Study')][string]$Consent,
+    [Parameter(ParameterSetName = 'Study')][switch]$FixPermissions,
+    [Parameter(ParameterSetName = 'Study')][switch]$KeepConfiguration,
     [Parameter(ParameterSetName = 'Study')][switch]$SkipDiscovery,
     [Parameter(ParameterSetName = 'Study')][switch]$PlanOnly
 )
@@ -175,16 +194,21 @@ from this phase without re-planning.
 # Action listing short-circuits the chain
 # ---------------------------------------------------------------------------
 
-if ($PSCmdlet.ParameterSetName -eq 'List') {
+if ($PSCmdlet.ParameterSetName -in @('ListActions', 'ListScenarios')) {
     $listArgs = @{
-        ListActions    = [switch]::Present
         SubscriptionId = $SubscriptionId
         ResourceGroup  = $ResourceGroup
-        ResourceName   = $ResourceName
+        WorkspaceName  = $WorkspaceName
     }
-    if ($ResourceType) { $listArgs['ResourceType'] = $ResourceType }
-    if ($Region) { $listArgs['Region'] = $Region }
-    $code = Invoke-ChaosPhase -Name 'chaos-study-scope (list)' -Script $scopeScript -Arguments $listArgs
+    if ($PSCmdlet.ParameterSetName -eq 'ListActions') {
+        $listArgs['ListActions'] = [switch]::Present
+        if ($Location) { $listArgs['Location'] = $Location }
+        $phaseName = 'chaos-study-scope (list actions)'
+    } else {
+        $listArgs['ListScenarios'] = [switch]::Present
+        $phaseName = 'chaos-study-scope (list scenarios)'
+    }
+    $code = Invoke-ChaosPhase -Name $phaseName -Script $scopeScript -Arguments $listArgs
     exit $code
 }
 
@@ -195,41 +219,46 @@ if ($PSCmdlet.ParameterSetName -eq 'List') {
 $scopeArgs = @{
     SubscriptionId  = $SubscriptionId
     ResourceGroup   = $ResourceGroup
-    ResourceName    = $ResourceName
+    WorkspaceName   = $WorkspaceName
+    Scenario        = $Scenario
     Action          = $Action
+    SteadyState     = $SteadyState
     DurationMinutes = $DurationMinutes
     BaselineMinutes = $BaselineMinutes
     RecoveryMinutes = $RecoveryMinutes
 }
-if ($ResourceType) { $scopeArgs['ResourceType'] = $ResourceType }
-if ($Region) { $scopeArgs['Region'] = $Region }
-if ($SteadyState) { $scopeArgs['SteadyState'] = $SteadyState }
+if ($CreateWorkspace) { $scopeArgs['CreateWorkspace'] = [switch]::Present }
+if ($Scope.Count -gt 0) { $scopeArgs['Scope'] = $Scope }
+if ($Location) { $scopeArgs['Location'] = $Location }
 if ($Hypothesis) { $scopeArgs['Hypothesis'] = $Hypothesis }
 if ($StudyRoot) { $scopeArgs['StudyRoot'] = $StudyRoot }
 if ($SignalSource.Count -gt 0) { $scopeArgs['SignalSource'] = $SignalSource }
+if ($FilterLocation.Count -gt 0) { $scopeArgs['FilterLocation'] = $FilterLocation }
+if ($ExcludeResource.Count -gt 0) { $scopeArgs['ExcludeResource'] = $ExcludeResource }
+if ($ExcludeType.Count -gt 0) { $scopeArgs['ExcludeType'] = $ExcludeType }
 if ($SkipDiscovery) { $scopeArgs['SkipDiscovery'] = [switch]::Present }
 if ($Parameters -and $Parameters.Count -gt 0) {
-    # Hashtables cannot cross the pwsh -File boundary, so parameterised actions are
-    # planned by calling the scope skill directly rather than through this chain.
-    Write-Error-Card -Title 'Use the scope skill for parameterised actions' -Body @"
+    # Hashtables cannot cross the pwsh -File boundary, so parameterised scenarios
+    # are planned by calling the scope skill directly rather than through this chain.
+    Write-Error-Card -Title 'Use the scope skill for parameterised scenarios' -Body @"
 -Parameters cannot be forwarded through the chained entry point.
 
 Plan the study with the scope skill directly, then continue here or with the run
 skill against the resulting study id:
 
-  chaos-study-scope -Action $Action -Parameters @{ ... }
+  chaos-study-scope -Scenario $Scenario -Action $Action -Parameters @{ ... }
 "@
     exit (Get-ChaosStudyExitCode -Name 'Error')
 }
 
 $scopeExit = Invoke-ChaosPhase -Name 'chaos-study-scope' -Script $scopeScript -Arguments $scopeArgs
 Stop-OnPhaseFailure -Name 'chaos-study-scope' -ExitCode $scopeExit -Guidance @"
-Scoping decides whether the study is worth running at all: it checks the fault
-path is actually open and the target is healthy enough that a breach would mean
-something. A failure here is a real answer, not an obstacle to work around.
+Scoping decides whether the study is worth running at all: it resolves the
+workspace, reads what is actually in its scopes, and checks the action applies to
+those resources. A failure here is a real answer, not an obstacle to work around.
 
-  exit 10  readiness gates failed - the target is already unhealthy
-  exit 14  the fault path is unavailable - the agent or capability is missing
+  exit 10  readiness gates failed - the scope is empty or already unhealthy
+  exit 14  discovery failed - the action or scenario is not offered here
 "@
 
 $store = if ($StudyRoot) { $StudyRoot } else { (Get-ChaosStudyRoot).path }
@@ -242,7 +271,7 @@ $studyId = $latest.studyId
 
 if ($PlanOnly) {
     Write-Card -Title 'Plan frozen' -Status 'success' -Body @"
-Study $studyId is planned and frozen. Nothing has been injected.
+Study $studyId is planned and frozen. Nothing has been executed.
 
 Review the plan, then run it when you are ready:
 
@@ -261,7 +290,8 @@ $runArgs = @{
 }
 if ($StudyRoot) { $runArgs['StudyRoot'] = $StudyRoot }
 if ($Consent) { $runArgs['Consent'] = $Consent }
-if ($Location) { $runArgs['Location'] = $Location }
+if ($FixPermissions) { $runArgs['FixPermissions'] = [switch]::Present }
+if ($KeepConfiguration) { $runArgs['KeepConfiguration'] = [switch]::Present }
 if ($SignalSource.Count -gt 0) { $runArgs['SignalSource'] = $SignalSource }
 
 $runExit = Invoke-ChaosPhase -Name 'chaos-study-run' -Script $runScript -Arguments $runArgs
@@ -269,11 +299,12 @@ Stop-OnPhaseFailure -Name 'chaos-study-run' -ExitCode $runExit -Guidance @"
   exit 11  consent was not given - re-run with the exact phrase the plan printed
   exit 12  the plan changed after it was frozen - re-scope rather than force it
   exit 13  this study is already sealed - scope a new one to re-test
+  exit 17  the scenario configuration did not validate - fix what it reported
 "@
 
 if ($DryRun) {
     Write-Card -Title 'Dry run complete' -Status 'success' -Body @"
-Study $studyId was previewed end to end. Nothing was injected, so there is no
+Study $studyId was previewed end to end. Nothing was executed, so there is no
 evidence to interpret and no report to write.
 
 When the preview matches your intent, arm it:

@@ -11,10 +11,12 @@
 
       steady state    without a numeric objective stated in advance there is
                       nothing to breach, so there is nothing to pass either
-      action fit      the action must be one the service reports for this
-                      target type, with the parameters its schema requires
+      scope           the workspace has to have discovered something, or the
+                      run touches nothing and reports success
+      action fit      the action must be one the service reports for a resource
+                      type in scope, with the parameters its schema requires
       observability   without a signal source the study can only prove the
-                      control plane accepted the experiment
+                      control plane accepted the scenario run
       blast radius    a window long enough to observe, short enough to bound
 
     Gates are `blocking` or `advisory`. Blocking gates stop scoping with exit
@@ -75,41 +77,90 @@ function Test-ChaosSteadyStatePredicate {
         -Detail "Steady state: $($Predicate.signal) $($Predicate.comparison) $($Predicate.threshold)$($Predicate.unit)."
 }
 
-function Test-ChaosActionTargetFit {
+function Test-ChaosScopePopulated {
     <#
     .SYNOPSIS
-        Blocking: does the service say this action applies to this target type?
+        Blocking: did the workspace actually discover anything to act on?
+
+    .DESCRIPTION
+        A workspace whose scopes resolve to no discovered resources will accept
+        a scenario configuration and run it to a clean Succeeded. Nothing was
+        touched, so nothing broke, and the report reads like a pass. That is the
+        single most misleading outcome this suite can produce, so an empty scope
+        stops scoping outright.
+
+        That verdict depends on having actually looked. When discovery was
+        deliberately skipped the count is not zero, it is unknown, and the gate
+        says so instead of failing: reporting "no resources" for a question we
+        never asked would be inventing evidence. The plan then carries L10 and
+        the run refuses to arm until discovery has confirmed the scope.
+    #>
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]]$ScopedResources,
+        [switch]$DiscoverySkipped
+    )
+
+    $count = @(@($ScopedResources) | Where-Object { $null -ne $_ }).Count
+
+    if ($DiscoverySkipped) {
+        return New-ChaosReadinessGate -Id 'scope-populated' -Title 'Workspace scope contains resources' `
+            -Status 'unknown' -Severity 'blocking' -LimitationCode 'L10' `
+            -Detail 'Discovery was skipped, so the workspace was never asked what it discovered. Whether the scope resolves to any resource at all is unverified.' `
+            -Remediation 'Re-scope without -SkipDiscovery before running this study, so an empty scope cannot be mistaken for a resilient result.'
+    }
+
+    if ($count -eq 0) {
+        return New-ChaosReadinessGate -Id 'scope-populated' -Title 'Workspace scope contains resources' `
+            -Status 'fail' -Severity 'blocking' `
+            -Detail 'The workspace reported no discovered resources. A scenario run against an empty scope succeeds without touching anything, which is indistinguishable from a resilient result.' `
+            -Remediation 'Check the workspace scopes cover the resources you meant to study, then run az chaos workspace refresh-recommendation and re-scope.'
+    }
+
+    return New-ChaosReadinessGate -Id 'scope-populated' -Title 'Workspace scope contains resources' `
+        -Status 'pass' -Severity 'blocking' `
+        -Detail "The workspace reported $count discovered resource(s) in scope."
+}
+
+function Test-ChaosActionScopeFit {
+    <#
+    .SYNOPSIS
+        Blocking: does the service report this action for a type in scope?
 
     .DESCRIPTION
         The answer comes from the action record the service returned, not from
-        a local expectation about what the action ought to support. When the
-        target type is not in the action's supportedTargetTypes the experiment
-        will be rejected, and finding that out here costs nothing.
+        a local expectation about what the action ought to support. When no
+        resource type in scope appears in the action's applicability list the
+        run has nothing to act on, and finding that out here costs nothing.
     #>
     param(
         [Parameter(Mandatory)][object]$Action,
-        [AllowNull()][AllowEmptyString()][string]$TargetType
+        [AllowNull()][AllowEmptyCollection()][string[]]$ScopedResourceTypes
     )
 
-    $supported = @($Action.supportedTargetTypes | ForEach-Object { $_.targetType })
+    $supported = @($Action.appliesTo | ForEach-Object { $_.resourceType })
+    $inScope = @(@($ScopedResourceTypes) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
-    if ([string]::IsNullOrWhiteSpace($TargetType)) {
-        return New-ChaosReadinessGate -Id 'action-target-fit' -Title 'Action applies to this target' `
+    if ($inScope.Count -eq 0) {
+        # An unverified action has no appliesTo list; appending an empty join
+        # would print a dangling "for: ." and imply the service said nothing.
+        $supportedText = if ($supported.Count -gt 0) { " The service reports this action for: $($supported -join ', ')." } else { '' }
+        return New-ChaosReadinessGate -Id 'action-scope-fit' -Title 'Action applies to a resource in scope' `
             -Status 'unknown' -Severity 'advisory' `
-            -Detail "The target's resource type could not be determined, so its fit with action '$($Action.name)' is unverified. The service reports this action for: $($supported -join ', ')." `
+            -Detail "No resource type could be read from the workspace scope, so its fit with action '$($Action.name)' is unverified.$supportedText" `
             -LimitationCode 'L10'
     }
 
-    if ($supported -notcontains $TargetType) {
-        return New-ChaosReadinessGate -Id 'action-target-fit' -Title 'Action applies to this target' `
+    $overlap = @($inScope | Where-Object { $supported -contains $_ })
+    if ($overlap.Count -eq 0) {
+        return New-ChaosReadinessGate -Id 'action-scope-fit' -Title 'Action applies to a resource in scope' `
             -Status 'fail' -Severity 'blocking' `
-            -Detail "Chaos Studio reports action '$($Action.name)' for $($supported -join ', '), which does not include '$TargetType'. The experiment would be rejected." `
-            -Remediation 'Run scoping with -ListActions to see the actions the service reports for this target type.'
+            -Detail "Chaos Studio reports action '$($Action.name)' for $($supported -join ', '), none of which are in scope ($($inScope -join ', ')). The run would act on nothing." `
+            -Remediation 'Run scoping with -ListActions to see the actions the service reports for the resource types this workspace discovered.'
     }
 
-    return New-ChaosReadinessGate -Id 'action-target-fit' -Title 'Action applies to this target' `
+    return New-ChaosReadinessGate -Id 'action-scope-fit' -Title 'Action applies to a resource in scope' `
         -Status 'pass' -Severity 'blocking' `
-        -Detail "The service reports action '$($Action.name)' for target type '$TargetType'."
+        -Detail "The service reports action '$($Action.name)' for $($overlap -join ', '), which is in scope."
 }
 
 function Test-ChaosActionParameterFit {
@@ -130,7 +181,7 @@ function Test-ChaosActionParameterFit {
             -LimitationCode 'L10'
     }
 
-    $problems = @(Test-ChaosActionParameters -Schema $schema -Parameters $Parameters)
+    $problems = ConvertTo-ChaosList (Test-ChaosActionParameters -Schema $schema -Parameters $Parameters)
     if ($problems.Count -gt 0) {
         return New-ChaosReadinessGate -Id 'action-parameters' -Title 'Action parameters match the service schema' `
             -Status 'fail' -Severity 'blocking' `
@@ -138,7 +189,7 @@ function Test-ChaosActionParameterFit {
             -Remediation 'Run scoping with -ListActions to print this action''s parameter schema, then supply -Parameters accordingly.'
     }
 
-    $specs = @(Get-ChaosActionParameterSpec -Schema $schema)
+    $specs = ConvertTo-ChaosList (Get-ChaosActionParameterSpec -Schema $schema)
     $requiredNames = @($specs | Where-Object { $_.required } | ForEach-Object { $_.name })
     $detail = if ($requiredNames.Count -gt 0) {
         "All required parameters supplied: $($requiredNames -join ', ')."
@@ -164,7 +215,7 @@ function Test-ChaosObservabilityCoverage {
     if (@($AvailableSources).Count -eq 0) {
         return New-ChaosReadinessGate -Id 'observability' -Title 'A signal can prove the fault landed' `
             -Status 'fail' -Severity 'advisory' `
-            -Detail 'No signal source was configured. The study can still run, but it will only be able to prove that the control plane accepted the experiment - never that the fault reached the workload. Every finding will carry mechanismProven: false.' `
+            -Detail 'No signal source was configured. The study can still run, but it will only be able to prove that the control plane accepted the scenario run - never that the fault reached the workload. Every finding will carry mechanismProven: false.' `
             -Remediation 'Re-run with -SignalSource "metrics:<metricName>" or -SignalSource "logs:<workspaceId>#<kql>".' `
             -LimitationCode 'L3'
     }
@@ -217,14 +268,14 @@ function Test-ChaosActionReversibility {
     if ($type -ieq 'Discrete') {
         return New-ChaosReadinessGate -Id 'reversibility' -Title 'Injection can be stopped early' `
             -Status 'fail' -Severity 'advisory' `
-            -Detail "Action '$($Action.name)' is Discrete: it runs to completion and cannot be cancelled once started. Cancelling the experiment stops the next step, not this fault, so the blast radius is set entirely by the parameters." `
+            -Detail "Action '$($Action.name)' is Discrete: it runs to completion and cannot be cancelled once started. Cancelling the scenario run stops the next action, not this one, so the blast radius is set entirely by the parameters and the configured filters." `
             -Remediation 'Confirm the parameters bound the impact acceptably before consenting; there is no abort once injection begins.' `
             -LimitationCode 'L6'
     }
 
     return New-ChaosReadinessGate -Id 'reversibility' -Title 'Injection can be stopped early' `
         -Status 'pass' -Severity 'advisory' `
-        -Detail "Action '$($Action.name)' is $type, so cancelling the experiment stops the fault."
+        -Detail "Action '$($Action.name)' is $type, so cancelling the scenario run stops the fault."
 }
 
 function Test-ChaosInjectionWindow {
@@ -254,16 +305,19 @@ function Invoke-ChaosReadinessGates {
     #>
     param(
         [Parameter(Mandatory)][object]$Action,
-        [AllowNull()][AllowEmptyString()][string]$TargetType,
+        [AllowNull()][AllowEmptyCollection()][string[]]$ScopedResourceTypes,
+        [AllowNull()][AllowEmptyCollection()][object[]]$ScopedResources,
         [AllowNull()][object]$Parameters,
         [AllowNull()][object]$SteadyState,
         [Parameter(Mandatory)][int]$InjectMinutes,
-        [AllowEmptyCollection()][string[]]$AvailableSources = @()
+        [AllowEmptyCollection()][string[]]$AvailableSources = @(),
+        [switch]$DiscoverySkipped
     )
 
     $gates = @(
         Test-ChaosSteadyStatePredicate -Predicate $SteadyState
-        Test-ChaosActionTargetFit -Action $Action -TargetType $TargetType
+        Test-ChaosScopePopulated -ScopedResources $ScopedResources -DiscoverySkipped:$DiscoverySkipped
+        Test-ChaosActionScopeFit -Action $Action -ScopedResourceTypes $ScopedResourceTypes
         Test-ChaosActionParameterFit -Action $Action -Parameters $Parameters
         Test-ChaosActionReversibility -Action $Action
         Test-ChaosInjectionWindow -InjectMinutes $InjectMinutes

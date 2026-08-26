@@ -22,15 +22,15 @@
 Set-StrictMode -Version Latest
 
 $ChaosStudyApiVersions = [ordered]@{
-    # Chaos Studio v2 - Microsoft.Chaos/workspaces (scenario path)
+    # Chaos Studio V2 - Microsoft.Chaos/workspaces, and the scenario,
+    # scenario-configuration and scenario-run resources beneath a workspace.
+    # This is the only Chaos control-plane surface this suite uses.
     chaosStudio              = '2026-05-01-preview'
-    # Microsoft.Chaos/locations/{region}/actions - the live action catalogue.
-    # This suite ships no bundled list of faults; every action it can plan is
-    # read from this endpoint at scope time and treated as authoritative.
+    # Microsoft.Chaos/locations/{region}/actions - the live action inventory.
+    # This suite ships no bundled list of faults; every action it can describe
+    # is read from this endpoint at scope time and treated as authoritative.
     chaosActions             = '2026-05-01-preview'
-    # Chaos Studio classic - Microsoft.Chaos/experiments, targets, capabilities
-    chaosClassic             = '2024-01-01'
-    # Generic ARM resource read - used to resolve a target's region
+    # Generic ARM resource read - used to resolve a scoped resource's region
     resources                = '2021-04-01'
     # Azure Monitor metrics - Microsoft.Insights/metrics
     metrics                  = '2024-02-01'
