@@ -28,18 +28,17 @@ function ConvertFrom-ChaosSignalSourceSpec {
 
     .DESCRIPTION
         Accepted forms:
-          k8s                        Ready/desired replica counts via kubectl
           metrics:<name>             Azure Monitor metric on the target resource
           metrics:<name>@<resourceId>   ... on a different resource
           metrics:<name>|<aggregation> ... with an explicit aggregation
           logs:<workspaceId>#<kql>   Log Analytics query
+
+        There is deliberately no resource-specific collector here. What counts
+        as evidence depends on the system under study, so the operator names it.
     #>
     param([Parameter(Mandatory)][string]$Spec)
 
     $text = $Spec.Trim()
-    if ($text -eq 'k8s' -or $text -eq 'kubernetes') {
-        return [pscustomobject]@{ kind = 'k8s'; id = 'k8s'; raw = $text }
-    }
 
     if ($text -like 'metrics:*') {
         $rest = $text.Substring('metrics:'.Length)
@@ -86,70 +85,10 @@ function ConvertFrom-ChaosSignalSourceSpec {
         }
     }
 
-    throw "Signal source '$Spec' is not recognised. Use 'k8s', 'metrics:<name>' or 'logs:<workspaceId>#<kql>'."
+    throw "Signal source '$Spec' is not recognised. Use 'metrics:<name>' or 'logs:<workspaceId>#<kql>'."
 }
 
 # -- Collectors ------------------------------------------------------------
-
-function Get-ChaosK8sReadinessSignal {
-    <#
-    .SYNOPSIS
-        Ready and desired replica counts, sampled once, from the cluster itself.
-
-    .DESCRIPTION
-        This is the closest thing to ground truth available without a metrics
-        pipeline, and it is the signal that proves an agent-based pod fault
-        actually landed.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$Namespace,
-        [AllowEmptyString()][string]$LabelSelector,
-        [Parameter(Mandatory)][object]$Window
-    )
-
-    $windowName = $Window.name
-    if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) {
-        return New-ChaosSignalResult -Source 'k8s' -Window $windowName `
-            -Caveat 'kubectl is not on PATH, so replica readiness could not be measured.'
-    }
-
-    $kubectlArgs = @('get', 'pods', '-n', $Namespace, '-o', 'json')
-    if (-not [string]::IsNullOrWhiteSpace($LabelSelector)) { $kubectlArgs += @('-l', $LabelSelector) }
-
-    try {
-        $raw = & kubectl @kubectlArgs 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            $detail = ($raw | Out-String).Trim()
-            $message = "kubectl returned exit code $LASTEXITCODE. $detail"
-            return New-ChaosSignalResult -Source 'k8s' -Window $windowName -Caveat (Protect-ChaosSecret -Text $message)
-        }
-        $parsed = ($raw | Out-String) | ConvertFrom-Json
-    } catch {
-        $message = "kubectl output could not be read: $($_.Exception.Message)"
-        return New-ChaosSignalResult -Source 'k8s' -Window $windowName -Caveat (Protect-ChaosSecret -Text $message)
-    }
-
-    $pods = @($parsed.items)
-    $ready = 0
-    $restarts = 0
-    foreach ($pod in $pods) {
-        $statuses = @()
-        if ($pod.status.PSObject.Properties.Name -contains 'containerStatuses') {
-            $statuses = @($pod.status.containerStatuses)
-        }
-        if ($statuses.Count -gt 0 -and -not ($statuses | Where-Object { -not $_.ready })) { $ready++ }
-        foreach ($status in $statuses) { $restarts += [int]$status.restartCount }
-    }
-
-    $values = [ordered]@{
-        totalPods    = $pods.Count
-        readyPods    = $ready
-        restartTotal = $restarts
-        sampledAt    = Get-ChaosUtcNow
-    }
-    return New-ChaosSignalResult -Source 'k8s' -Window $windowName -Values $values `
-        -Query ([ordered]@{ namespace = $Namespace; selector = $LabelSelector })
-}
 
 function Get-ChaosMetricSignal {
     <#
@@ -316,18 +255,19 @@ function Invoke-ChaosSignalCollection {
     $results = @()
     $specs = @()
 
-    # Kubernetes readiness is always collected: it is the only signal that can
-    # prove an in-cluster fault landed at all.
-    $specs += [pscustomobject]@{ kind = 'k8s'; id = 'k8s'; raw = 'k8s' }
     foreach ($source in @($Sources)) {
         if ([string]::IsNullOrWhiteSpace($source)) { continue }
-        if ($source -eq 'k8s' -or $source -eq 'kubernetes') { continue }
         try {
             $specs += ConvertFrom-ChaosSignalSourceSpec -Spec $source
         } catch {
             $results += New-ChaosSignalResult -Source $source -Window $Window.name `
                 -Caveat (Protect-ChaosSecret -Text $_.Exception.Message)
         }
+    }
+
+    if ($specs.Count -eq 0 -and $results.Count -eq 0) {
+        $results += New-ChaosSignalResult -Source 'none' -Window $Window.name `
+            -Caveat 'No signal sources were configured, so this window has no measurement of any kind.'
     }
 
     foreach ($spec in $specs) {
@@ -338,10 +278,6 @@ function Invoke-ChaosSignalCollection {
         }
 
         switch ($spec.kind) {
-            'k8s' {
-                $results += Get-ChaosK8sReadinessSignal -Namespace $Plan.target.namespace `
-                    -LabelSelector ([string]$Plan.target.selector) -Window $Window
-            }
             'metrics' {
                 $results += Get-ChaosMetricSignal -Spec $spec -ResourceId $Plan.target.resourceId -Window $Window
             }

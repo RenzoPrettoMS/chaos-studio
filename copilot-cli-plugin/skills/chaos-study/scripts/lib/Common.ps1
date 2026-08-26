@@ -72,15 +72,16 @@ function Get-ChaosSharedScriptStatus {
 
 # -- Exit-code contract (additive; the shipped skills own 0-4) --
 $ChaosStudyExit = @{
-    Success              = 0
-    Error                = 1
-    BroadFixUnconsented  = 4
-    ReadinessFailed      = 10
-    ConsentDeclined      = 11
-    ConfigurationDrift   = 12
-    StudyAlreadySealed   = 13
-    FaultPathUnavailable = 14
-    StudyIncomparable    = 15
+    Success                    = 0
+    Error                      = 1
+    BroadFixUnconsented        = 4
+    ReadinessFailed            = 10
+    ConsentDeclined            = 11
+    ConfigurationDrift         = 12
+    StudyAlreadySealed         = 13
+    FaultPathUnavailable       = 14
+    StudyIncomparable          = 15
+    ActionDiscoveryUnavailable = 16
 }
 
 function Get-ChaosStudyExitCode {
@@ -408,15 +409,86 @@ function New-ChaosSignalResult {
     }
 }
 
+function Get-ChaosSignalValueMap {
+    <#
+    .SYNOPSIS
+        Reduce a signal's measurements to a flat name -> value map.
+
+    .DESCRIPTION
+        Collectors report in whichever shape their source speaks. A metric query
+        returns a time series; a log query returns a single row of named
+        columns. Everything downstream - the predicate, the movement check, the
+        evidence table - needs one shape, and it needs it to be derived rather
+        than re-measured, so this is the only place the two are reconciled.
+
+        A series is summarised into first/last/min/max/mean/count. Those names
+        are then directly comparable across windows, which is what makes
+        "did this number move?" answerable without knowing what the number is.
+
+        A signal that was never measured yields an empty map, never zeros.
+    #>
+    param([Parameter(Mandatory)][AllowNull()][object]$Signal)
+
+    $map = [ordered]@{}
+    if (-not $Signal -or $null -eq $Signal.values) { return $map }
+    $values = $Signal.values
+
+    if ($values -is [System.Collections.IDictionary]) {
+        foreach ($key in @($values.Keys)) {
+            if ($key -eq 'sampledAt') { continue }
+            $map[[string]$key] = $values[$key]
+        }
+        return $map
+    }
+
+    $isSeries = ($values -is [System.Collections.IEnumerable]) -and ($values -isnot [string])
+    if (-not $isSeries) {
+        foreach ($property in @($values.PSObject.Properties)) {
+            if ($property.Name -eq 'sampledAt') { continue }
+            $map[$property.Name] = $property.Value
+        }
+        return $map
+    }
+
+    $numbers = [System.Collections.Generic.List[double]]::new()
+    foreach ($point in @($values)) {
+        if ($null -eq $point) { continue }
+        $raw = $point
+        if ($point -isnot [string] -and $point.PSObject.Properties.Name -contains 'value') {
+            $raw = $point.value
+        }
+        if ($null -eq $raw) { continue }
+        $parsed = 0.0
+        if ([double]::TryParse([string]$raw, [ref]$parsed)) { [void]$numbers.Add($parsed) }
+    }
+
+    if ($numbers.Count -eq 0) { return $map }
+
+    $map['first'] = $numbers[0]
+    $map['last'] = $numbers[$numbers.Count - 1]
+    $map['min'] = ($numbers | Measure-Object -Minimum).Minimum
+    $map['max'] = ($numbers | Measure-Object -Maximum).Maximum
+    $map['mean'] = [math]::Round((($numbers | Measure-Object -Average).Average), 4)
+    $map['count'] = $numbers.Count
+    return $map
+}
+
 # -- HTML escaping (NFR-8) --------------------------------
 function ConvertTo-ChaosHtmlText {
     <#
     .SYNOPSIS
         Escape a value for HTML text content. Every value drawn from Azure or
         from the model passes through here before it reaches the report.
+
+    .NOTES
+        CmdletBinding is deliberate. Without it this is a simple function, and
+        PowerShell silently routes an unrecognised named argument into $args
+        instead of failing - which renders every escaped value as an empty
+        string and produces a structurally valid but entirely blank report.
     #>
-    param([AllowNull()][object]$Value)
-    if ($null -eq $Value) { return '' }
-    $text = if ($Value -is [string]) { $Value } else { [string]$Value }
-    return $text.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;').Replace("'", '&#39;')
+    [CmdletBinding()]
+    param([Parameter(Mandatory, Position = 0)][AllowNull()][object]$Text)
+    if ($null -eq $Text) { return '' }
+    $value = if ($Text -is [string]) { $Text } else { [string]$Text }
+    return $value.Replace('&', '&amp;').Replace('<', '&lt;').Replace('>', '&gt;').Replace('"', '&quot;').Replace("'", '&#39;')
 }

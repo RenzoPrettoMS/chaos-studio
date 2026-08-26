@@ -24,8 +24,14 @@ Set-StrictMode -Version Latest
 $ChaosStudyApiVersions = [ordered]@{
     # Chaos Studio v2 - Microsoft.Chaos/workspaces (scenario path)
     chaosStudio              = '2026-05-01-preview'
+    # Microsoft.Chaos/locations/{region}/actions - the live action catalogue.
+    # This suite ships no bundled list of faults; every action it can plan is
+    # read from this endpoint at scope time and treated as authoritative.
+    chaosActions             = '2026-05-01-preview'
     # Chaos Studio classic - Microsoft.Chaos/experiments, targets, capabilities
     chaosClassic             = '2024-01-01'
+    # Generic ARM resource read - used to resolve a target's region
+    resources                = '2021-04-01'
     # Azure Monitor metrics - Microsoft.Insights/metrics
     metrics                  = '2024-02-01'
     # Log Analytics query API
@@ -35,8 +41,6 @@ $ChaosStudyApiVersions = [ordered]@{
     # Alerts Management, with the documented fallback
     alertsManagement         = '2023-05-01-preview'
     alertsManagementFallback = '2018-05-05'
-    # AKS managed clusters
-    managedClusters          = '2024-09-01'
     # Azure Monitor workspace (managed Prometheus)
     monitorWorkspace         = '2023-04-03'
     # Data collection rules - used to detect a Prometheus pipeline

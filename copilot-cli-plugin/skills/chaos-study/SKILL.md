@@ -1,6 +1,6 @@
 ---
 name: chaos-study
-description: "Run a complete Chaos reliability study against an AKS cluster: frame a falsifiable steady-state question, freeze a plan, inject a fault with explicit consent, collect before/during/after evidence, and produce a self-contained HTML report. Start here for 'is my service actually resilient to X?' questions."
+description: "Run a complete Chaos reliability study against an Azure resource: frame a falsifiable steady-state question, discover the faults Chaos Studio actually offers for that resource live, freeze a plan, inject with explicit consent, collect before/during/after evidence, and produce a self-contained HTML report. Start here for 'is my service actually resilient to X?' questions."
 ---
 
 # chaos-study — reliability studies, end to end
@@ -11,7 +11,7 @@ what the evidence actually showed.
 
 ## The question this suite answers
 
-> Does **`<steady state>`** hold when I inject **`<fault>`** into **`<target>`**?
+> Does **`<steady state>`** hold when I inject **`<action>`** into **`<target>`**?
 
 If you cannot phrase the goal that way, stop and reframe it. "Test resilience"
 is not a study — there is no way for it to fail, so it cannot teach you anything.
@@ -21,6 +21,11 @@ is not a study — there is no way for it to fail, so it cannot teach you anythi
 **A study is a falsifiable claim.** Every study needs a steady-state predicate
 that is measurable before injection and could plausibly break during it.
 
+**The platform decides what is possible, not this plugin.** The available faults
+are read live from Chaos Studio for the target's region, every time. This suite
+ships **no** fault catalogue, and there is no offline fallback: if the service
+cannot be asked, scoping stops with exit `16` rather than guessing.
+
 **Evidence beats vibes.** A verdict is only as good as the signals behind it. If
 a signal was not collected, the report says *not measured* — never `0`, never a
 plausible-looking guess. Absent evidence is reported as absent.
@@ -29,9 +34,9 @@ plausible-looking guess. Absent evidence is reported as absent.
 study takes both `-DryRun:$false` and typing back the exact phrase the plan
 prints. There is no flag that skips this.
 
-**Blast radius is bounded before it is armed.** Namespace, selector, and duration
-are frozen into the plan and hashed. If the plan changed after you approved it,
-the run refuses rather than injecting something you did not review.
+**Blast radius is bounded before it is armed.** Target, action, parameters and
+duration are frozen into the plan and hashed. If the plan changed after you
+approved it, the run refuses rather than injecting something you did not review.
 
 **A clean result is not automatically good news.** If the fault never actually
 reached the target, "steady state held" means nothing. The report says
@@ -44,7 +49,7 @@ This is a suite, not a monolith. Use the front door unless you need one phase.
 | Skill | Owns |
 | --- | --- |
 | **chaos-study** | chains the phases below; the default entry point |
-| **chaos-study-scope** | frames the question, checks readiness, freezes the plan |
+| **chaos-study-scope** | live action discovery, readiness, freezing the plan |
 | **chaos-study-run** | consent, injection, evidence collection |
 | **chaos-study-report** | interpretation, findings, the HTML report |
 | **chaos-study-history** | list, compare, and re-run past studies |
@@ -54,23 +59,26 @@ from that phase — you never have to restart from scratch.
 
 ## Usage
 
-**1. See what can be studied.** Fault choice determines what the study can prove,
-so start here rather than guessing a fault name:
+**1. Ask the platform what it can do here.** The answer depends on the region and
+the resource type, and it changes as Chaos Studio ships new actions:
 
 ```powershell
-./scripts/Invoke-ChaosStudy.ps1 -ListFaults
+./scripts/Invoke-ChaosStudy.ps1 -ListActions `
+    -SubscriptionId $sub -ResourceGroup rg-prod -ResourceName payments-vm `
+    -ResourceType 'Microsoft.Compute/virtualMachines'
 ```
 
-Each fault reports its **proof strength**. `strong` means a clean run is
-meaningful; `weak` means treat a clean run as inconclusive.
+Each action is printed with its canonical URN, its type, its supported target
+types and its parameter schema — all as the service reported them.
 
 **2. Plan and preview.** This injects nothing:
 
 ```powershell
 ./scripts/Invoke-ChaosStudy.ps1 `
-    -SubscriptionId $sub -ResourceGroup rg-prod -ClusterName aks-prod `
-    -Namespace payments -Selector app=api `
-    -Fault aks-chaosmesh-pod -SteadyState 'successRate >= 99.5'
+    -SubscriptionId $sub -ResourceGroup rg-prod -ResourceName payments-vm `
+    -ResourceType 'Microsoft.Compute/virtualMachines' `
+    -Action 'urn:csci:microsoft:virtualMachine:shutdown/1.0.0' `
+    -SteadyState 'successRate >= 99.5' -SignalSource 'metrics:Availability'
 ```
 
 Read the preview. It shows the exact blast radius, the windows, and the request
@@ -97,26 +105,39 @@ reports and seals the study.
 Severity follows recovery, not drama: a breach that never recovers is `critical`;
 the same breach that self-heals is `medium`.
 
+## Choosing signals
+
+The suite collects only what you name, because what counts as evidence depends
+on the system under study. Two forms:
+
+- `metrics:<name>` — an Azure Monitor metric on the target (or `@<resourceId>`
+  for a different resource, `|<aggregation>` to override the aggregation)
+- `logs:<workspaceId>#<kql>` — a Log Analytics query
+
+Name at least one signal that would be expected to *move* under the action. That
+is what separates "resilient" from "the fault never landed".
+
 ## Before you run against production
 
-Scoping checks the target is healthy first. A study on an already-broken target
-teaches nothing, so readiness failure (exit `10`) is a real answer, not a gate to
-bypass. Likewise exit `14` means the fault path is not open — the agent or
-capability is missing, and injecting anyway would produce a false pass.
+Scoping checks readiness first. A study whose objective cannot be measured, or
+whose action parameters do not satisfy the live schema, teaches nothing — so
+readiness failure (exit `10`) is a real answer, not a gate to bypass. Exit `14`
+means the Chaos Studio target or capability is not enabled on the resource;
+injecting anyway would produce a false pass. Exit `16` means the platform could
+not be asked what it offers, and the suite refuses to substitute its own list.
 
 ## Progressive discovery
 
-Do not memorise fault identifiers or JSON specs. They live next to the evidence
-requirements that make them interpretable:
+Action identifiers, parameters and required permissions are **not** documented
+here, because they are the service's to state and this plugin's to relay. Get
+them from `-ListActions`. What lives here is the method:
 
-- **`references/faults/_index.md`** — which fault answers which question
-- **`references/faults/<name>.md`** — prerequisites, blast radius, proof strength
-- **`references/scenarios/_index.md`** — ready-made Kubernetes studies
 - **`references/study-method.md`** — the five-phase method and why it is split
 - **`references/report-contract.md`** — what the report may and may not claim
 
-Kubernetes is the first vertical. The method is deliberately fault-agnostic so
-further verticals slot in as new guides rather than new scripts.
+Kubernetes/AKS-specific guidance is deliberately absent: those actions are not
+available from the actions endpoint yet. When they ship, they appear in
+`-ListActions` automatically, with no change to this suite.
 
 ## Exit codes
 
@@ -124,12 +145,13 @@ further verticals slot in as new guides rather than new scripts.
 | --- | --- |
 | `0` | Success |
 | `1` | Error |
-| `10` | Readiness gates failed — target is already unhealthy |
+| `10` | Readiness gates failed |
 | `11` | Consent declined or phrase mismatch |
 | `12` | Plan changed after it was frozen |
 | `13` | Study already sealed |
-| `14` | Fault path unavailable |
+| `14` | Delivery path unavailable — target or capability not enabled |
 | `15` | Studies not comparable |
+| `16` | Live action discovery unavailable — there is no fallback |
 
 ## Notes
 
@@ -138,5 +160,5 @@ further verticals slot in as new guides rather than new scripts.
 - Studies persist under a dated store, so later chats can list, compare, and
   re-run them. Sealed studies are immutable — re-testing scopes a **new** study
   rather than overwriting the record.
-- Parameterised faults (`-Parameters`) are planned via `chaos-study-scope`
+- Parameterised actions (`-Parameters`) are planned via `chaos-study-scope`
   directly; hashtables cannot cross the chained entry point.

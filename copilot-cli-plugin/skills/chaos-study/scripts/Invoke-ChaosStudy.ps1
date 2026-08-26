@@ -29,33 +29,40 @@
 
 .EXAMPLE
     ./Invoke-ChaosStudy.ps1 -SubscriptionId $sub -ResourceGroup rg-prod `
-        -ClusterName aks-prod -Namespace payments -Selector app=api `
-        -Fault aks-chaosmesh-pod -SteadyState 'successRate >= 99.5'
+        -ResourceName payments-vm -ResourceType 'Microsoft.Compute/virtualMachines' `
+        -Action 'urn:csci:microsoft:virtualMachine:shutdown/1.0.0' `
+        -SteadyState 'successRate >= 99.5'
 
     Plans the study and previews the run. Injects nothing.
 
 .EXAMPLE
-    ./Invoke-ChaosStudy.ps1 ... -DryRun:$false -Consent 'INJECT aks-prod payments'
+    ./Invoke-ChaosStudy.ps1 ... -DryRun:$false -Consent '<phrase the dry run prints>'
 
     Runs the study for real, then reports and seals it.
 
 .EXAMPLE
-    ./Invoke-ChaosStudy.ps1 -ListFaults
+    ./Invoke-ChaosStudy.ps1 -ListActions -SubscriptionId $sub -ResourceGroup rg-prod -ResourceName payments-vm
 
-    Lists the faults this vertical can study, with proof strength and prerequisites.
+    Lists the actions Chaos Studio actually offers for that resource's region,
+    read live from the service. This suite ships no fault catalogue.
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Study')]
 param(
-    [Parameter(ParameterSetName = 'List', Mandatory)][switch]$ListFaults,
-    [Parameter(ParameterSetName = 'List')][string]$Vertical = 'kubernetes',
+    [Parameter(ParameterSetName = 'List', Mandatory)][switch]$ListActions,
 
+    [Parameter(ParameterSetName = 'List', Mandatory)]
     [Parameter(ParameterSetName = 'Study', Mandatory)][string]$SubscriptionId,
+    [Parameter(ParameterSetName = 'List', Mandatory)]
     [Parameter(ParameterSetName = 'Study', Mandatory)][string]$ResourceGroup,
-    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$ClusterName,
-    [Parameter(ParameterSetName = 'Study')][string]$Namespace = 'default',
-    [Parameter(ParameterSetName = 'Study')][string]$Selector,
-    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$Fault,
+    [Parameter(ParameterSetName = 'List', Mandatory)]
+    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$ResourceName,
+    [Parameter(ParameterSetName = 'List')]
+    [Parameter(ParameterSetName = 'Study')][string]$ResourceType,
+    [Parameter(ParameterSetName = 'List')]
+    [Parameter(ParameterSetName = 'Study')][string]$Region,
+
+    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$Action,
     [Parameter(ParameterSetName = 'Study')][string]$SteadyState,
     [Parameter(ParameterSetName = 'Study')][ValidateRange(1, 60)][int]$DurationMinutes = 3,
     [Parameter(ParameterSetName = 'Study')][ValidateRange(1, 60)][int]$BaselineMinutes = 5,
@@ -63,7 +70,6 @@ param(
     [Parameter(ParameterSetName = 'Study')][hashtable]$Parameters,
     [Parameter(ParameterSetName = 'Study')][string]$Hypothesis,
     [Parameter(ParameterSetName = 'Study')][string[]]$SignalSource = @(),
-    [Parameter(ParameterSetName = 'Study')][string]$ChaosMeshNamespace = 'chaos-testing',
     [Parameter(ParameterSetName = 'Study')][string]$StudyRoot,
     [Parameter(ParameterSetName = 'Study')][string]$Location,
     [Parameter(ParameterSetName = 'Study')][bool]$DryRun = $true,
@@ -166,14 +172,19 @@ from this phase without re-planning.
 }
 
 # ---------------------------------------------------------------------------
-# Fault listing short-circuits the chain
+# Action listing short-circuits the chain
 # ---------------------------------------------------------------------------
 
 if ($PSCmdlet.ParameterSetName -eq 'List') {
-    $code = Invoke-ChaosPhase -Name 'chaos-study-scope (list)' -Script $scopeScript -Arguments @{
-        ListFaults = [switch]::Present
-        Vertical   = $Vertical
+    $listArgs = @{
+        ListActions    = [switch]::Present
+        SubscriptionId = $SubscriptionId
+        ResourceGroup  = $ResourceGroup
+        ResourceName   = $ResourceName
     }
+    if ($ResourceType) { $listArgs['ResourceType'] = $ResourceType }
+    if ($Region) { $listArgs['Region'] = $Region }
+    $code = Invoke-ChaosPhase -Name 'chaos-study-scope (list)' -Script $scopeScript -Arguments $listArgs
     exit $code
 }
 
@@ -182,32 +193,31 @@ if ($PSCmdlet.ParameterSetName -eq 'List') {
 # ---------------------------------------------------------------------------
 
 $scopeArgs = @{
-    SubscriptionId     = $SubscriptionId
-    ResourceGroup      = $ResourceGroup
-    ClusterName        = $ClusterName
-    Namespace          = $Namespace
-    Fault              = $Fault
-    DurationMinutes    = $DurationMinutes
-    BaselineMinutes    = $BaselineMinutes
-    RecoveryMinutes    = $RecoveryMinutes
-    ChaosMeshNamespace = $ChaosMeshNamespace
+    SubscriptionId  = $SubscriptionId
+    ResourceGroup   = $ResourceGroup
+    ResourceName    = $ResourceName
+    Action          = $Action
+    DurationMinutes = $DurationMinutes
+    BaselineMinutes = $BaselineMinutes
+    RecoveryMinutes = $RecoveryMinutes
 }
-if ($Selector) { $scopeArgs['Selector'] = $Selector }
+if ($ResourceType) { $scopeArgs['ResourceType'] = $ResourceType }
+if ($Region) { $scopeArgs['Region'] = $Region }
 if ($SteadyState) { $scopeArgs['SteadyState'] = $SteadyState }
 if ($Hypothesis) { $scopeArgs['Hypothesis'] = $Hypothesis }
 if ($StudyRoot) { $scopeArgs['StudyRoot'] = $StudyRoot }
 if ($SignalSource.Count -gt 0) { $scopeArgs['SignalSource'] = $SignalSource }
 if ($SkipDiscovery) { $scopeArgs['SkipDiscovery'] = [switch]::Present }
 if ($Parameters -and $Parameters.Count -gt 0) {
-    # Hashtables cannot cross the pwsh -File boundary, so parameterised faults are
+    # Hashtables cannot cross the pwsh -File boundary, so parameterised actions are
     # planned by calling the scope skill directly rather than through this chain.
-    Write-Error-Card -Title 'Use the scope skill for parameterised faults' -Body @"
+    Write-Error-Card -Title 'Use the scope skill for parameterised actions' -Body @"
 -Parameters cannot be forwarded through the chained entry point.
 
 Plan the study with the scope skill directly, then continue here or with the run
 skill against the resulting study id:
 
-  chaos-study-scope -Fault $Fault -Parameters @{ ... }
+  chaos-study-scope -Action $Action -Parameters @{ ... }
 "@
     exit (Get-ChaosStudyExitCode -Name 'Error')
 }

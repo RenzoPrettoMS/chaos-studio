@@ -60,12 +60,12 @@ function Get-ChaosStudyIdentityFacts {
     return [pscustomobject]@{
         studyId   = [string]$Study.studyId
         scopeHash = [string]$Study.scopeHash
-        target    = [string]$identity.target
-        faultUrn  = [string]$identity.faultUrn
-        faultPath = [string]$identity.faultPath
-        predicate = ConvertTo-ChaosNormalisedPredicate -Raw ([string]$identity.predicate)
-        windows   = $identity.windows
-        verdict   = [string]$Study.summary.verdict
+        target     = [string]$identity.target
+        faultUrn   = [string]$identity.faultUrn
+        targetType = [string]$identity.targetType
+        predicate  = ConvertTo-ChaosNormalisedPredicate -Raw ([string]$identity.predicate)
+        windows    = $identity.windows
+        verdict    = [string]$Study.summary.verdict
     }
 }
 
@@ -88,8 +88,8 @@ function Test-ChaosStudyComparability {
 
     if ($a.scopeHash -ne $b.scopeHash) { $reasons += "Different scope: $($a.scopeHash) vs $($b.scopeHash)." }
     if ($a.target -ne $b.target) { $reasons += "Different target: $($a.target) vs $($b.target)." }
-    if ($a.faultUrn -ne $b.faultUrn) { $reasons += "Different fault: $($a.faultUrn) vs $($b.faultUrn)." }
-    if ($a.faultPath -ne $b.faultPath) { $reasons += "Different fault path: $($a.faultPath) vs $($b.faultPath). A fault delivered by a different mechanism is a different experiment." }
+    if ($a.faultUrn -ne $b.faultUrn) { $reasons += "Different action: $($a.faultUrn) vs $($b.faultUrn)." }
+    if ($a.targetType -ne $b.targetType) { $reasons += "Different target type: $($a.targetType) vs $($b.targetType). A fault delivered through a different target is a different experiment." }
     if ($a.predicate -ne $b.predicate) { $reasons += "Different steady-state objective: '$($Baseline.identity.predicate)' vs '$($Candidate.identity.predicate)'." }
 
     foreach ($window in @('baselineMinutes', 'injectMinutes', 'recoveryMinutes')) {

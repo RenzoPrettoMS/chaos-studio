@@ -109,10 +109,12 @@ if ($OutputPath) {
 
 if (-not $NoSeal) {
     $identity = [ordered]@{
-        target       = "$($plan.target.resourceName)/$($plan.target.namespace)"
-        fault        = [string]$plan.fault.guide
+        target       = [string]$plan.target.resourceName
+        resourceId   = [string]$plan.target.resourceId
+        action       = [string]$plan.fault.action
         faultUrn     = [string]$plan.fault.faultUrn
-        faultPath    = [string]$plan.fault.faultPath
+        actionType   = [string]$plan.fault.actionType
+        targetType   = [string]$plan.fault.targetType
         predicate    = [string]$plan.question.steadyState.raw
         windows      = [ordered]@{
             baselineMinutes = $plan.windows.baselineMinutes

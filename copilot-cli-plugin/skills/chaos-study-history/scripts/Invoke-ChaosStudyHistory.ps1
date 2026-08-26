@@ -86,7 +86,7 @@ switch ($Action) {
                 Study    = $entry.studyId
                 State    = $entry.state
                 Target   = $(if ($entry.identity) { [string]$entry.identity.target } else { '-' })
-                Fault    = $(if ($entry.identity) { [string]$entry.identity.fault } else { '-' })
+                Action   = $(if ($entry.identity) { [string]$entry.identity.action } else { '-' })
                 Verdict  = $(if ($entry.summary) { [string]$entry.summary.verdict } else { '-' })
                 Findings = $(if ($entry.summary) { $entry.summary.findingCount } else { '-' })
                 Scope    = $entry.scopeHash
@@ -116,7 +116,7 @@ $(if ($entry.summary) { [string]$entry.summary.verdict } else { 'Not yet reporte
             'State'     = $entry.state
             'Sealed'    = $entry.sealedAt
             'Target'    = $(if ($entry.identity) { [string]$entry.identity.target } else { '-' })
-            'Fault'     = $(if ($entry.identity) { [string]$entry.identity.faultUrn } else { '-' })
+            'Action'    = $(if ($entry.identity) { [string]$entry.identity.faultUrn } else { '-' })
             'Predicate' = $(if ($entry.identity) { [string]$entry.identity.predicate } else { '-' })
             'Report'    = (Join-Path $entry.path 'report.html')
         })
@@ -212,27 +212,32 @@ $($baseline.studyId) ($($comparison.baseline.verdict))
             exit (Get-ChaosStudyExitCode -Name 'Error')
         }
         $scope = Join-Path $PSScriptRoot '..' '..' 'chaos-study-scope' 'scripts' 'Invoke-ChaosStudyScope.ps1'
-        $selectorLine = if ($plan.target.selector) { "`n    -Selector '$($plan.target.selector)' ``" } else { '' }
+        $resourceTypeLine = if ($plan.target.resourceType) { "`n    -ResourceType '$($plan.target.resourceType)' ``" } else { '' }
+        $regionLine = if ($plan.target.PSObject.Properties.Name -contains 'region' -and $plan.target.region) { "`n    -Region '$($plan.target.region)' ``" } else { '' }
+        $sourceLines = @($plan.signals.configuredSources | Where-Object { $_ } | ForEach-Object { "    -SignalSource '$_' ``" })
         $command = @(
             "& '$scope' ``"
             "    -SubscriptionId '$($plan.target.subscriptionId)' ``"
             "    -ResourceGroup '$($plan.target.resourceGroup)' ``"
-            "    -ClusterName '$($plan.target.resourceName)' ``"
-            "    -Namespace '$($plan.target.namespace)' ``$selectorLine"
-            "    -Fault '$($plan.fault.guide)' ``"
+            "    -ResourceName '$($plan.target.resourceName)' ``$resourceTypeLine$regionLine"
+            "    -Action '$($plan.fault.faultUrn)' ``"
             "    -SteadyState '$($plan.question.steadyState.raw)' ``"
+            $sourceLines
             "    -DurationMinutes $($plan.windows.injectMinutes) ``"
             "    -BaselineMinutes $($plan.windows.baselineMinutes) ``"
             "    -RecoveryMinutes $($plan.windows.recoveryMinutes)"
-        ) -join "`n"
+        ) | Where-Object { $_ } | ForEach-Object { $_ }
+        $command = ($command -join "`n")
 
         Write-Card -Title "Rerun study $($entry.studyId)" -Status 'info' -Body @"
 Rerunning creates a new study rather than overwriting this one, so the pair can
-be compared afterwards. Nothing has been injected - run the command below, then
-the chaos-study-run skill with explicit consent.
+be compared afterwards. The action is resolved against the live action list
+again, so a rerun fails loudly if the platform no longer offers it. Nothing has
+been injected - run the command below, then the chaos-study-run skill with
+explicit consent.
 "@ -Properties ([ordered]@{
-            'Target'    = "$($plan.target.resourceName)/$($plan.target.namespace)"
-            'Fault'     = [string]$plan.fault.displayName
+            'Target'    = [string]$plan.target.resourceName
+            'Action'    = [string]$plan.fault.displayName
             'Predicate' = [string]$plan.question.steadyState.raw
         })
         Write-Card -Title 'Command' -Status 'info' -Body $command

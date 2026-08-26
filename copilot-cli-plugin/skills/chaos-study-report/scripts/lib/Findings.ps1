@@ -32,6 +32,7 @@ $script:ChaosLimitationText = [ordered]@{
     L7 = 'Duration - the window may be too short to observe slow failure modes'
     L8 = 'Aborted - the run stopped before the planned window completed'
     L9 = 'Configuration drift - the target changed between planning and execution'
+    L10 = 'Discovery unverified - action metadata was not confirmed against the live Chaos Studio action list'
 }
 
 function Get-ChaosLimitationText {
@@ -50,10 +51,9 @@ function Get-ChaosSignalValue {
         [Parameter(Mandatory)][string]$Name
     )
     if (-not $Signal -or $null -eq $Signal.values) { return $null }
-    $values = $Signal.values
-    $names = if ($values -is [System.Collections.IDictionary]) { @($values.Keys) } else { @($values.PSObject.Properties.Name) }
-    if ($names -notcontains $Name) { return $null }
-    return $(if ($values -is [System.Collections.IDictionary]) { $values[$Name] } else { $values.$Name })
+    $map = Get-ChaosSignalValueMap -Signal $Signal
+    if (-not $map.Contains($Name)) { return $null }
+    return $map[$Name]
 }
 
 function Test-ChaosPredicate {
@@ -82,42 +82,77 @@ function Test-ChaosPredicate {
     }
 }
 
-function Get-ChaosReadinessDelta {
+function Get-ChaosImpactDelta {
     <#
     .SYNOPSIS
-        Did the Kubernetes readiness signal actually move between two windows?
+        Did any measured signal actually move between two windows?
 
     .DESCRIPTION
-        This is the data-plane proof for the Kubernetes vertical. A drop in ready
-        pods, or a rise in restarts, means the fault reached the workload.
+        This is the proof that the fault reached the system rather than being
+        accepted by the API and quietly doing nothing. It is deliberately
+        resource-agnostic: the study compares the numbers it was told to
+        collect, whatever they are, and reports movement in the operator's own
+        terms.
+
+        A signal has "moved" when a numeric value it reported in the baseline
+        window differs during injection. No threshold is applied here - the
+        question is only whether the system noticed, not whether it suffered.
     #>
     param(
-        [AllowNull()][object]$Before,
-        [AllowNull()][object]$During
+        [AllowNull()][object[]]$Before,
+        [AllowNull()][object[]]$During
     )
 
-    $readyBefore = Get-ChaosSignalValue -Signal $Before -Name 'readyPods'
-    $readyDuring = Get-ChaosSignalValue -Signal $During -Name 'readyPods'
-    $restartBefore = Get-ChaosSignalValue -Signal $Before -Name 'restartTotal'
-    $restartDuring = Get-ChaosSignalValue -Signal $During -Name 'restartTotal'
+    $beforeSignals = @(@($Before) | Where-Object { $null -ne $_ })
+    $duringSignals = @(@($During) | Where-Object { $null -ne $_ })
+    $measuredDuring = @($duringSignals | Where-Object { $null -ne $_.values })
 
-    if ($null -eq $readyDuring -and $null -eq $restartDuring) {
-        return [pscustomobject]@{ moved = $null; detail = 'No Kubernetes readiness measurement was available during injection.' }
+    if ($measuredDuring.Count -eq 0) {
+        return [pscustomobject]@{ moved = $null; detail = 'No signal was measured during injection, so there is nothing to compare.' }
     }
 
-    $readyDropped = ($null -ne $readyBefore -and $null -ne $readyDuring -and [int]$readyDuring -lt [int]$readyBefore)
-    $restartsRose = ($null -ne $restartBefore -and $null -ne $restartDuring -and [int]$restartDuring -gt [int]$restartBefore)
+    $movements = @()
+    # These loop variables must not reuse the parameter names: $Before/$During
+    # are constrained to [object[]], and PowerShell re-applies that constraint on
+    # every assignment - so a single signal assigned to $during would be silently
+    # re-wrapped into an array and read as a time series of signal objects,
+    # making the movement check unable to ever fire.
+    foreach ($duringSignal in $measuredDuring) {
+        $baseline = @($beforeSignals | Where-Object { $_.source -eq $duringSignal.source })
+        if ($baseline.Count -eq 0 -or $null -eq $baseline[0].values) { continue }
 
-    if ($readyDropped -or $restartsRose) {
-        $parts = @()
-        if ($readyDropped) { $parts += "ready pods fell from $readyBefore to $readyDuring" }
-        if ($restartsRose) { $parts += "restarts rose from $restartBefore to $restartDuring" }
-        return [pscustomobject]@{ moved = $true; detail = ($parts -join '; ') }
+        $names = @((Get-ChaosSignalValueMap -Signal $duringSignal).Keys)
+        foreach ($name in $names) {
+            $b = Get-ChaosSignalValue -Signal $baseline[0] -Name $name
+            $d = Get-ChaosSignalValue -Signal $duringSignal -Name $name
+            if ($null -eq $b -or $null -eq $d) { continue }
+
+            $bNum = 0.0
+            $dNum = 0.0
+            if (-not [double]::TryParse([string]$b, [ref]$bNum)) { continue }
+            if (-not [double]::TryParse([string]$d, [ref]$dNum)) { continue }
+            if ($bNum -eq $dNum) { continue }
+
+            $direction = if ($dNum -lt $bNum) { 'fell' } else { 'rose' }
+            $movements += "$($duringSignal.source).$name $direction from $b to $d"
+        }
+    }
+
+    if ($movements.Count -gt 0) {
+        return [pscustomobject]@{ moved = $true; detail = ($movements -join '; ') }
+    }
+
+    $comparable = @($measuredDuring | Where-Object { $s = $_; @($beforeSignals | Where-Object { $_.source -eq $s.source -and $null -ne $_.values }).Count -gt 0 })
+    if ($comparable.Count -eq 0) {
+        return [pscustomobject]@{
+            moved  = $null
+            detail = 'Signals were measured during injection but not in the baseline window, so no comparison is possible.'
+        }
     }
 
     return [pscustomobject]@{
         moved  = $false
-        detail = "Kubernetes readiness did not change during injection (ready pods $readyBefore then $readyDuring)."
+        detail = 'No measured signal changed between the baseline and injection windows.'
     }
 }
 
@@ -207,11 +242,7 @@ function Build-StudyFindings {
     $during = @($Evidence.during)
     $post = @($Evidence.post)
 
-    $k8sPre = $pre | Where-Object { $_.source -eq 'k8s' } | Select-Object -First 1
-    $k8sDuring = $during | Where-Object { $_.source -eq 'k8s' } | Select-Object -First 1
-    $k8sPost = $post | Where-Object { $_.source -eq 'k8s' } | Select-Object -First 1
-
-    $delta = Get-ChaosReadinessDelta -Before $k8sPre -During $k8sDuring
+    $delta = Get-ChaosImpactDelta -Before $pre -During $during
     $mechanismProven = $delta.moved -eq $true
 
     $predicate = $Plan.question.steadyState
@@ -224,8 +255,22 @@ function Build-StudyFindings {
         return $null
     }
 
-    $predicateDuring = Test-ChaosPredicate -Predicate $predicate -Value (Get-ChaosSignalValue -Signal (& $findByName $during) -Name 'value')
-    $predicatePost = Test-ChaosPredicate -Predicate $predicate -Value (Get-ChaosSignalValue -Signal (& $findByName $post) -Name 'value')
+    # A collector reports either a named column or a time series. Scoping has
+    # already refused to plan a study whose objective no source produces, so the
+    # only question here is which key carries the number: the signal's own name
+    # for a named column, or the series' final reading.
+    $readPredicateValue = {
+        param($signal)
+        if ($null -eq $signal) { return $null }
+        foreach ($candidate in @($signalName, 'value', 'last', 'mean')) {
+            $value = Get-ChaosSignalValue -Signal $signal -Name $candidate
+            if ($null -ne $value) { return $value }
+        }
+        return $null
+    }
+
+    $predicateDuring = Test-ChaosPredicate -Predicate $predicate -Value (& $readPredicateValue (& $findByName $during))
+    $predicatePost = Test-ChaosPredicate -Predicate $predicate -Value (& $readPredicateValue (& $findByName $post))
 
     $findings = @()
     $limitations = @('L1')
@@ -250,7 +295,7 @@ function Build-StudyFindings {
                 [ordered]@{ signal = $signalName; window = 'post'; kind = 'predicate' }
             ) `
             -Remediation @(
-                "Bound the blast radius of this failure mode for $($Plan.target.resourceName)/$($Plan.target.namespace) - add replicas, spread them across zones, or add a circuit breaker on the dependency the fault interrupted."
+                "Bound the blast radius of this failure mode for $($Plan.target.resourceName) - add redundancy, spread the workload across zones, or add a circuit breaker on the dependency the fault interrupted."
                 'Add an alert on this predicate so the same degradation is detected without a chaos study.'
             )
     } elseif ($null -eq $predicateDuring) {
@@ -268,16 +313,17 @@ function Build-StudyFindings {
 
     if (-not $mechanismProven) {
         $limitations += 'L3'
-        $evidenceRef = @([ordered]@{ signal = 'k8s'; window = 'during'; kind = 'mechanism' })
-        $findings += New-ChaosFinding -Key (Get-ChaosFindingKey -FaultUrn $Plan.fault.faultUrn -Signal 'mechanism' -Predicate 'data-plane-proof') `
-            -Title 'Fault injection was not proven to reach the workload' `
+        $evidenceRef = @([ordered]@{ signal = 'all-sources'; window = 'during'; kind = 'mechanism' })
+        $findings += New-ChaosFinding -Key (Get-ChaosFindingKey -FaultUrn $Plan.fault.faultUrn -Signal 'mechanism' -Predicate 'impact-proof') `
+            -Title 'Fault injection was not proven to reach the system' `
             -Severity 'low' -Confidence $(if ($null -eq $delta.moved) { 'low' } else { 'medium' }) `
             -Observation $delta.detail `
-            -Interpretation 'Chaos Studio reporting success means the fault was accepted by the control plane. Without a data-plane signal that moved, a clean result may mean the service is resilient - or that nothing was ever injected. These are not the same, and this study cannot tell them apart.' `
+            -Interpretation 'Chaos Studio reporting success means the fault was accepted by the control plane. Without a signal that moved, a clean result may mean the service is resilient - or that nothing was ever injected. These are not the same, and this study cannot tell them apart.' `
             -Evidence $evidenceRef `
             -Remediation @(
-                'Confirm the in-cluster agent or Chaos Mesh installation is healthy, then repeat the study.'
-                'Widen the blast radius slightly (for example mode: fixed-percent) so the effect is large enough to observe.'
+                'Add a signal that would be expected to move under this action, so a clean result can be distinguished from a fault that never landed.'
+                "Confirm the Chaos Studio target and capability for $($Plan.fault.faultUrn) are still enabled on the resource, then repeat the study."
+                'Widen the blast radius within the bounds the action allows, so the effect is large enough to observe.'
             )
     }
 

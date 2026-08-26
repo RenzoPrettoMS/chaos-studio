@@ -7,8 +7,8 @@
     Three ideas govern this file.
 
     Nothing runs without consent. Consent is a phrase the operator types, and
-    the phrase contains the cluster, the namespace and a hash of the plan. It
-    cannot be given by accident, it cannot be given in advance, and it cannot
+    the phrase contains the action, the target resource and a hash of the plan.
+    It cannot be given by accident, it cannot be given in advance, and it cannot
     be inherited from an environment variable - this suite deliberately ignores
     STARTCHAOS_NONINTERACTIVE, because "unattended" is not a reason to skip the
     one gate that bounds production risk.
@@ -79,14 +79,14 @@ function Get-ChaosConsentPhrase {
         The exact phrase the operator must type to authorise injection.
 
     .DESCRIPTION
-        The phrase names the blast radius (cluster and namespace) so it cannot
-        be typed without reading it, and carries the plan hash so it cannot be
+        The phrase names the action and the resource it lands on so it cannot be
+        typed without reading it, and carries the plan hash so it cannot be
         reused for a different plan.
     #>
     param([Parameter(Mandatory)][object]$Plan)
 
     $shortHash = ([string]$Plan.frozenConfigHash).Substring(0, 8)
-    return "inject $($Plan.fault.guide) into $($Plan.target.resourceName)/$($Plan.target.namespace) $shortHash"
+    return "inject $($Plan.fault.action) into $($Plan.target.resourceName) $shortHash"
 }
 
 function Assert-ChaosConsent {
@@ -113,13 +113,15 @@ function Assert-ChaosConsent {
         'The consent phrase did not match this plan exactly (comparison is case-sensitive).'
     }
 
+    $targetTypeText = if ($Plan.fault.targetType) { $Plan.fault.targetType } else { '(target type not resolved)' }
+
     Write-ChaosStudyFailure -Title 'Injection not authorised' -Message @"
 $reason
 
 This study would inject $($Plan.fault.displayName) into
-  cluster   $($Plan.target.resourceName)
-  namespace $($Plan.target.namespace)
-  selector  $(if ($Plan.target.selector) { $Plan.target.selector } else { '(all workloads in the namespace)' })
+  resource    $($Plan.target.resourceName)
+  resource id $($Plan.target.resourceId)
+  target type $targetTypeText
 for $($Plan.windows.injectMinutes) minutes.
 
 To authorise it, pass this phrase exactly:
@@ -138,24 +140,27 @@ function ConvertTo-ChaosFaultParameters {
         expects.
 
     .DESCRIPTION
-        Chaos Mesh faults take the whole specification as a single jsonSpec
-        string. Service-direct faults take flat key/value pairs, with non-scalar
-        values JSON-encoded.
+        The shape is driven by the action's own parameter schema, captured live
+        at scope time. Scalars go through as strings; anything structured is
+        JSON-encoded, because the experiment API carries every parameter value
+        as a string.
     #>
     param(
         [Parameter(Mandatory)][object]$Plan
     )
 
     $parameters = $Plan.fault.parameters
-    $isChaosMesh = ([string]$Plan.fault.targetType) -like '*ChaosMesh*'
+    if ($null -eq $parameters) { return @() }
 
-    if ($isChaosMesh) {
-        $spec = ConvertTo-ChaosCanonical -InputObject $parameters
-        return @(@{ key = 'jsonSpec'; value = ($spec | ConvertTo-Json -Depth 32 -Compress) })
+    # Member enumeration over an empty property collection throws under
+    # Set-StrictMode -Version Latest, so the names are projected explicitly.
+    $names = if ($parameters -is [System.Collections.IDictionary]) {
+        @($parameters.Keys)
+    } else {
+        @($parameters.PSObject.Properties | ForEach-Object { $_.Name })
     }
 
     $pairs = @()
-    $names = if ($parameters -is [System.Collections.IDictionary]) { @($parameters.Keys) } else { @($parameters.PSObject.Properties.Name) }
     foreach ($name in $names) {
         $value = if ($parameters -is [System.Collections.IDictionary]) { $parameters[$name] } else { $parameters.$name }
         $encoded = if ($value -is [string]) {
@@ -169,7 +174,27 @@ function ConvertTo-ChaosFaultParameters {
         }
         $pairs += @{ key = "$name"; value = $encoded }
     }
-    return ,@($pairs)
+    return $pairs
+}
+
+function Get-ChaosExperimentActionType {
+    <#
+    .SYNOPSIS
+        Map the action type the service reported onto the experiment schema's
+        action type.
+
+    .DESCRIPTION
+        The actions endpoint reports Continuous, Cancelable or Discrete. The
+        experiment body understands 'continuous' and 'discrete'. Cancelable
+        actions run for a window and can be stopped, so they are continuous as
+        far as the experiment body is concerned; discrete actions are a single
+        act with no duration.
+    #>
+    param([AllowNull()][string]$ActionType)
+
+    if ([string]::IsNullOrWhiteSpace($ActionType)) { return 'continuous' }
+    if ($ActionType -ieq 'Discrete') { return 'discrete' }
+    return 'continuous'
 }
 
 function New-ChaosExperimentDefinition {
@@ -182,8 +207,35 @@ function New-ChaosExperimentDefinition {
         [Parameter(Mandatory)][string]$Location
     )
 
-    $targetId = "$($Plan.target.resourceId)/providers/Microsoft.Chaos/targets/$($Plan.fault.targetType)"
-    $duration = "PT$($Plan.windows.injectMinutes)M"
+    # The target URI is the one the delivery probe actually walked at scope
+    # time, so the experiment addresses exactly what was verified. Only when no
+    # probe ran at all does this fall back to the documented convention.
+    $targetId = $null
+    if ($Plan.PSObject.Properties.Name -contains 'readiness' -and
+        $Plan.readiness.PSObject.Properties.Name -contains 'deliveryPath' -and
+        $null -ne $Plan.readiness.deliveryPath -and
+        $Plan.readiness.deliveryPath.PSObject.Properties.Name -contains 'targetUri') {
+        $targetId = [string]$Plan.readiness.deliveryPath.targetUri
+    }
+    if ([string]::IsNullOrWhiteSpace($targetId)) {
+        # No probe confirmed a Chaos Studio target on this resource. Emitting a
+        # plausible-looking resource id here would be inventing evidence, so the
+        # preview carries an obviously unusable placeholder instead. Arming is
+        # already refused while the delivery path is anything but 'open'.
+        $targetId = "$($Plan.target.resourceId)/providers/Microsoft.Chaos/targets/<unresolved: re-scope without -SkipDiscovery>"
+    }
+
+    $experimentActionType = Get-ChaosExperimentActionType -ActionType ([string]$Plan.fault.actionType)
+
+    $action = [ordered]@{
+        type       = $experimentActionType
+        name       = $Plan.fault.faultUrn
+        selectorId = 'studySelector'
+    }
+    if ($experimentActionType -eq 'continuous') {
+        $action['duration'] = "PT$($Plan.windows.injectMinutes)M"
+    }
+    $action['parameters'] = @(ConvertTo-ChaosFaultParameters -Plan $Plan | Where-Object { $null -ne $_ })
 
     return [ordered]@{
         location   = $Location
@@ -202,15 +254,7 @@ function New-ChaosExperimentDefinition {
                     branches = @(
                         [ordered]@{
                             name    = 'primary'
-                            actions = @(
-                                [ordered]@{
-                                    type       = 'continuous'
-                                    name       = $Plan.fault.faultUrn
-                                    selectorId = 'studySelector'
-                                    duration   = $duration
-                                    parameters = @(ConvertTo-ChaosFaultParameters -Plan $Plan)
-                                }
-                            )
+                            actions = @($action)
                         }
                     )
                 }

@@ -15,9 +15,9 @@ creates a **new** study rather than overwriting the old one — otherwise there 
 nothing to compare against and no way to show improvement.
 
 **Only compare like with like.** Two studies are comparable only if the scope,
-target, fault, fault path, and normalised predicate match, and each window is
+target, action, target type, and normalised predicate match, and each window is
 within ±20% of its counterpart. Anything else exits `15` and explains which
-attribute diverged. A comparison across different faults is not evidence.
+attribute diverged. A comparison across different actions is not evidence.
 
 **Findings are matched by key, not by title.** Every finding carries a stable
 `findingKey`. Rewording a title does not make a problem look resolved, and a
@@ -28,7 +28,9 @@ genuinely different problem never masquerades as the same one.
 
 **Re-run prints, it does not inject.** The `rerun` action emits the exact scope
 command that reproduces a study. You review it and run it. Nothing is injected
-from here.
+from here. Because scoping re-queries the live action list, a rerun of a study
+whose action the platform no longer offers fails loudly instead of silently
+testing something else.
 
 ## Usage
 
@@ -38,7 +40,7 @@ from here.
 ./scripts/Invoke-ChaosStudyHistory.ps1 -Action list
 ```
 
-Add `-ScopeHash <hash>` to narrow to one target/fault pairing, or `-Json` for
+Add `-ScopeHash <hash>` to narrow to one target/action pairing, or `-Json` for
 machine-readable output.
 
 **Inspect one:**
@@ -86,7 +88,8 @@ The root is resolved in this order:
 
 Layout is `<root>/<scopeHash>/<studyId>/`, where `studyId` is
 `<UTC timestamp>-<8 hex>`. The scope hash groups every study of the same
-target/fault pairing, which is what makes comparison meaningful.
+subscription / resource group / resource / type / region, which is what makes
+comparison meaningful.
 
 States: `EMPTY`, `PLANNED`, `EXECUTED`, `SEALED`, `ABANDONED`. Only `SEALED`
 studies carry a report; the index is rebuilt from disk on every read, so a stale

@@ -85,12 +85,15 @@ function New-ChaosSignalTable {
             $valueCell = if ($null -eq $signal.values) {
                 '<span class="notmeasured">not measured</span>'
             } else {
-                $names = if ($signal.values -is [System.Collections.IDictionary]) { @($signal.values.Keys) } else { @($signal.values.PSObject.Properties.Name) }
-                $parts = foreach ($name in ($names | Sort-Object)) {
-                    $v = if ($signal.values -is [System.Collections.IDictionary]) { $signal.values[$name] } else { $signal.values.$name }
-                    "$(ConvertTo-ChaosHtmlText -Text $name) = $(ConvertTo-ChaosReportValue -Value $v)"
+                $map = Get-ChaosSignalValueMap -Signal $signal
+                if ($map.Count -eq 0) {
+                    '<span class="notmeasured">not measured</span>'
+                } else {
+                    $parts = foreach ($name in @($map.Keys)) {
+                        "$(ConvertTo-ChaosHtmlText -Text $name) = $(ConvertTo-ChaosReportValue -Value $map[$name])"
+                    }
+                    ($parts -join '<br>')
                 }
-                ($parts -join '<br>')
             }
             $caveat = if ($signal.caveat) { ConvertTo-ChaosHtmlText -Text ([string]$signal.caveat) } else { '&mdash;' }
             $rows += "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string]$signal.source))</td><td>$window</td><td class=`"num`">$valueCell</td><td>$caveat</td></tr>"
@@ -152,7 +155,7 @@ function New-ChaosStudyReportHtml {
 
     $template = [System.IO.File]::ReadAllText((Get-ChaosReportTemplatePath))
     $visual = Get-ChaosVerdictVisual -Verdict $Findings.verdict
-    $target = "$($Plan.target.resourceName)/$($Plan.target.namespace)"
+    $target = [string]$Plan.target.resourceName
 
     $verdictDetail = switch ($Findings.verdict) {
         'Steady state held'      { "$($Plan.question.steadyState.raw) held throughout injection and recovery." }
@@ -163,7 +166,7 @@ function New-ChaosStudyReportHtml {
 
     $headerFacts = @(
         New-ChaosReportRow -Label 'Target' -Value $target
-        New-ChaosReportRow -Label 'Fault' -Value ([string]$Plan.fault.displayName)
+        New-ChaosReportRow -Label 'Action' -Value ([string]$Plan.fault.displayName)
         New-ChaosReportRow -Label 'Steady state' -Value ([string]$Plan.question.steadyState.raw)
         New-ChaosReportRow -Label 'Injection window' -Value "$($Plan.windows.injectMinutes) minutes"
         New-ChaosReportRow -Label 'Run started' -Value ([string]$RunRecord.startedAt)
@@ -171,9 +174,9 @@ function New-ChaosStudyReportHtml {
     ) -join "`n"
 
     $mechanismSentence = if ($Findings.mechanismProven) {
-        'The fault was proven to reach the workload.'
+        'The fault was proven to reach the system: measured signals moved during injection.'
     } else {
-        'The fault was not proven to reach the workload, so a clean result cannot be read as resilience.'
+        'The fault was not proven to reach the system, so a clean result cannot be read as resilience.'
     }
 
     $summary = @"
@@ -187,7 +190,13 @@ $(ConvertTo-ChaosHtmlText -Text $mechanismSentence)</p>
 "@
 
     $parameterRows = @()
-    $paramNames = if ($Plan.fault.parameters -is [System.Collections.IDictionary]) { @($Plan.fault.parameters.Keys) } else { @($Plan.fault.parameters.PSObject.Properties.Name) }
+    $paramNames = if ($null -eq $Plan.fault.parameters) {
+        @()
+    } elseif ($Plan.fault.parameters -is [System.Collections.IDictionary]) {
+        @($Plan.fault.parameters.Keys)
+    } else {
+        @($Plan.fault.parameters.PSObject.Properties | ForEach-Object { $_.Name })
+    }
     foreach ($name in ($paramNames | Sort-Object)) {
         $value = if ($Plan.fault.parameters -is [System.Collections.IDictionary]) { $Plan.fault.parameters[$name] } else { $Plan.fault.parameters.$name }
         $rendered = if ($value -is [string] -or $value -is [bool] -or $value -is [int] -or $value -is [long] -or $value -is [double]) {
@@ -201,18 +210,17 @@ $(ConvertTo-ChaosHtmlText -Text $mechanismSentence)</p>
     $tested = @"
 <dl class="kv">
 $(New-ChaosReportRow -Label 'Resource' -Value ([string]$Plan.target.resourceId))
-$(New-ChaosReportRow -Label 'Namespace' -Value ([string]$Plan.target.namespace))
-$(New-ChaosReportRow -Label 'Selector' -Value $(if ($Plan.target.selector) { [string]$Plan.target.selector } else { 'whole namespace' }))
-$(New-ChaosReportRow -Label 'Fault URN' -Value ([string]$Plan.fault.faultUrn))
-$(New-ChaosReportRow -Label 'Fault path' -Value ([string]$Plan.fault.faultPath))
+$(New-ChaosReportRow -Label 'Region' -Value ([string]$Plan.target.region))
+$(New-ChaosReportRow -Label 'Action URN' -Value ([string]$Plan.fault.faultUrn))
+$(New-ChaosReportRow -Label 'Action type' -Value ([string]$Plan.fault.actionType))
+$(New-ChaosReportRow -Label 'Target type' -Value ([string]$Plan.fault.targetType))
+$(New-ChaosReportRow -Label 'Action metadata' -Value $(if ([string]$Plan.fault.source -eq 'live-discovery') { 'discovered live from Microsoft.Chaos/locations/{region}/actions' } else { $null }))
 $(New-ChaosReportRow -Label 'Windows' -Value "baseline $($Plan.windows.baselineMinutes) min, injection $($Plan.windows.injectMinutes) min, recovery $($Plan.windows.recoveryMinutes) min")
 </dl>
-<h3>Fault parameters</h3>
+<h3>Action parameters</h3>
 <table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>
 $($parameterRows -join "`n")
 </tbody></table>
-<h3>Blast-radius controls</h3>
-$(New-ChaosReportList -Items $Plan.safety.blastRadiusControls)
 <h3>Abort conditions</h3>
 $(New-ChaosReportList -Items $Plan.safety.abortConditions)
 "@

@@ -6,7 +6,7 @@ description: "Execute a frozen Chaos study plan against Azure: verify plan integ
 # chaos-study-run — the only phase that changes production
 
 Everything before this is analysis. This skill injects a real fault into a real
-cluster, so it is deliberately the most conservative script in the suite.
+Azure resource, so it is deliberately the most conservative script in the suite.
 
 ## Principles
 
@@ -50,26 +50,32 @@ by scoping a new one, so history stays comparable.
 
 ```powershell
 ./scripts/Invoke-ChaosStudyRun.ps1 -StudyId latest -DryRun:$false `
-    -Consent 'INJECT aks-prod payments'
+    -Consent '<phrase from the preview>'
 ```
 
 Switches worth knowing:
 
-- `-SignalSource` — add evidence sources beyond the plan's defaults
-- `-Location` — where the experiment resource is created
+- `-SignalSource` — add evidence sources beyond the plan's (`metrics:` / `logs:`)
+- `-Location` — where the experiment resource is created; defaults to the
+  target's region as recorded in the plan
 - `-PollSeconds` — experiment status poll interval
 - `-KeepExperiment` — leave the experiment for inspection (it stays stopped)
 
 ## What actually happens
 
 1. Load the plan and re-verify its hash
-2. Re-verify the fault path is still open
+2. Re-verify the delivery path is still open — target onboarded, capability enabled
 3. Render the consent phrase and require it back verbatim
 4. Collect the **baseline** window
 5. Create and start the experiment; poll until it completes
 6. Collect the **during** window while the fault is live
 7. Wait out recovery, then collect the **post** window
 8. Delete the experiment (always), write `run-record.v1.json` and evidence
+
+The experiment body is built from the action metadata the plan captured live at
+scope time: the canonical URN, the parameters that satisfied the service's own
+schema, and the action type. A `Discrete` action is emitted as a discrete branch
+with no duration; everything else runs for the planned injection window.
 
 ## Implementation note
 
@@ -88,7 +94,7 @@ change cannot silently alter behaviour.
 | `11` | Consent declined or phrase mismatch |
 | `12` | Plan changed after it was frozen |
 | `13` | Study already sealed |
-| `14` | Fault path no longer available |
+| `14` | Delivery path no longer available |
 
 ## If it fails partway
 
@@ -103,5 +109,6 @@ explicit limitations rather than hiding them.
 chaos-study-report -StudyId <studyId>
 ```
 
-See `../chaos-study/references/study-method.md` for how the windows are chosen
-and `../chaos-study/references/faults/<name>.md` for per-fault blast radius.
+See `../chaos-study/references/study-method.md` for how the windows are chosen.
+Per-action blast radius is not documented locally: it comes from the live action
+metadata frozen into the plan, which the dry run prints in full.

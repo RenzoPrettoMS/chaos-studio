@@ -11,16 +11,16 @@ importantly — what they do **not** mean.
 ## Principles
 
 **Interpretation is pure.** This skill reads only what the run wrote. It calls no
-Azure APIs, collects nothing new, and changes nothing in your cluster. Given the
-same evidence it produces the same report, every time.
+Azure APIs, collects nothing new, and changes nothing in your environment. Given
+the same evidence it produces the same report, every time.
 
 **Absent evidence is reported as absent.** A signal that was not collected
 renders as *not measured*, never as `0`. A zero is a measurement; a gap is not.
 
-**A pass requires proof the fault landed.** If the mechanism cannot be shown to
-have worked — pods never went unready, restarts never rose — the verdict is
-**Inconclusive**, not "held". Claiming resilience against a fault that never
-arrived is the most expensive mistake this suite can make, so it is designed out.
+**A pass requires proof the fault landed.** If no collected signal moved between
+the baseline and injection windows, the verdict is **Inconclusive**, not "held".
+Claiming resilience against a fault that never arrived is the most expensive
+mistake this suite can make, so it is designed out.
 
 **Severity follows recovery, not drama.** A breach that never recovers is
 `critical`. The identical breach that self-heals within the recovery window is
@@ -62,14 +62,18 @@ renders beside it as `report-<studyId>.html` and exits `0`.
 
 ## Report sections
 
-1. Masthead — verdict, target, fault, window
+1. Masthead — verdict, target, action, window
 2. What was asked — the steady-state predicate and hypothesis
-3. Tests run — windows, injection, experiment outcome
+3. Tests run — the action as the service described it, windows, experiment outcome
 4. Evidence — signal-by-signal, before / during / after
 5. Findings — prioritized, with severity and the evidence behind each
 6. Limitations — what this study could not establish
 7. Remediation — what to do about the findings
 8. Provenance — plan hash, command trail, api-versions
+
+The "Tests run" section states that the action metadata was discovered live from
+`Microsoft.Chaos/locations/{region}/actions`, so a reader can see the identity,
+type and target type came from the platform rather than from a local list.
 
 ## Limitation codes
 
@@ -81,6 +85,7 @@ renders beside it as `report-<studyId>.html` and exits `0`.
 | `L7` | Injection window ≤ 3 minutes — too short to separate resilience from luck |
 | `L8` | The experiment failed or was cancelled mid-run |
 | `L9` | The plan hash did not match at run time |
+| `L10` | Action metadata was not confirmed against the live action list |
 
 Additional codes are carried forward from the readiness gates recorded at scope
 time. `L1` is always present — by design, because it is always true.

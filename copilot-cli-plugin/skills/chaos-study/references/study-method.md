@@ -23,14 +23,21 @@ know, and produces evidence either way. That difference drives everything here:
 Decide *what system*, *what fault*, and *what would count as a failure* —
 before touching anything.
 
-The output is a **study plan**: target, fault, blast-radius controls, steady
+The fault is not chosen from a list this suite carries. It is chosen from the
+list Chaos Studio returns for the target's region, live, at scope time. That
+response is authoritative for the action's identity, its type, its supported
+target types and its parameter schema. There is no bundled catalogue and no
+offline fallback: if the platform cannot be asked, scoping stops at exit code 16.
+
+The output is a **study plan**: target, action metadata as discovered, steady
 state predicate, abort conditions, and the signals that will be collected.
 A plan is a written commitment. If the plan cannot be written, the study does
 not happen.
 
-Scoping fails closed. If the fault path is unavailable (capability not
-enabled, agent not installed, permission missing), we stop at exit code 14
-rather than degrading to a weaker fault that answers a different question.
+Scoping fails closed. If the delivery path is unavailable (resource not
+onboarded as a target, capability not enabled, permission missing), we stop at
+exit code 14 rather than substituting a different fault that answers a different
+question.
 
 ### 2. Readiness
 
@@ -39,7 +46,8 @@ Verify the plan is executable *and* observable.
 Two independent checks:
 
 - **Executable** — can Chaos Studio actually inject this fault at this target
-  right now?
+  right now? Does the target type the action supports match the resource, and do
+  the supplied parameters satisfy the schema the service published?
 - **Observable** — will we be able to tell what happened? If no signal source
   covers the impact, the study can still run, but it will produce a finding
   with `confidence: low` and a mandatory limitation. We say so *before*
@@ -59,8 +67,8 @@ Rules that do not bend:
 - **Non-interactive escape hatches do not apply.** The study suite ignores
   `STARTCHAOS_NONINTERACTIVE`. A human types the consent string or nothing is
   injected.
-- **The blast radius is in the plan, not in the operator's head.** Selectors,
-  percentages and durations are frozen at consent time.
+- **The blast radius is in the plan, not in the operator's head.** The target,
+  the action parameters and the duration are frozen at consent time.
 - **Abort is not cleanup.** Abort conditions are evaluated during the run; if
   one trips, the fault stops and the study records that it was aborted, which
   is itself a finding.
@@ -76,8 +84,8 @@ and it must carry a caveat saying why. Every signal collector returns the same
 shape so this cannot be fudged.
 
 Control-plane state — "the experiment reported Success" — is **not** proof that
-the fault reached the workload. It proves Chaos Studio accepted the request.
-Only a data-plane signal can set `mechanismProven: true`.
+the fault reached the system under study. It proves Chaos Studio accepted the
+request. Only a data-plane signal can set `mechanismProven: true`.
 
 ### 5. Conclude
 
@@ -107,7 +115,7 @@ mode:
 | Skill | Owns | Produces |
 |---|---|---|
 | `chaos-study` | the opinionated end-to-end path | an orchestrated study |
-| `chaos-study-scope` | target, fault, readiness | `study-plan.v1.json` |
+| `chaos-study-scope` | discovery, target, readiness | `study-plan.v1.json` |
 | `chaos-study-run` | consent, injection, observation | `run-record.v1.json` |
 | `chaos-study-report` | interpretation, rendering, sealing | `findings.v1.json`, `report.html` |
 | `chaos-study-history` | recall and comparison | listings, diffs, reruns |

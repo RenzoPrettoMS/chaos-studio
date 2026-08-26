@@ -21,7 +21,7 @@
     Previews the latest planned study without touching anything.
 
 .EXAMPLE
-    ./Invoke-ChaosStudyRun.ps1 -DryRun:$false -Consent 'inject aks-chaosmesh-pod into aks-prod/payments 3d1f87dd'
+    ./Invoke-ChaosStudyRun.ps1 -DryRun:$false -Consent 'inject microsoft-virtualmachine-shutdown into payments-vm 3d1f87dd'
     Runs it.
 #>
 
@@ -101,7 +101,7 @@ if ($sources.Count -eq 0 -and $plan.signals.configuredSources) {
 
 if ($DryRun) {
     $phrase = Get-ChaosConsentPhrase -Plan $plan
-    $definition = New-ChaosExperimentDefinition -Plan $plan -Location ($Location ? $Location : '<cluster region>')
+    $definition = New-ChaosExperimentDefinition -Plan $plan -Location ($Location ? $Location : ($plan.target.region ?? '<region>'))
     $previewWindow = New-ChaosWindow -Name 'preview' -Start (ConvertTo-ChaosUtcIso -Instant (Get-Date).ToUniversalTime().AddMinutes(-1)) -End (Get-ChaosUtcNow)
     $preview = Invoke-ChaosSignalCollection -Plan $plan -Window $previewWindow -Sources $sources -DryRun
 
@@ -110,14 +110,16 @@ Nothing has been injected. This is what would happen.
 
 $($plan.question.hypothesis)
 "@ -Properties ([ordered]@{
-        'Target'      = "$($plan.target.resourceName)/$($plan.target.namespace)"
-        'Selector'    = if ($plan.target.selector) { $plan.target.selector } else { '(whole namespace)' }
-        'Fault'       = $plan.fault.displayName
-        'Injection'   = "$($plan.windows.injectMinutes) minutes"
-        'Baseline'    = "$($plan.windows.baselineMinutes) minutes before injection"
-        'Recovery'    = "$($plan.windows.recoveryMinutes) minutes after injection"
-        'Experiment'  = $experimentName
-        'Fault path'  = $plan.readiness.faultPath.verdict
+        'Target'        = $plan.target.resourceName
+        'Target type'   = if ($plan.fault.targetType) { $plan.fault.targetType } else { '(not resolved)' }
+        'Region'        = if ($plan.target.region) { $plan.target.region } else { '(not resolved)' }
+        'Action'        = $plan.fault.displayName
+        'Action URN'    = $plan.fault.faultUrn
+        'Injection'     = "$($plan.windows.injectMinutes) minutes"
+        'Baseline'      = "$($plan.windows.baselineMinutes) minutes before injection"
+        'Recovery'      = "$($plan.windows.recoveryMinutes) minutes after injection"
+        'Experiment'    = $experimentName
+        'Delivery path' = $plan.readiness.deliveryPath.verdict
     })
 
     Write-Table -Title 'Evidence that would be collected' -Data @(
@@ -150,9 +152,9 @@ exact plan. Type it exactly:
 
 Assert-ChaosConsent -Plan $plan -Consent $Consent | Out-Null
 
-if ($plan.readiness.faultPath.verdict -ne 'open' -and -not $Force) {
-    Write-ChaosStudyFailure -Title 'Fault path was never verified as open' -Message @"
-The plan records the fault path as '$($plan.readiness.faultPath.verdict)'. Injecting
+if ($plan.readiness.deliveryPath.verdict -ne 'open' -and -not $Force) {
+    Write-ChaosStudyFailure -Title 'Delivery path was never verified as open' -Message @"
+The plan records the delivery path as '$($plan.readiness.deliveryPath.verdict)'. Injecting
 without a verified path usually produces a failed experiment and no evidence,
 which costs a production window for nothing.
 "@ -Remediation 'Re-run chaos-study-scope without -SkipDiscovery, or pass -Force to proceed anyway.'
@@ -161,11 +163,15 @@ which costs a production window for nothing.
 
 if (Get-Command Ensure-AzLogin -ErrorAction SilentlyContinue) { Ensure-AzLogin | Out-Null }
 
+if (-not $Location -and $plan.target.PSObject.Properties.Name -contains 'region') {
+    $Location = [string]$plan.target.region
+}
+
 if (-not $Location) {
     $Location = (az resource show --ids $plan.target.resourceId --query location -o tsv 2>$null)
     if (-not $Location) {
-        Write-ChaosStudyFailure -Title 'Could not determine the cluster region' -Message @"
-The experiment resource must be created in a region and the target cluster's
+        Write-ChaosStudyFailure -Title 'Could not determine the target region' -Message @"
+The experiment resource must be created in a region, and the target resource's
 region could not be read.
 "@ -Remediation 'Pass -Location <region> explicitly.'
         exit (Get-ChaosStudyExitCode -Name 'Error')

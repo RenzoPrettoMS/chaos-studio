@@ -23,7 +23,7 @@ they read. This file defines what it must contain and what it must never do.
 
 ### 1. Header
 
-Study id, target, fault, window, sealed timestamp, and the overall verdict.
+Study id, target, action, window, sealed timestamp, and the overall verdict.
 A reader must be able to answer "what was tested and did it hold?" without
 scrolling.
 
@@ -37,9 +37,14 @@ No jargon that is not defined later in the document.
 
 ### 3. What we tested
 
-The plan, rendered: target identity, fault and its parameters, blast-radius
-controls, steady-state predicate, abort conditions, and the three window
+The plan, rendered: target identity and region, the action as the platform
+described it — canonical URN, action type, supported target type — its
+parameters, the steady-state predicate, abort conditions, and the three window
 boundaries.
+
+The report states that the action metadata was discovered live from
+`Microsoft.Chaos/locations/{region}/actions`, so a reader can tell the claim
+came from the service rather than from a local list that may have drifted.
 
 This section exists so the reader can judge whether the study asked a question
 worth answering.
@@ -81,6 +86,7 @@ Mandatory and never empty. Drawn from the taxonomy:
 | L7 | Duration — window too short to observe slow failure modes |
 | L8 | Aborted — the run stopped early |
 | L9 | Configuration drift — target changed between plan and run |
+| L10 | Discovery unverified — action metadata not confirmed against the live action list |
 
 L1 always applies. Others are added when their condition is detected.
 
