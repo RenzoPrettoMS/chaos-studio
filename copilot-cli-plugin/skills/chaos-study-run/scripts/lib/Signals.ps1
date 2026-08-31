@@ -18,6 +18,31 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Common.ps1')
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'ApiVersions.ps1')
+. (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Operation.ps1')
+
+function Resolve-ChaosSignalAdapter {
+    <#
+    .SYNOPSIS
+        Choose the adapter probe-signal collection routes through.
+
+    .DESCRIPTION
+        Evidence collection - including the mechanism probe - must reach Azure
+        through the same operation seam as everything else, never a direct
+        Invoke-AzRest. The adapter is taken from an explicit override, then the
+        adapter frozen on the plan, and only then the in-process 'local-az' path
+        that preserves how this suite has always collected signals. This is a
+        read-only collection default, not a control-plane fallback.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][object]$Plan
+    )
+    if (-not [string]::IsNullOrWhiteSpace($Adapter)) { return $Adapter }
+    if ($null -ne $Plan -and ($Plan.PSObject.Properties.Name -contains 'adapter') -and -not [string]::IsNullOrWhiteSpace([string]$Plan.adapter)) {
+        return [string]$Plan.adapter
+    }
+    return 'local-az'
+}
 
 # -- Source specifications -------------------------------------------------
 
@@ -99,7 +124,9 @@ function Get-ChaosMetricSignal {
     param(
         [Parameter(Mandatory)][object]$Spec,
         [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ResourceId,
-        [Parameter(Mandatory)][object]$Window
+        [Parameter(Mandatory)][object]$Window,
+        [AllowNull()][AllowEmptyString()][string]$Adapter = $null,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath = $null
     )
 
     $windowName = $Window.name
@@ -121,14 +148,18 @@ function Get-ChaosMetricSignal {
         interval    = 'PT1M'
     }
 
-    if (-not (Get-Command Invoke-AzRest -ErrorAction SilentlyContinue)) {
+    if (-not (Get-Command Invoke-ChaosStudyOperation -ErrorAction SilentlyContinue)) {
         return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
-            -Caveat 'The shared Invoke-AzRest helper is unavailable, so Azure Monitor could not be queried.'
+            -Caveat 'The operation adapter seam is unavailable, so Azure Monitor could not be queried.'
     }
 
+    # Probe-signal collection is routed through the operation seam - never a
+    # direct Invoke-AzRest - so the mechanism probe reaches Azure the same way
+    # every other operation does and can be brokered or stubbed as one.
     $uri = "$metricTarget/providers/Microsoft.Insights/metrics?timespan=$timespan&interval=PT1M&metricnames=$($Spec.metricName)&aggregation=$($Spec.aggregation)"
     try {
-        $response = Invoke-AzRest -Method GET -Uri $uri -ApiVersion (Get-ChaosApiVersion -Name 'metrics')
+        $response = Invoke-ChaosStudyOperation -Kind 'metrics.query' -Arguments @{ uri = $uri } `
+            -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath
     } catch {
         $message = "Azure Monitor query failed: $($_.Exception.Message)"
         return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
@@ -161,43 +192,6 @@ function Get-ChaosMetricSignal {
     return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Values $series -Query $query
 }
 
-function Invoke-ChaosLogAnalyticsQuery {
-    <#
-    .SYNOPSIS
-        Run a KQL query against a Log Analytics workspace.
-
-    .DESCRIPTION
-        The shared Invoke-AzRest helper is pinned to the ARM audience, so it
-        cannot reach the Log Analytics data plane. This calls az rest directly
-        with the correct audience rather than modifying a shipped script.
-    #>
-    param(
-        [Parameter(Mandatory)][string]$WorkspaceId,
-        [Parameter(Mandatory)][string]$Query,
-        [Parameter(Mandatory)][string]$Timespan
-    )
-
-    if (-not (Get-Command az -ErrorAction SilentlyContinue)) {
-        throw 'The Azure CLI is not on PATH.'
-    }
-
-    $endpoint = Get-ChaosEndpoint -Name 'logAnalytics'
-    $uri = "$endpoint/v1/workspaces/$WorkspaceId/query"
-    $bodyFile = [System.IO.Path]::GetTempFileName()
-    try {
-        $body = @{ query = $Query; timespan = $Timespan } | ConvertTo-Json -Depth 8 -Compress
-        [System.IO.File]::WriteAllText($bodyFile, $body, [System.Text.UTF8Encoding]::new($false))
-        $raw = & az rest --method POST --uri $uri --resource $endpoint `
-            --headers 'Content-Type=application/json' --body "@$bodyFile" --output json 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw (($raw | Out-String).Trim())
-        }
-        return ($raw | Out-String) | ConvertFrom-Json
-    } finally {
-        Remove-Item -LiteralPath $bodyFile -Force -ErrorAction SilentlyContinue
-    }
-}
-
 function Get-ChaosLogSignal {
     <#
     .SYNOPSIS
@@ -205,15 +199,26 @@ function Get-ChaosLogSignal {
     #>
     param(
         [Parameter(Mandatory)][object]$Spec,
-        [Parameter(Mandatory)][object]$Window
+        [Parameter(Mandatory)][object]$Window,
+        [AllowNull()][AllowEmptyString()][string]$Adapter = $null,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath = $null
     )
 
     $windowName = $Window.name
     $timespan = "$(ConvertTo-ChaosUtcIso -Instant $Window.start)/$(ConvertTo-ChaosUtcIso -Instant $Window.end)"
     $query = [ordered]@{ workspaceId = $Spec.workspaceId; kql = $Spec.query; timespan = $timespan }
 
+    if (-not (Get-Command Invoke-ChaosStudyOperation -ErrorAction SilentlyContinue)) {
+        return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
+            -Caveat 'The operation adapter seam is unavailable, so Log Analytics could not be queried.'
+    }
+
+    # Routed through the seam so the mechanism probe's log query is brokered or
+    # stubbed like any other operation, never a direct az rest call from here.
     try {
-        $response = Invoke-ChaosLogAnalyticsQuery -WorkspaceId $Spec.workspaceId -Query $Spec.query -Timespan $timespan
+        $response = Invoke-ChaosStudyOperation -Kind 'logs.query' `
+            -Arguments @{ workspaceId = $Spec.workspaceId; query = $Spec.query; timespan = $timespan } `
+            -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath
     } catch {
         $message = "Log Analytics query failed: $($_.Exception.Message)"
         return New-ChaosSignalResult -Source $Spec.id -Window $windowName -Query $query `
@@ -258,8 +263,12 @@ function Invoke-ChaosSignalCollection {
         [Parameter(Mandatory)][object]$Plan,
         [Parameter(Mandatory)][object]$Window,
         [string[]]$Sources = @(),
+        [AllowNull()][AllowEmptyString()][string]$Adapter = $null,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath = $null,
         [switch]$DryRun
     )
+
+    $selectedAdapter = Resolve-ChaosSignalAdapter -Adapter $Adapter -Plan $Plan
 
     $results = @()
     $specs = @()
@@ -294,10 +303,10 @@ function Invoke-ChaosSignalCollection {
 
         switch ($spec.kind) {
             'metrics' {
-                $results += Get-ChaosMetricSignal -Spec $spec -ResourceId $implicitResourceId -Window $Window
+                $results += Get-ChaosMetricSignal -Spec $spec -ResourceId $implicitResourceId -Window $Window -Adapter $selectedAdapter -StudyPath $StudyPath
             }
             'logs' {
-                $results += Get-ChaosLogSignal -Spec $spec -Window $Window
+                $results += Get-ChaosLogSignal -Spec $spec -Window $Window -Adapter $selectedAdapter -StudyPath $StudyPath
             }
             default {
                 $results += New-ChaosSignalResult -Source $spec.id -Window $Window.name `

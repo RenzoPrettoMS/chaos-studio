@@ -97,6 +97,26 @@ param(
 
     [string]$Hypothesis,
 
+    # How the injected action is expected to falsify the steady state: the
+    # action's effect, the code or dependency failure it provokes, and how that
+    # reaches the predicate. Required for a falsifiable study; a missing or empty
+    # value is a blocking readiness failure (exit 10), not a silent omission.
+    [string]$FailureMechanism,
+
+    # A concrete reference (file, symbol, or architecture note) that anchors the
+    # mechanism in the system under study, so its truthfulness can be reviewed.
+    # Empty is untraceable and blocks at readiness.
+    [string]$MechanismEvidence,
+
+    # The probe that proves the mechanism landed, as a hashtable with keys:
+    #   signal | query        the exact signal (or KQL) the mechanism moves
+    #   expectedDirection     up | down | appears | disappears | crosses
+    #   condition             optional threshold/predicate the direction is about
+    #   resourceCorrelation   the resource the probe must resolve to
+    # The probe signal must be one of -SignalSource and resolve to a scoped
+    # resource, or readiness blocks it as untraceable (exit 10).
+    [hashtable]$MechanismProbe,
+
     # Signal sources: 'metrics:<name>' or 'logs:<workspaceId>#<kql>'.
     [string[]]$SignalSource = @(),
 
@@ -126,7 +146,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib' 'Workspace.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'Readiness.ps1')
 
-$ChaosStudyPlanVersion = 'study-plan.v2'
+$ChaosStudyPlanVersion = 'study-plan.v3'
 
 # -- Steady state ----------------------------------------------------------
 
@@ -153,6 +173,70 @@ function ConvertFrom-ChaosSteadyState {
         comparison = $Matches[2]
         threshold  = [double]$Matches[3]
         unit       = if ($Matches[4]) { $Matches[4] } else { $null }
+    }
+}
+
+function ConvertFrom-ChaosMechanismProbe {
+    <#
+    .SYNOPSIS
+        Normalise the -MechanismProbe hashtable into the structure frozen onto
+        the plan.
+
+    .DESCRIPTION
+        The probe is what turns "a signal moved" into "the signal this mechanism
+        predicts moved, on the resource it predicts". Its fields are structured
+        here so freezing, hashing and later proof all read one shape:
+
+          signal | query        the exact measurement the mechanism moves
+          expectedDirection     up | down | appears | disappears | crosses
+          condition             optional threshold the direction is about
+          resourceCorrelation   the resource the probe must resolve to
+
+        When a query-based probe uses a numeric direction (up, down or
+        crosses), its result set must project a numeric column the proof step
+        can read: one named 'value', 'count', 'last', 'mean', or the probe's
+        own signal name. A query that returns only custom-named columns (say
+        'HealthScore') leaves the proof step nothing to compare, and the report
+        reports that as a probe configuration gap rather than a disproof.
+        The appears/disappears directions need no such column - they turn on
+        the rows' presence alone.
+
+        Presence and traceability are enforced by the readiness gate, not here:
+        a null probe returns $null so the gate can report it as missing rather
+        than this throwing before the gate ever runs. What this does reject is a
+        probe whose direction is not one the proof step knows how to evaluate,
+        because a freely-typed direction can never be checked.
+    #>
+    param([AllowNull()][object]$Table)
+
+    if ($null -eq $Table) { return $null }
+
+    $read = {
+        param($name)
+        $value = $null
+        if ($Table -is [System.Collections.IDictionary]) {
+            if ($Table.Contains($name)) { $value = $Table[$name] }
+        }
+        elseif ($Table.PSObject.Properties.Name -contains $name) {
+            $value = $Table.$name
+        }
+        if ($value -is [string]) { $value = $value.Trim() }
+        if ($value -is [string] -and [string]::IsNullOrWhiteSpace($value)) { return $null }
+        return $value
+    }
+
+    $direction = & $read 'expectedDirection'
+    $allowed = @('up', 'down', 'appears', 'disappears', 'crosses')
+    if ($null -ne $direction -and $allowed -notcontains [string]$direction) {
+        throw "Mechanism probe expectedDirection '$direction' is not recognised. Use one of: $($allowed -join ', ')."
+    }
+
+    return [pscustomobject]@{
+        signal              = & $read 'signal'
+        query               = & $read 'query'
+        expectedDirection   = if ($null -ne $direction) { [string]$direction } else { $null }
+        condition           = & $read 'condition'
+        resourceCorrelation = & $read 'resourceCorrelation'
     }
 }
 
@@ -375,6 +459,8 @@ else {
 
 $predicate = ConvertFrom-ChaosSteadyState -Text $SteadyState
 
+$mechanismProbe = ConvertFrom-ChaosMechanismProbe -Table $MechanismProbe
+
 $blastRadius = New-ChaosBlastRadius -Location $FilterLocation -Zone $FilterZone -PhysicalZone $FilterPhysicalZone `
     -ExcludeResource $ExcludeResource -ExcludeType $ExcludeType -ExcludeTag $ExcludeTag
 
@@ -391,6 +477,9 @@ $readiness = Invoke-ChaosReadinessGates -Action $selectedAction `
     -SteadyState $predicate `
     -InjectMinutes $DurationMinutes `
     -AvailableSources $SignalSource `
+    -FailureMechanism $FailureMechanism `
+    -MechanismEvidence $MechanismEvidence `
+    -MechanismProbe $mechanismProbe `
     -DiscoverySkipped:$SkipDiscovery
 
 $limitationCodes = @($readiness.limitationCodes)
@@ -422,6 +511,16 @@ $plan = [ordered]@{
     question    = [ordered]@{
         hypothesis  = if ($Hypothesis) { $Hypothesis } else { "The system holds $($predicate.raw) while '$($selectedAction.name)' is injected." }
         steadyState = $predicate
+    }
+
+    mechanism   = [ordered]@{
+        # Frozen falsifiability inputs. Presence and traceability were enforced
+        # by Test-ChaosMechanismTraceable before this plan was written; the
+        # report proves the probe over the actual action window, and never
+        # accepts unrelated signal movement as proof.
+        failureMechanism    = if ([string]::IsNullOrWhiteSpace($FailureMechanism)) { $null } else { $FailureMechanism.Trim() }
+        mechanismEvidence   = if ([string]::IsNullOrWhiteSpace($MechanismEvidence)) { $null } else { $MechanismEvidence.Trim() }
+        mechanismProbe      = $mechanismProbe
     }
 
     workspace   = [ordered]@{

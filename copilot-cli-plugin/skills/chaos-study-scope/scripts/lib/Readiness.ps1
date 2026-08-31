@@ -278,6 +278,140 @@ function Test-ChaosActionReversibility {
         -Detail "Action '$($Action.name)' is $type, so cancelling the scenario run stops the fault."
 }
 
+function Test-ChaosMechanismTraceable {
+    <#
+    .SYNOPSIS
+        Blocking: is there a falsifiable, traceable mechanism behind this study?
+
+    .DESCRIPTION
+        A study that cannot say *how* the action would breach the steady state
+        is a guess dressed as an experiment. Three inputs make the claim
+        falsifiable and reviewable, and all three must be present and traceable
+        before the plan is written:
+
+          failureMechanism    the action's effect, the code or dependency
+                              failure it provokes, and how that reaches the
+                              predicate
+          mechanismEvidence   a concrete reference (file, symbol, architecture)
+                              that anchors the mechanism in the real system
+          mechanismProbe      the exact signal that proves the mechanism landed,
+                              the direction it should move, and the resource it
+                              must resolve to
+
+        Traceability is what this gate can check by script: the probe's signal
+        must be one the study actually collects, and its resourceCorrelation
+        must resolve to a resource in scope. Truthfulness - whether the stated
+        mechanism is the real one - is the agent's and code review's
+        responsibility, which is exactly why mechanismEvidence must cite
+        something a reviewer can open.
+
+        A gap here is blocking, not advisory: without a traceable mechanism the
+        report's mechanismProven can only ever be an accident of correlation.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$FailureMechanism,
+        [AllowNull()][AllowEmptyString()][string]$MechanismEvidence,
+        [AllowNull()][object]$MechanismProbe,
+        [AllowEmptyCollection()][string[]]$AvailableSources = @(),
+        [AllowNull()][AllowEmptyCollection()][string[]]$ScopedResourceIds = @()
+    )
+
+    $problems = @()
+
+    if ([string]::IsNullOrWhiteSpace($FailureMechanism)) {
+        $problems += 'no failureMechanism was stated, so the study cannot say how the action would breach the steady state'
+    }
+    if ([string]::IsNullOrWhiteSpace($MechanismEvidence)) {
+        $problems += 'no mechanismEvidence was cited, so the mechanism is not anchored to anything a reviewer can open'
+    }
+
+    if ($null -eq $MechanismProbe) {
+        $problems += 'no mechanismProbe was supplied, so nothing was named that would prove the mechanism reached the system'
+    }
+    else {
+        $signal = if ($MechanismProbe.PSObject.Properties.Name -contains 'signal') { [string]$MechanismProbe.signal } else { '' }
+        $query = if ($MechanismProbe.PSObject.Properties.Name -contains 'query') { [string]$MechanismProbe.query } else { '' }
+        $direction = if ($MechanismProbe.PSObject.Properties.Name -contains 'expectedDirection') { [string]$MechanismProbe.expectedDirection } else { '' }
+        $correlation = if ($MechanismProbe.PSObject.Properties.Name -contains 'resourceCorrelation') { [string]$MechanismProbe.resourceCorrelation } else { '' }
+
+        if ([string]::IsNullOrWhiteSpace($signal) -and [string]::IsNullOrWhiteSpace($query)) {
+            $problems += 'the mechanismProbe names neither a signal nor a query, so there is nothing to measure'
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($signal)) {
+            # The probe's own signal has to be one the study actually collects,
+            # otherwise the proof step would have no series to read.
+            $matched = @($AvailableSources | Where-Object {
+                    $_ -eq $signal -or $_ -like "*:$signal" -or $_ -like "*:$signal#*"
+                })
+            if ($matched.Count -eq 0) {
+                $sourceList = if (@($AvailableSources).Count -gt 0) { $AvailableSources -join ', ' } else { 'none' }
+                $problems += "the mechanismProbe signal '$signal' is not among the configured signal sources ($sourceList), so it is untraceable"
+            }
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($query)) {
+            # A query-based probe may name its workspace as
+            # 'logs:<workspaceId>#<kql>'. When it does, a configured source for
+            # THAT workspace must exist - a logs source for a different
+            # workspace does not make this probe traceable. Without a workspace
+            # prefix, any logs source is enough to run the query against.
+            $probeWorkspaceId = $null
+            if ($query -like 'logs:*') {
+                $probeRest = $query.Substring('logs:'.Length)
+                if ($probeRest.Contains('#')) {
+                    $probeWsPart = $probeRest.Split('#', 2)[0]
+                    if (-not [string]::IsNullOrWhiteSpace($probeWsPart)) { $probeWorkspaceId = $probeWsPart.Trim() }
+                }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($probeWorkspaceId)) {
+                $matchedWs = @($AvailableSources | Where-Object {
+                        $_ -eq "logs:$probeWorkspaceId" -or $_ -like "logs:$probeWorkspaceId#*"
+                    })
+                if ($matchedWs.Count -eq 0) {
+                    $sourceList = if (@($AvailableSources).Count -gt 0) { $AvailableSources -join ', ' } else { 'none' }
+                    $problems += "the mechanismProbe query targets workspace '$probeWorkspaceId' but no matching logs: signal source is configured ($sourceList), so it is untraceable"
+                }
+            }
+            else {
+                $hasLogSource = @($AvailableSources | Where-Object { $_ -like 'logs:*' }).Count -gt 0
+                if (-not $hasLogSource) {
+                    $problems += 'the mechanismProbe uses a query but no logs: signal source is configured for it to run against, so it is untraceable'
+                }
+            }
+        }
+
+        if ([string]::IsNullOrWhiteSpace($direction)) {
+            $problems += 'the mechanismProbe has no expectedDirection, so its movement cannot be judged for or against the mechanism'
+        }
+
+        if ([string]::IsNullOrWhiteSpace($correlation)) {
+            $problems += 'the mechanismProbe has no resourceCorrelation, so a movement could not be tied to the resource under study'
+        }
+        else {
+            # When discovery ran, the correlated resource must be one in scope.
+            # When it was skipped the scope is unknown, not empty, so presence is
+            # all that can be checked - resolution is deferred rather than faked.
+            $ids = @(@($ScopedResourceIds) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($ids.Count -gt 0) {
+                $resolves = @($ids | Where-Object { $_ -eq $correlation -or $_ -like "*$correlation" -or $correlation -like "*$_" })
+                if ($resolves.Count -eq 0) {
+                    $problems += "the mechanismProbe resourceCorrelation '$correlation' does not resolve to any resource in scope, so it is untraceable"
+                }
+            }
+        }
+    }
+
+    if ($problems.Count -gt 0) {
+        return New-ChaosReadinessGate -Id 'mechanism-traceable' -Title 'The failure mechanism is stated and traceable' `
+            -Status 'fail' -Severity 'blocking' `
+            -Detail ('A falsifiable study needs a traceable mechanism, but ' + ($problems -join '; ') + '.') `
+            -Remediation 'Re-run scoping with -FailureMechanism, -MechanismEvidence, and a -MechanismProbe whose signal is one of -SignalSource and whose resourceCorrelation is a resource in scope. Read the application code and runtime topology first; the evidence reference must cite something a reviewer can open.'
+    }
+
+    return New-ChaosReadinessGate -Id 'mechanism-traceable' -Title 'The failure mechanism is stated and traceable' `
+        -Status 'pass' -Severity 'blocking' `
+        -Detail "Mechanism stated and its probe ($(if ($MechanismProbe.signal) { $MechanismProbe.signal } else { 'query' }), expected to $($MechanismProbe.expectedDirection)) traces to a configured signal and a scoped resource. Truthfulness of the mechanism remains the agent's and reviewer's responsibility."
+}
+
 function Test-ChaosInjectionWindow {
     <#
     .SYNOPSIS
@@ -311,14 +445,25 @@ function Invoke-ChaosReadinessGates {
         [AllowNull()][object]$SteadyState,
         [Parameter(Mandatory)][int]$InjectMinutes,
         [AllowEmptyCollection()][string[]]$AvailableSources = @(),
+        [AllowNull()][AllowEmptyString()][string]$FailureMechanism = $null,
+        [AllowNull()][AllowEmptyString()][string]$MechanismEvidence = $null,
+        [AllowNull()][object]$MechanismProbe = $null,
         [switch]$DiscoverySkipped
     )
+
+    $scopedResourceIds = @(@($ScopedResources) | Where-Object { $_ } | ForEach-Object {
+            if ($_ -is [string]) { $_ }
+            elseif ($_.PSObject.Properties.Name -contains 'resourceId') { [string]$_.resourceId }
+            else { [string]$_ }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
     $gates = @(
         Test-ChaosSteadyStatePredicate -Predicate $SteadyState
         Test-ChaosScopePopulated -ScopedResources $ScopedResources -DiscoverySkipped:$DiscoverySkipped
         Test-ChaosActionScopeFit -Action $Action -ScopedResourceTypes $ScopedResourceTypes
         Test-ChaosActionParameterFit -Action $Action -Parameters $Parameters
+        Test-ChaosMechanismTraceable -FailureMechanism $FailureMechanism -MechanismEvidence $MechanismEvidence `
+            -MechanismProbe $MechanismProbe -AvailableSources $AvailableSources -ScopedResourceIds $scopedResourceIds
         Test-ChaosActionReversibility -Action $Action
         Test-ChaosInjectionWindow -InjectMinutes $InjectMinutes
         Test-ChaosObservabilityCoverage -AvailableSources $AvailableSources -SteadyState $SteadyState
