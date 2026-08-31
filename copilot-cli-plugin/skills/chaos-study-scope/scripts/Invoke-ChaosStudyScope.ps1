@@ -133,7 +133,19 @@ param(
 
     # Plan without probing Azure. The plan carries limitation L10 and is not
     # evidence that the study can run.
-    [switch]$SkipDiscovery
+    [switch]$SkipDiscovery,
+
+    # Which operation adapter turns preflight config.create/validate into either
+    # an in-process Azure call ('local-az') or a durable pause/resume against a
+    # host that owns auth ('external'). Frozen onto the plan so the run reaches
+    # Azure the same way it was scoped.
+    [ValidateSet('local-az', 'external')][string]$Adapter = 'local-az',
+
+    # Accept a partial scenario - one whose preflight execution plan runs fewer
+    # legs than it declares. Must be the exact phrase printed when a partial
+    # scenario is first detected; it is bound to the plan and the effective legs.
+    # Without it a partial scenario is fail-closed (exit 20).
+    [string]$AcceptPartialScenario
 )
 
 Set-StrictMode -Version Latest
@@ -142,6 +154,8 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Common.ps1')
 . (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'ApiVersions.ps1')
 . (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Study.ps1')
+. (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Operation.ps1')
+. (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Residue.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'ActionDiscovery.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'Workspace.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'Readiness.ps1')
@@ -237,6 +251,86 @@ function ConvertFrom-ChaosMechanismProbe {
         expectedDirection   = if ($null -ne $direction) { [string]$direction } else { $null }
         condition           = & $read 'condition'
         resourceCorrelation = & $read 'resourceCorrelation'
+    }
+}
+
+function Get-ChaosPreflightConfigurationName {
+    <#
+    .SYNOPSIS
+        Deterministic preflight configuration name derived from the study id.
+
+    .DESCRIPTION
+        Deriving it means the same study always names its preflight
+        configuration the same way, so the run can find and reuse - or clean up -
+        the exact resource scope validated it, rather than guessing a name.
+    #>
+    param([Parameter(Mandatory)][string]$StudyId)
+    $suffix = ($StudyId -replace '[^A-Za-z0-9]', '').ToLowerInvariant()
+    if ($suffix.Length -gt 34) { $suffix = $suffix.Substring($suffix.Length - 34) }
+    return "preflight-$suffix"
+}
+
+function Get-ChaosPreflightValidationStatus {
+    <#
+    .SYNOPSIS
+        Read the status out of a preflight validation result, whatever shape it
+        arrives in (`status` or ARM-style `properties.status`).
+    #>
+    param([AllowNull()][object]$Validation)
+    if ($null -eq $Validation) { return $null }
+    if (($Validation.PSObject.Properties.Name -contains 'properties') -and $null -ne $Validation.properties -and
+        ($Validation.properties.PSObject.Properties.Name -contains 'status')) {
+        return [string]$Validation.properties.status
+    }
+    if ($Validation.PSObject.Properties.Name -contains 'status') { return [string]$Validation.status }
+    return $null
+}
+
+function New-ChaosPreflightConfiguration {
+    <#
+    .SYNOPSIS
+        Create and validate a deterministic preflight configuration, and return
+        the validation result whose execution plan the effective-leg model reads.
+
+    .DESCRIPTION
+        This runs before any fault consent. It creates a temporary scenario
+        configuration named for the study, validates it, and returns the
+        validation result untouched so Resolve-ChaosEffectiveLegs can inspect the
+        execution plan the platform computed. Both calls go through the operation
+        seam, so the same adapter (local-az or external) reaches Azure here as
+        will reach it at run time; an external adapter pauses durably (exit 18)
+        exactly as it would anywhere else.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StudyId,
+        [Parameter(Mandatory)][string]$ResourceGroup,
+        [Parameter(Mandatory)][string]$WorkspaceName,
+        [Parameter(Mandatory)][string]$ScenarioName,
+        [AllowNull()][AllowEmptyCollection()][object[]]$Parameters = @(),
+        [Parameter(Mandatory)][string]$Adapter,
+        [Parameter(Mandatory)][string]$StudyPath
+    )
+
+    $name = Get-ChaosPreflightConfigurationName -StudyId $StudyId
+    $scoping = @('-n', $name, '-g', $ResourceGroup, '--workspace-name', $WorkspaceName, '--scenario-name', $ScenarioName)
+    $body = if (@($Parameters).Count -gt 0) { @($Parameters) } else { $null }
+
+    $created = Invoke-ChaosStudyOperation -Kind 'config.create' -Arguments @{ cliArgs = $scoping } -Body $body `
+        -ExpectedSchema 'configuration.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'preflight config create'
+
+    $validation = Invoke-ChaosStudyOperation -Kind 'config.validate' -Arguments @{ cliArgs = $scoping } `
+        -ExpectedSchema 'validation.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'preflight config validate'
+
+    return [pscustomobject]@{
+        name          = $name
+        adapter       = $Adapter
+        created       = $created
+        validation    = $validation
+        status        = Get-ChaosPreflightValidationStatus -Validation $validation
+        # executionPlan intentionally aliases the same validation object: config
+        # validate returns the execution plan inline, so Resolve-ChaosEffectiveLegs
+        # reads the plan straight from it. Not a copy-paste error - do not "dedupe".
+        executionPlan = $validation
     }
 }
 
@@ -503,10 +597,91 @@ $effectiveScopes = if ($workspace) { @($workspace.scopes) } else { @($Scope) }
 $scopeHash = Get-ChaosScopeHash -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
     -WorkspaceName $WorkspaceName -Scope $effectiveScopes -Region $region
 
+# -- Preflight configuration + effective legs (Req C) ----------------------
+#
+# Before any fault consent, validate a deterministic configuration and inspect
+# the execution plan the platform computes for it. A scenario that would run
+# nothing, or fewer legs than its name implies, is caught here rather than after
+# a change window has already been spent. The study directory is created now so
+# the preflight configuration is recorded in this study's residue ledger.
+
+$study = New-ChaosStudy -ScopeHash $scopeHash -StudyRoot $StudyRoot
+$scenarioParameters = ConvertTo-ChaosList (ConvertTo-ChaosScenarioParameter -Table $Parameters)
+$declaredVsEffective = $null
+
+if (-not $SkipDiscovery) {
+    Write-ChaosStudyNote -Message "Validating a preflight configuration for scenario '$($selectedScenario.name)' to see which legs would actually run."
+
+    $preflight = New-ChaosPreflightConfiguration -StudyId $study.studyId `
+        -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName -ScenarioName $selectedScenario.name `
+        -Parameters $scenarioParameters -Adapter $Adapter -StudyPath $study.path
+
+    $effectiveLegs = Resolve-ChaosEffectiveLegs -ExecutionPlan $preflight.executionPlan
+
+    Assert-ChaosScenarioNameHonest -ScenarioName $selectedScenario.name -DisplayName $selectedScenario.displayName -EffectiveLegs $effectiveLegs | Out-Null
+
+    $legsDecision = Assert-ChaosEffectiveLegs -EffectiveLegs $effectiveLegs -ScopeHash $scopeHash `
+        -ScenarioName $selectedScenario.name -AcceptPartialScenario $AcceptPartialScenario
+
+    if ($legsDecision.limitationCodes -contains 'L11' -and $limitationCodes -notcontains 'L11') {
+        $limitationCodes += 'L11'
+    }
+
+    # The effective plan is what a run must reproduce exactly before it may
+    # start. The hash is over the STABLE parts - total, executable count, and the
+    # sorted selectors of skipped legs - not the platform's free-text reasons,
+    # so equality means "the same legs execute". The run recomputes this identical
+    # projection (Get-ChaosRunEffectivePlanHash) to prove equality rather than trust.
+    # Computed before the residue entry so the ledger records the real hash, not null.
+    $effectivePlanProjection = [ordered]@{
+        total      = $effectiveLegs.total
+        executable = $effectiveLegs.executable
+        skipped    = @(@($effectiveLegs.skipped) | ForEach-Object { [string]$_.legSelector } | Sort-Object)
+    }
+    $effectivePlanHash = Get-ChaosDigest -InputObject $effectivePlanProjection
+
+    Add-ChaosPreflightResidueEntry -StudyPath $study.path -ConfigurationName $preflight.name `
+        -Workspace ([pscustomobject]@{ resourceGroup = $ResourceGroup; name = $WorkspaceName; scenario = $selectedScenario.name }) `
+        -Adapter $Adapter -ValidationStatus $preflight.status -EffectivePlanHash $effectivePlanHash | Out-Null
+
+    Add-ChaosCommandTrailEntry -StudyPath $study.path -Command 'az chaos scenario config validate' -Phase 'scope' `
+        -Arguments @($preflight.name, "executable=$($effectiveLegs.executable)", "total=$($effectiveLegs.total)") `
+        -ExitCode 0 -Note "preflight legs $($effectiveLegs.executable) of $($effectiveLegs.total)" | Out-Null
+
+    $declaredVsEffective = [ordered]@{
+        adapter    = $Adapter
+        preflight  = [ordered]@{
+            configurationName = $preflight.name
+            validationStatus  = $preflight.status
+        }
+        decision   = $legsDecision.kind
+        accepted   = [bool]$legsDecision.accepted
+        legs       = [ordered]@{
+            total      = $effectiveLegs.total
+            executable = $effectiveLegs.executable
+            skipped    = @($effectiveLegs.skipped)
+        }
+    }
+    $declaredVsEffective['effectivePlanHash'] = $effectivePlanHash
+}
+else {
+    # Discovery was skipped, so there is no execution plan to inspect. The
+    # legs are unknown, not empty, and the plan already carries L10 to say so.
+    $declaredVsEffective = [ordered]@{
+        adapter           = $Adapter
+        preflight         = $null
+        decision          = 'unknown'
+        accepted          = $false
+        legs              = [ordered]@{ total = $null; executable = $null; skipped = @() }
+        effectivePlanHash = $null
+    }
+}
+
 $plan = [ordered]@{
     planVersion = $ChaosStudyPlanVersion
     createdAt   = Get-ChaosUtcNow
     scopeHash   = $scopeHash
+    adapter     = $Adapter
 
     question    = [ordered]@{
         hypothesis  = if ($Hypothesis) { $Hypothesis } else { "The system holds $($predicate.raw) while '$($selectedAction.name)' is injected." }
@@ -561,8 +736,10 @@ $plan = [ordered]@{
         version              = $selectedScenario.version
         recommendationStatus = $selectedScenario.recommendationStatus
         parameterSpec        = @($selectedScenario.parameters)
-        parameters           = ConvertTo-ChaosList (ConvertTo-ChaosScenarioParameter -Table $Parameters)
+        parameters           = @($scenarioParameters)
     }
+
+    declaredVsEffective = $declaredVsEffective
 
     action      = [ordered]@{
         # Every field below came from the service's own action record.
@@ -619,7 +796,6 @@ $plan['frozenConfigHash'] = Get-ChaosDigest -InputObject $plan
 
 # -- Persist ---------------------------------------------------------------
 
-$study = New-ChaosStudy -ScopeHash $scopeHash -StudyRoot $StudyRoot
 Save-ChaosStudyArtifact -StudyPath $study.path -RelativePath 'study-plan.v1.json' -Content $plan | Out-Null
 
 Add-ChaosCommandTrailEntry -StudyPath $study.path -Command 'chaos-study-scope' `

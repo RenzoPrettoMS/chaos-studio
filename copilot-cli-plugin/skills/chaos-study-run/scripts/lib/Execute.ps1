@@ -658,6 +658,226 @@ instead.
     exit (Get-ChaosStudyExitCode -Name 'ValidationFailed')
 }
 
+# -- Preflight reuse + effective-plan equality (Req C) ---------------------
+#
+# Scope validated a deterministic preflight configuration and froze the exact
+# effective plan (which legs run) into the study plan. A run must either reuse
+# that same validated configuration, or - if it has to re-create one - prove the
+# re-created configuration's effective plan is identical before it may start.
+# Either way, what executes is provably what was scoped and consented to, not a
+# configuration that quietly drifted between scope and run.
+
+function Get-ChaosRunLegField {
+    <#
+    .SYNOPSIS
+        Read the first present field from a leg-like object across aliases. A
+        run-side mirror of the scope resolver's field lookup, kept here so the
+        run skill needs nothing from the scope skill's library.
+    #>
+    param([AllowNull()][object]$Leg, [Parameter(Mandatory)][string[]]$Names)
+    if ($null -eq $Leg) { return $null }
+    foreach ($name in $Names) {
+        if ($Leg -is [System.Collections.IDictionary]) {
+            if ($Leg.Contains($name) -and $null -ne $Leg[$name]) { return $Leg[$name] }
+        } elseif ($Leg -is [pscustomobject]) {
+            if (($Leg.PSObject.Properties.Name -contains $name) -and $null -ne $Leg.$name) { return $Leg.$name }
+        }
+    }
+    return $null
+}
+
+function Get-ChaosRunEffectivePlanHash {
+    <#
+    .SYNOPSIS
+        Recompute the stable effective-plan hash from a validation result, in
+        the exact shape scope froze: total legs, executable count, and the sorted
+        selectors of the legs that will not run.
+
+    .DESCRIPTION
+        The hash is deliberately over the STABLE parts of the plan - counts and
+        leg selectors - not the platform's free-text skip reasons, which can
+        vary run to run for the same effective plan. Equality therefore means
+        "the same legs execute", which is what a run must guarantee, rather than
+        "the service worded its reasons identically".
+
+        This is the run-side MIRROR of the scope-side projection built by
+        Resolve-ChaosEffectiveLegs / Test-ChaosLegSkipped in Readiness.ps1. The
+        two must stay in lockstep: the skip signals inspected here (executable
+        flag, skip reason, skip status, and the `skipped` boolean) are exactly
+        those the scope side inspects. If the scope projection shape ever
+        changes, this mirror must change with it or Assert-ChaosEffectivePlanEquality
+        will diverge on a plan that actually matches.
+
+        KNOWN LIMITATION: unlike Get-ChaosExecutionPlanLegs on the scope side,
+        this normalizer only reads direct `legs`/`effectiveLegs` fields and does
+        not expand a steps->branches->actions->targets tree. If the platform ever
+        returns validation with only a steps tree, this hash would be over an
+        empty projection while the scope hash would not, tripping the equality
+        gate; the run mirror must gain the same expansion in lockstep should the
+        scope side ever rely on it.
+    #>
+    param([AllowNull()][object]$Validation)
+
+    $roots = @()
+    if ($null -ne $Validation) {
+        $roots += $Validation
+        if (($Validation.PSObject.Properties.Name -contains 'properties') -and $null -ne $Validation.properties) {
+            $roots += $Validation.properties
+        }
+        if (($Validation.PSObject.Properties.Name -contains 'executionPlan') -and $null -ne $Validation.executionPlan) {
+            $roots += $Validation.executionPlan
+        }
+    }
+
+    $legs = @()
+    foreach ($root in $roots) {
+        $found = Get-ChaosRunLegField -Leg $root -Names @('legs', 'effectiveLegs')
+        if ($null -ne $found) { $legs = @($found); break }
+    }
+
+    $skippedSelectors = @()
+    $executable = 0
+    foreach ($leg in $legs) {
+        $selector = [string](Get-ChaosRunLegField -Leg $leg -Names @('legSelector', 'selector', 'targetSelector', 'resourceSelector', 'resourceId', 'id', 'key', 'name'))
+        $reason = Get-ChaosRunLegField -Leg $leg -Names @('reason', 'skipReason', 'skippedReason')
+        $status = [string](Get-ChaosRunLegField -Leg $leg -Names @('status', 'state'))
+        $executableFlag = Get-ChaosRunLegField -Leg $leg -Names @('executable', 'willExecute', 'included')
+        $skippedBool = Get-ChaosRunLegField -Leg $leg -Names @('skipped')
+        $skipStates = @('skipped', 'notapplicable', 'not-applicable', 'excluded', 'unsupported', 'notsupported', 'ineligible', 'filtered')
+        $isSkipped = ($executableFlag -is [bool] -and -not $executableFlag) -or
+            ($skippedBool -is [bool] -and $skippedBool) -or
+            (-not [string]::IsNullOrWhiteSpace([string]$reason)) -or
+            ((-not [string]::IsNullOrWhiteSpace($status)) -and ($skipStates -contains $status.Trim().ToLowerInvariant().Replace(' ', '')))
+        if ($isSkipped) { $skippedSelectors += $selector } else { $executable++ }
+    }
+
+    $projection = [ordered]@{
+        total      = @($legs).Count
+        executable = $executable
+        skipped    = @(@($skippedSelectors) | Sort-Object)
+    }
+    return Get-ChaosDigest -InputObject $projection
+}
+
+function Assert-ChaosEffectivePlanEquality {
+    <#
+    .SYNOPSIS
+        Refuse to run a re-created configuration whose effective plan differs
+        from the one scope froze and the operator consented to.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Expected,
+        [AllowNull()][AllowEmptyString()][string]$Actual,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    # Fail closed on an absent hash on either side: a missing hash is not proof
+    # of equality, and two empty strings must never pass this gate vacuously.
+    if ([string]::IsNullOrWhiteSpace($Expected) -or [string]::IsNullOrWhiteSpace($Actual)) {
+        Write-ChaosStudyFailure -Title 'The effective-plan equality proof is missing a hash' -Message @"
+Proving the re-created configuration '$ConfigurationName' matches the scoped plan
+requires both the frozen effective-plan hash and the one recomputed for this run,
+but at least one is empty. Without both, equality cannot be proven, so the run
+stops rather than proceeding on an unverified plan.
+"@ -Remediation 'Re-run chaos-study-scope to produce a plan that carries a frozen effective-plan hash, then run against that plan.'
+        exit (Get-ChaosStudyExitCode -Name 'ScopeUnverified')
+    }
+
+    if ($Expected -eq $Actual) { return $true }
+
+    Write-ChaosStudyFailure -Title 'The re-created configuration does not match the scoped plan' -Message @"
+Scope froze an effective plan hashing to $Expected, but the configuration
+'$ConfigurationName' re-created for this run has an effective plan hashing to
+$Actual.
+
+Consent is bound to the legs scope validated. Because a different set of legs
+would now run, executing this configuration would inject something other than
+what was scoped and consented to, so the run stops here.
+"@ -Remediation 'Re-run chaos-study-scope to produce a fresh plan whose effective legs match the scope you intend to run, then consent to that plan.'
+    exit (Get-ChaosStudyExitCode -Name 'ScopeUnverified')
+}
+
+function Resolve-ChaosRunConfiguration {
+    <#
+    .SYNOPSIS
+        Provide a validated configuration to run: reuse the exact validated
+        preflight configuration when it still matches, otherwise re-create one
+        and prove its effective plan equals the scoped one before validating it.
+
+    .DESCRIPTION
+        Reuse is preferred because the preflight configuration is the one scope
+        actually validated; reusing it removes any chance of drift between scope
+        and run. Reuse is allowed only when the preflight configuration still
+        validates Succeeded and its effective plan still hashes to the frozen
+        value. Otherwise the run re-creates its own configuration, asserts exact
+        effective-plan equality against the frozen hash, and revalidates before
+        returning. When the plan carries no frozen effective plan (e.g. discovery
+        was skipped at scope time) this falls back to the historical create +
+        validate path unchanged.
+
+        Returns { configurationName; validation; status; permissionFix; reused }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    $dve = $null
+    if (($Plan.PSObject.Properties.Name -contains 'declaredVsEffective') -and $null -ne $Plan.declaredVsEffective) {
+        $dve = $Plan.declaredVsEffective
+    }
+    $frozenHash = if ($dve -and ($dve.PSObject.Properties.Name -contains 'effectivePlanHash')) { [string]$dve.effectivePlanHash } else { $null }
+    $preflightName = if ($dve -and $dve.preflight -and ($dve.preflight.PSObject.Properties.Name -contains 'configurationName')) { [string]$dve.preflight.configurationName } else { $null }
+
+    # 1. Reuse the exact validated preflight configuration when it still holds.
+    if (-not [string]::IsNullOrWhiteSpace($preflightName) -and -not [string]::IsNullOrWhiteSpace($frozenHash)) {
+        $preflightValidation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $preflightName
+        $preflightStatus = Get-ChaosValidationStatus -Validation $preflightValidation
+        if ($preflightStatus -eq 'Succeeded') {
+            $preflightHash = Get-ChaosRunEffectivePlanHash -Validation $preflightValidation
+            if ($preflightHash -eq $frozenHash) {
+                Write-ChaosStudyNote -Message "Reusing the validated preflight configuration $preflightName; its effective plan still matches the scoped one."
+                return [pscustomobject]@{
+                    configurationName = $preflightName
+                    validation        = $preflightValidation
+                    status            = $preflightStatus
+                    permissionFix     = $null
+                    reused            = $true
+                }
+            }
+            Write-ChaosStudyNote -Message "The preflight configuration $preflightName no longer matches the scoped effective plan; re-creating a fresh configuration." -Level 'warn'
+        }
+        else {
+            Write-ChaosStudyNote -Message "The preflight configuration $preflightName is not reusable (validation '$preflightStatus'); re-creating a fresh configuration." -Level 'warn'
+        }
+    }
+
+    # 2. Re-create, prove effective-plan equality when a plan was frozen, then return.
+    New-ChaosStudyConfiguration -Plan $Plan -ConfigurationName $ConfigurationName | Out-Null
+    $resolved = Resolve-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName
+
+    if (-not [string]::IsNullOrWhiteSpace($frozenHash)) {
+        # $resolved.validation is the object equality is proved over and is already
+        # Succeeded (Resolve-ChaosConfigurationValidation would have exited otherwise).
+        # Proving equality here - rather than re-fetching after - keeps the returned
+        # plan identical to the one the proof covered and avoids a redundant
+        # validate/show round-trip on every re-created run. When no plan was frozen
+        # (discovery skipped at scope time) this proof is skipped and the historical
+        # create + validate result is returned unchanged.
+        $actualHash = Get-ChaosRunEffectivePlanHash -Validation $resolved.validation
+        Assert-ChaosEffectivePlanEquality -Expected $frozenHash -Actual $actualHash -ConfigurationName $ConfigurationName | Out-Null
+    }
+
+    return [pscustomobject]@{
+        configurationName = $ConfigurationName
+        validation        = $resolved.validation
+        status            = $resolved.status
+        permissionFix     = $resolved.permissionFix
+        reused            = $false
+    }
+}
+
 # -- Scenario run ----------------------------------------------------------
 
 function Start-ChaosStudyScenarioRun {

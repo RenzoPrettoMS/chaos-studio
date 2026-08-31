@@ -220,17 +220,23 @@ try {
     # validate is a run that fails within seconds, and discovering that after a
     # baseline window has already elapsed wastes the window and leaves a study
     # that has to be planned again from scratch.
-    Write-ChaosStudyNote -Message "Creating scenario configuration $configurationName."
-    New-ChaosStudyConfiguration -Plan $plan -ConfigurationName $configurationName | Out-Null
-    $configurationCreated = $true
-    Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config create' `
-        -Arguments @($configurationName) -ExitCode 0 | Out-Null
+    #
+    # Reuse the validated preflight configuration when it still matches the
+    # scoped effective plan; otherwise re-create one and prove its effective plan
+    # is identical before validating. Either way, what runs is provably what was
+    # scoped and consented to.
+    Write-ChaosStudyNote -Message "Resolving the scenario configuration for $configurationName."
+    $resolvedConfig = Resolve-ChaosRunConfiguration -Plan $plan -ConfigurationName $configurationName
+    $configurationName = $resolvedConfig.configurationName
+    if (-not $resolvedConfig.reused) {
+        $configurationCreated = $true
+        Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config create' `
+            -Arguments @($configurationName) -ExitCode 0 | Out-Null
+    }
 
-    Write-ChaosStudyNote -Message 'Validating the configuration against the live scope.'
-    $validated = Resolve-ChaosConfigurationValidation -Plan $plan -ConfigurationName $configurationName
-    $validation = $validated.validation
-    $validationStatus = $validated.status
-    $permissionFix = $validated.permissionFix
+    $validation = $resolvedConfig.validation
+    $validationStatus = $resolvedConfig.status
+    $permissionFix = $resolvedConfig.permissionFix
 
     if ($null -ne $permissionFix) {
         Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config fix-permissions' `
