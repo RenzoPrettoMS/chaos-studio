@@ -39,8 +39,11 @@ Set-StrictMode -Version Latest
 if (-not (Get-Command Get-ChaosSha256 -ErrorAction SilentlyContinue)) {
     . (Join-Path $PSScriptRoot 'Common.ps1')
 }
+if (-not (Get-Command Assert-ChaosStudyWriteCompatible -ErrorAction SilentlyContinue)) {
+    . (Join-Path $PSScriptRoot 'Versioning.ps1')
+}
 
-$ChaosStudyManifestVersion = 1
+$ChaosStudyManifestVersion = $ChaosCurrentManifestVersion
 $ChaosStudyAbandonHorizonDays = 7
 
 # -- Root resolution (FR-14) ------------------------------
@@ -179,7 +182,7 @@ function Resolve-ChaosStudyPath {
         [Parameter(Mandatory)][string]$StudyRoot,
         [Parameter(Mandatory)][string]$ScopeHash,
         [Parameter(Mandatory)][string]$StudyId,
-        [ValidateSet('root', 'manifest', 'plan', 'runRecord', 'findings', 'report', 'commands', 'sealed', 'evidencePre', 'evidenceDuring', 'evidencePost')]
+        [ValidateSet('root', 'manifest', 'plan', 'runRecord', 'findings', 'report', 'commands', 'sealed', 'evidencePre', 'evidenceDuring', 'evidencePost', 'operations', 'operationsProvenance', 'residueLedger')]
         [string]$Artifact = 'root'
     )
     $dir = Join-Path (Join-Path $StudyRoot $ScopeHash) $StudyId
@@ -195,6 +198,9 @@ function Resolve-ChaosStudyPath {
         'evidencePre'    { return Join-Path (Join-Path $dir 'evidence') 'pre' }
         'evidenceDuring' { return Join-Path (Join-Path $dir 'evidence') 'during' }
         'evidencePost'   { return Join-Path (Join-Path $dir 'evidence') 'post' }
+        'operations'          { return Join-Path $dir 'operations' }
+        'operationsProvenance' { return Join-Path (Join-Path $dir 'operations') 'provenance.jsonl' }
+        'residueLedger'       { return Join-Path $dir 'residue-ledger.json' }
     }
 }
 
@@ -295,6 +301,129 @@ function Add-ChaosCommandTrailEntry {
     return $entry
 }
 
+# -- Durable operation store (external adapter) -----------
+function Get-ChaosStudyOperationsDir {
+    <#
+    .SYNOPSIS
+        The operations/ directory for a study, created on demand. This is where
+        the external adapter's durable request/result exchange lives.
+    #>
+    param([Parameter(Mandatory)][string]$StudyPath)
+    $dir = Join-Path $StudyPath 'operations'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Save-ChaosOperationRequest {
+    <#
+    .SYNOPSIS
+        Persist an external-adapter operation request as
+        operations/<operationId>.request.json.
+
+    .DESCRIPTION
+        Refuses a sealed study and an incompatible artifact generation, so a
+        durable pause can never mutate a study it must not. Returns the path.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StudyPath,
+        [Parameter(Mandatory)][AllowNull()][object]$Request
+    )
+    if (Test-ChaosStudySealed -StudyPath $StudyPath) {
+        throw "StudyAlreadySealed: '$StudyPath' is sealed and cannot be modified."
+    }
+    Assert-ChaosStudyWriteCompatible -StudyPath $StudyPath | Out-Null
+    $operationId = if ($Request -is [System.Collections.IDictionary]) { $Request['operationId'] } else { $Request.operationId }
+    if ([string]::IsNullOrWhiteSpace([string]$operationId)) {
+        throw 'Save-ChaosOperationRequest: the request has no operationId.'
+    }
+    $dir = Get-ChaosStudyOperationsDir -StudyPath $StudyPath
+    $path = Join-Path $dir "$operationId.request.json"
+    Write-ChaosJsonFile -Path $path -InputObject $Request | Out-Null
+    return $path
+}
+
+function Get-ChaosOperationRequestByHash {
+    <#
+    .SYNOPSIS
+        Find a persisted request whose requestHash matches, or $null. This is
+        how a resume rediscovers the operationId a prior pause created.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StudyPath,
+        [Parameter(Mandatory)][string]$RequestHash
+    )
+    $dir = Join-Path $StudyPath 'operations'
+    if (-not (Test-Path -LiteralPath $dir)) { return $null }
+    foreach ($file in (Get-ChildItem -LiteralPath $dir -Filter '*.request.json' -File -ErrorAction SilentlyContinue | Sort-Object -Property Name)) {
+        $request = Read-ChaosJsonFile -Path $file.FullName
+        if ($request -and ($request.PSObject.Properties.Name -contains 'requestHash') -and $request.requestHash -eq $RequestHash) {
+            return $request
+        }
+    }
+    return $null
+}
+
+function Get-ChaosOperationResult {
+    <#
+    .SYNOPSIS
+        Read operations/<operationId>.result.json, or $null when the host has
+        not yet produced a result.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StudyPath,
+        [Parameter(Mandatory)][string]$OperationId
+    )
+    $path = Join-Path (Join-Path $StudyPath 'operations') "$OperationId.result.json"
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    return Read-ChaosJsonFile -Path $path
+}
+
+function Get-ChaosOperationProvenance {
+    <#
+    .SYNOPSIS
+        The provenance ledger entries appended when results were ingested.
+    #>
+    param([Parameter(Mandatory)][string]$StudyPath)
+    $path = Join-Path (Join-Path $StudyPath 'operations') 'provenance.jsonl'
+    if (-not (Test-Path -LiteralPath $path)) { return @() }
+    $entries = @()
+    foreach ($line in [System.IO.File]::ReadAllLines($path)) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        $entries += ($line | ConvertFrom-Json)
+    }
+    return @($entries)
+}
+
+function Add-ChaosOperationProvenance {
+    <#
+    .SYNOPSIS
+        Append one provenance record to operations/provenance.jsonl,
+        idempotently: a record for an operationId already present is not
+        duplicated, so re-running a satisfied operation leaves one entry.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StudyPath,
+        [Parameter(Mandatory)][AllowNull()][object]$Entry
+    )
+    if (Test-ChaosStudySealed -StudyPath $StudyPath) {
+        throw "StudyAlreadySealed: '$StudyPath' is sealed and cannot be modified."
+    }
+    Assert-ChaosStudyWriteCompatible -StudyPath $StudyPath | Out-Null
+
+    $operationId = if ($Entry -is [System.Collections.IDictionary]) { $Entry['operationId'] } else { $Entry.operationId }
+    foreach ($existing in (Get-ChaosOperationProvenance -StudyPath $StudyPath)) {
+        if (($existing.PSObject.Properties.Name -contains 'operationId') -and $existing.operationId -eq $operationId) {
+            return $existing
+        }
+    }
+
+    $dir = Get-ChaosStudyOperationsDir -StudyPath $StudyPath
+    $path = Join-Path $dir 'provenance.jsonl'
+    $line = (Protect-ChaosObject -InputObject $Entry | ConvertTo-Json -Depth 16 -Compress)
+    Add-Content -LiteralPath $path -Value $line -Encoding utf8
+    return $Entry
+}
+
 function Get-ChaosStudyState {
     <#
     .SYNOPSIS
@@ -387,6 +516,24 @@ function Complete-ChaosStudy {
     }
 
     $hashes = Get-ChaosStudyFileHashes -StudyPath $StudyPath
+
+    # manifest.v2 folds the generated durable-operation provenance and the
+    # residue ledger into the sealed manifest. A handwritten report cannot
+    # claim a compliant seal because these hashes are computed here, over
+    # artifacts only the seam and the cleanup ledger produce - their absence is
+    # recorded honestly rather than hidden.
+    $provenancePath = Join-Path (Join-Path $StudyPath 'operations') 'provenance.jsonl'
+    $residuePath = Join-Path $StudyPath 'residue-ledger.json'
+    $provenancePresent = Test-Path -LiteralPath $provenancePath
+    $residuePresent = Test-Path -LiteralPath $residuePath
+    $compliance = [ordered]@{
+        provenanceHash     = if ($provenancePresent) { Get-ChaosSha256 -Path $provenancePath } else { $null }
+        residueLedgerHash  = if ($residuePresent) { Get-ChaosSha256 -Path $residuePath } else { $null }
+        provenancePresent  = [bool]$provenancePresent
+        residueLedgerPresent = [bool]$residuePresent
+        sealClass          = if ($provenancePresent -and $residuePresent) { 'compliant' } else { 'partial' }
+    }
+
     $manifest = [ordered]@{
         manifestVersion = $ChaosStudyManifestVersion
         studyId         = Split-Path -Leaf $StudyPath
@@ -394,6 +541,7 @@ function Complete-ChaosStudy {
         sealedAt        = Get-ChaosUtcNow
         identity        = $Identity
         summary         = $Summary
+        compliance      = $compliance
         apiVersions     = if (Get-Command Get-ChaosApiVersionTable -ErrorAction SilentlyContinue) { Get-ChaosApiVersionTable } else { $null }
         files           = $hashes
         contentHash     = Get-ChaosSha256 -Text (ConvertTo-ChaosCanonicalJson -InputObject $hashes)

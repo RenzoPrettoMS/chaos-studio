@@ -83,6 +83,12 @@ $ChaosStudyExit = @{
     StudyIncomparable          = 15
     ActionDiscoveryUnavailable = 16
     ValidationFailed           = 17
+    ResumableOperation         = 18
+    PermissionApprovalRequired = 19
+    PartialScenarioUnaccepted  = 20
+    InsufficientExposure       = 21
+    AdapterUnavailable         = 22
+    StudyIncompatibleVersion   = 23
 }
 
 function Get-ChaosStudyExitCode {
