@@ -70,6 +70,62 @@ function Resolve-Entry {
     }
 }
 
+function Format-RerunLiteral {
+    <#
+    .SYNOPSIS
+        Render a stored plan value as PowerShell source the operator can run.
+
+    .DESCRIPTION
+        A rerun command is only useful if it can be pasted, so nested values -
+        the mechanism probe, scenario parameters, tag exclusions - have to come
+        back out as literals rather than as "System.Collections.Hashtable".
+        Strings are single-quoted with embedded quotes doubled; anything the
+        renderer does not recognise returns $null so the caller can report it as
+        unreproducible rather than emit a command that lies.
+    #>
+    param([AllowNull()][object]$Value)
+
+    if ($null -eq $Value) { return '$null' }
+    if ($Value -is [bool]) { return $(if ($Value) { '$true' } else { '$false' }) }
+    if ($Value -is [string]) { return ("'" + ($Value -replace "'", "''") + "'") }
+    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal]) { return [string]$Value }
+
+    if ($Value -is [array] -or ($Value -is [System.Collections.IList] -and $Value -isnot [string])) {
+        $items = @()
+        foreach ($item in $Value) {
+            $inner = Format-RerunLiteral -Value $item
+            if ($null -eq $inner) { return $null }
+            $items += $inner
+        }
+        return ('@(' + ($items -join ', ') + ')')
+    }
+
+    if ($Value -is [System.Collections.IDictionary] -or $Value -is [pscustomobject]) {
+        $names = @(Get-ChaosMemberName -InputObject $Value)
+        if ($names.Count -eq 0) { return '@{}' }
+        $parts = @()
+        foreach ($name in $names) {
+            $inner = Format-RerunLiteral -Value (Get-ChaosMember -InputObject $Value -Name $name)
+            if ($null -eq $inner) { return $null }
+            $parts += "$name = $inner"
+        }
+        return ('@{ ' + ($parts -join '; ') + ' }')
+    }
+
+    return $null
+}
+
+function Get-ChaosMemberName {
+    <#
+    .SYNOPSIS
+        Property or key names of a stored record, whichever shape it came back as.
+    #>
+    param([AllowNull()][object]$InputObject)
+    if ($null -eq $InputObject) { return @() }
+    if ($InputObject -is [System.Collections.IDictionary]) { return @($InputObject.Keys | ForEach-Object { [string]$_ }) }
+    return @($InputObject.PSObject.Properties | ForEach-Object { $_.Name })
+}
+
 if ($index.Count -eq 0) {
     Write-Card -Title 'No studies yet' -Status 'info' -Body @"
 No studies were found under the study root. History becomes useful after the
@@ -231,26 +287,160 @@ $($baseline.studyId): predicate $($comparison.baseline.predicateVerdict), study 
         # command deliberately omits -CreateWorkspace: reruns observe, they do not
         # provision. The scope is re-discovered live, so a resource that has since
         # left the workspace is not silently carried forward from the old plan.
-        $regionLine = if ($plan.scope.region) { "`n    -Location '$($plan.scope.region)' ``" } else { '' }
+        #
+        # Everything the first study froze is reproduced here. Two kinds of
+        # omission are dangerous rather than merely untidy: dropping the
+        # mechanism or its probe emits a command that fails readiness (exit 10)
+        # and looks like a platform fault, and dropping a blast-radius filter or
+        # exclusion emits a command that runs WIDER than the study it claims to
+        # repeat. Both are treated as unreproducible below rather than printed.
+        $unreproducible = @()
+
         # -Action accepts a URN or a name. Prefer the URN because it is exact, but
         # a discovery-skipped plan never learned one, and emitting -Action '' would
         # hand the operator a command that cannot run.
         $actionRef = if ([string]::IsNullOrWhiteSpace($plan.action.canonicalId)) { [string]$plan.action.name } else { [string]$plan.action.canonicalId }
-        $sourceLines = @($plan.signals.configuredSources | Where-Object { $_ } | ForEach-Object { "    -SignalSource '$_' ``" })
-        $command = @(
+        if ([string]::IsNullOrWhiteSpace($actionRef)) { $unreproducible += 'the action - the plan records neither a canonical id nor a name' }
+
+        $lines = @(
             "& '$scope' ``"
             "    -SubscriptionId '$($plan.workspace.subscriptionId)' ``"
             "    -ResourceGroup '$($plan.workspace.resourceGroup)' ``"
-            "    -WorkspaceName '$($plan.workspace.name)' ``$regionLine"
+            "    -WorkspaceName '$($plan.workspace.name)' ``"
+        )
+        if ($plan.scope.region) { $lines += "    -Location '$($plan.scope.region)' ``" }
+        $lines += @(
             "    -Scenario '$($plan.scenario.name)' ``"
             "    -Action '$actionRef' ``"
             "    -SteadyState '$($plan.question.steadyState.raw)' ``"
-            $sourceLines
+        )
+
+        foreach ($source in @($plan.signals.configuredSources | Where-Object { $_ })) {
+            $lines += "    -SignalSource '$($source -replace "'", "''")' ``"
+        }
+
+        # Falsifiability inputs. Required by readiness, so a rerun without them
+        # is not a weaker rerun - it is a command that cannot run at all.
+        $mechanism = $plan.mechanism
+        $failureMechanism = [string](Get-ChaosMember -InputObject $mechanism -Name 'failureMechanism')
+        $mechanismEvidence = [string](Get-ChaosMember -InputObject $mechanism -Name 'mechanismEvidence')
+        $mechanismProbe = Get-ChaosMember -InputObject $mechanism -Name 'mechanismProbe'
+
+        if ([string]::IsNullOrWhiteSpace($failureMechanism)) { $unreproducible += 'the failure mechanism - readiness requires it (exit 10)' }
+        else { $lines += "    -FailureMechanism '$($failureMechanism -replace "'", "''")' ``" }
+
+        if ([string]::IsNullOrWhiteSpace($mechanismEvidence)) { $unreproducible += 'the mechanism evidence - readiness requires it (exit 10)' }
+        else { $lines += "    -MechanismEvidence '$($mechanismEvidence -replace "'", "''")' ``" }
+
+        if ($null -eq $mechanismProbe) { $unreproducible += 'the mechanism probe - readiness requires it (exit 10)' }
+        else {
+            $probeLiteral = Format-RerunLiteral -Value $mechanismProbe
+            if ($null -eq $probeLiteral) { $unreproducible += 'the mechanism probe - it contains a value that cannot be written back as a literal' }
+            else { $lines += "    -MechanismProbe $probeLiteral ``" }
+        }
+
+        $hypothesis = [string](Get-ChaosMember -InputObject $plan.question -Name 'hypothesis')
+        if (-not [string]::IsNullOrWhiteSpace($hypothesis)) { $lines += "    -Hypothesis '$($hypothesis -replace "'", "''")' ``" }
+
+        # Scenario parameters are stored as the {key,value} pairs the service
+        # takes; the scope skill takes a hashtable, so they are folded back.
+        $storedParameters = @(Get-ChaosItems -InputObject (Get-ChaosMember -InputObject $plan.scenario -Name 'parameters'))
+        if ($storedParameters.Count -gt 0) {
+            $pairs = @()
+            foreach ($parameter in $storedParameters) {
+                $key = [string](Get-ChaosMember -InputObject $parameter -Name 'key')
+                $literal = Format-RerunLiteral -Value (Get-ChaosMember -InputObject $parameter -Name 'value')
+                if ([string]::IsNullOrWhiteSpace($key) -or $null -eq $literal) { $pairs = $null; break }
+                $pairs += "$key = $literal"
+            }
+            if ($null -eq $pairs) { $unreproducible += 'the scenario parameters - one of them cannot be written back as a literal' }
+            else { $lines += "    -Parameters @{ $($pairs -join '; ') } ``" }
+        }
+
+        # Exposure arithmetic. Reproduced from the frozen inputs so the rerun
+        # buys the same exposure and the two studies stay comparable.
+        $exerciseInputs = Get-ChaosMember -InputObject (Get-ChaosMember -InputObject $plan.exercise -Name 'model') -Name 'inputs'
+        foreach ($pair in @(
+                @{ field = 'eventRatePerSecond'; parameter = 'EventRatePerSecond' }
+                @{ field = 'vulnerableWindowSeconds'; parameter = 'VulnerableWindowSeconds' }
+                @{ field = 'eligibleFraction'; parameter = 'EligibleFraction' })) {
+            $value = Get-ChaosMember -InputObject $exerciseInputs -Name $pair.field
+            if ($null -ne $value) { $lines += "    -$($pair.parameter) $value ``" }
+        }
+        foreach ($assumption in @(Get-ChaosItems -InputObject (Get-ChaosMember -InputObject (Get-ChaosMember -InputObject $plan.exercise -Name 'model') -Name 'assumptions'))) {
+            if ($assumption) { $lines += "    -ExerciseAssumption '$([string]$assumption -replace "'", "''")' ``" }
+        }
+        if ([bool](Get-ChaosMember -InputObject $plan.exercise -Name 'weakAccepted')) { $lines += '    -AcceptWeakExercise `' }
+
+        # Blast radius. Anything here that fails to reproduce widens the rerun,
+        # so it is a hard failure rather than a dropped line.
+        $blastRadius = Get-ChaosMember -InputObject $plan.scope -Name 'blastRadius'
+        $filters = Get-ChaosMember -InputObject $blastRadius -Name 'filters'
+        $exclusions = Get-ChaosMember -InputObject $blastRadius -Name 'exclusions'
+        foreach ($map in @(
+                @{ container = $filters; field = 'location'; parameter = 'FilterLocation'; list = $true }
+                @{ container = $filters; field = 'zone'; parameter = 'FilterZone'; list = $true }
+                @{ container = $filters; field = 'physicalZone'; parameter = 'FilterPhysicalZone'; list = $false }
+                @{ container = $exclusions; field = 'resource'; parameter = 'ExcludeResource'; list = $true }
+                @{ container = $exclusions; field = 'type'; parameter = 'ExcludeType'; list = $true })) {
+            $value = Get-ChaosMember -InputObject $map.container -Name $map.field
+            if ($null -eq $value) { continue }
+            if ($map.list) {
+                $items = @(Get-ChaosItems -InputObject $value | Where-Object { $_ })
+                if ($items.Count -eq 0) { continue }
+                $rendered = @($items | ForEach-Object { "'$([string]$_ -replace "'", "''")'" })
+                $lines += "    -$($map.parameter) $($rendered -join ', ') ``"
+            }
+            elseif (-not [string]::IsNullOrWhiteSpace([string]$value)) {
+                $lines += "    -$($map.parameter) '$([string]$value -replace "'", "''")' ``"
+            }
+        }
+        $excludeTag = Get-ChaosMember -InputObject $exclusions -Name 'tag'
+        if ($null -ne $excludeTag) {
+            $tagLiteral = Format-RerunLiteral -Value $excludeTag
+            if ($null -eq $tagLiteral) { $unreproducible += 'the tag exclusions - they cannot be written back as a literal, and omitting them would widen the blast radius' }
+            elseif ($tagLiteral -ne '@{}') { $lines += "    -ExcludeTag $tagLiteral ``" }
+        }
+
+        # Any blast-radius key the plan carries that this builder does not know
+        # how to emit would silently widen the rerun, so it fails instead.
+        foreach ($pair in @(
+                @{ container = $filters; known = @('location', 'zone', 'physicalZone'); label = 'filter' }
+                @{ container = $exclusions; known = @('resource', 'type', 'tag'); label = 'exclusion' })) {
+            foreach ($name in @(Get-ChaosMemberName -InputObject $pair.container)) {
+                if ($pair.known -notcontains $name) {
+                    $value = Get-ChaosMember -InputObject $pair.container -Name $name
+                    if ($null -ne $value -and @(Get-ChaosItems -InputObject $value | Where-Object { $_ }).Count -gt 0) {
+                        $unreproducible += "the '$name' blast-radius $($pair.label) - this skill cannot write it back, and omitting it would widen the rerun"
+                    }
+                }
+            }
+        }
+
+        $adapter = [string](Get-ChaosMember -InputObject $plan -Name 'adapter')
+        if (-not [string]::IsNullOrWhiteSpace($adapter)) { $lines += "    -Adapter '$adapter' ``" }
+
+        $lines += @(
             "    -DurationMinutes $($plan.windows.injectMinutes) ``"
             "    -BaselineMinutes $($plan.windows.baselineMinutes) ``"
             "    -RecoveryMinutes $($plan.windows.recoveryMinutes)"
-        ) | Where-Object { $_ } | ForEach-Object { $_ }
-        $command = ($command -join "`n")
+        )
+
+        if ($unreproducible.Count -gt 0) {
+            $detail = @($unreproducible | ForEach-Object { "  - $_" }) -join "`n"
+            Write-ChaosStudyFailure -Title 'Rerun cannot be reproduced' -Message @"
+Study $($entry.studyId) cannot be repeated exactly from its plan, so no command
+was printed. A command that silently drops one of these would either fail
+readiness or run against a wider blast radius than the study it claims to
+repeat, and the two results would not be comparable.
+
+Missing:
+$detail
+"@ -Remediation 'Plan a fresh study with the chaos-study-scope skill, supplying these inputs explicitly, and compare the two studies afterwards with -Action compare.'
+            exit (Get-ChaosStudyExitCode -Name 'RerunNotReproducible')
+        }
+
+        $command = ($lines -join "`n")
 
         Write-Card -Title "Rerun study $($entry.studyId)" -Status 'info' -Body @"
 Rerunning creates a new study rather than overwriting this one, so the pair can

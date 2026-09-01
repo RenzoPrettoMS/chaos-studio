@@ -29,12 +29,49 @@ blast radius, validation runs against that configuration, and execution produces
 a **scenario run**. This suite uses that model exclusively — there is no V1 path
 and no fallback to one.
 
-## The five phases
+## The six phases
 
-### 1. Scope
+### 1. Design
 
-Decide *what system*, *what action*, and *what would count as a failure* —
-before anything runs.
+Decide *what is worth testing at all*, before any Azure call is made.
+
+This phase exists because the most common way a reliability study fails is not a
+bad injection — it is a well-executed injection of something that never mattered.
+An action is picked because it is available, it runs, nothing moves, and the
+system is declared resilient. Nothing was learned, but a report now says
+otherwise.
+
+Design fixes the ordering. First the system is *read*: code, deployment, the
+dependency graph, retry and fallback behaviour, persistence paths, workload
+shape, existing telemetry, and deployment identity. Each of those eight areas is
+either observed with a citation or explicitly declared unavailable with a reason.
+Silence fails at exit code 24. A hypothesis may not rest on evidence nobody read.
+
+Only then is the customer interviewed — one question at a time, in dependency
+order, and vague answers are refused rather than recorded. Questions that
+analysis already answered are pre-filled and skipped, so the customer is asked
+only for what only they can supply: what they want to learn, the business impact
+they care about, the change they are validating, the blast radius and data-loss
+risk they accept, production or not, their abort threshold, the window, how
+representative the traffic is, and whether discrete or destructive actions are
+acceptable at all.
+
+The output is a ranked set of two to four **candidate hypotheses**, each carrying
+a dependency edge, a concrete failure mechanism, the code evidence for it, an
+exact data-plane probe, a falsifiable predicate, exposure inputs, collateral
+risks, a suggested blast radius and abort criteria. Candidates are intersected
+with live regional action discovery and the workspace's own recommended
+scenarios; when Azure cannot be reached they are marked *provisional* and
+limitation `L15` is recorded rather than guessing what the platform offers.
+
+Nothing is recommended as final until the customer returns the exact confirmation
+phrase, which is bound to the brief hash so it keeps referring to what they
+actually saw. The confirmed brief then feeds scoping, so no decision is retyped
+and none is silently changed in transit.
+
+### 2. Scope
+
+Turn the confirmed intent into a frozen, checkable plan — before anything runs.
 
 The action is not chosen from a list this suite carries. It is chosen from the
 list Chaos Studio returns for the workspace's region, live, at scope time. That
@@ -57,7 +94,7 @@ Scoping fails closed. If nothing is in scope, or the action applies to no
 resource type present, we stop at exit code 14 rather than substituting a
 different action that answers a different question.
 
-### 2. Readiness
+### 3. Readiness
 
 Verify the plan is executable *and* observable.
 
@@ -73,7 +110,7 @@ Two independent checks:
 
 Readiness failure is exit code 10. It is not a warning.
 
-### 3. Execute
+### 4. Execute
 
 Run the scenario inside a bounded window, with the abort path armed.
 
@@ -96,7 +133,7 @@ Rules that do not bend:
   one trips, the run is cancelled and the study records that it was aborted,
   which is itself a finding. Cleanup of the configuration happens regardless.
 
-### 4. Observe
+### 5. Observe
 
 Collect three windows: `pre`, `during`, `post`. All windows are half-open
 `[start, end)` so a sample can never be counted twice.
@@ -111,7 +148,7 @@ that the action reached the system under study. It proves Chaos Studio accepted
 and executed the request. Only a data-plane signal can set
 `mechanismProven: true`.
 
-### 5. Conclude
+### 6. Conclude
 
 Turn evidence into findings, then seal.
 
@@ -130,7 +167,7 @@ hashed, the manifest records the hashes and the api-version pins, and then —
 and only then — `SEALED` is written. A sealed study is evidence you can cite
 six months later.
 
-## Why the suite is five skills
+## Why the suite is six skills
 
 One skill that did all of this would be unreadable and untestable. Splitting on
 the phase boundaries gives each skill one job, one output, and one failure
@@ -139,6 +176,7 @@ mode:
 | Skill | Owns | Produces |
 |---|---|---|
 | `chaos-study` | the opinionated end-to-end path | an orchestrated study |
+| `chaos-study-design` | analysis, interview, candidate hypotheses | `study-brief.v1.json` |
 | `chaos-study-scope` | workspace, scope, discovery, readiness | `study-plan.v3.json` |
 | `chaos-study-run` | configuration, consent, execution, observation | `run-record.v3.json` |
 | `chaos-study-report` | interpretation, rendering, sealing | `findings.v2.json`, `report.html` |

@@ -76,16 +76,28 @@ param(
 
     # The scenario to configure and execute: its name or id, as returned by
     # -ListScenarios. Matched against the live list.
-    [Parameter(ParameterSetName = 'Plan', Mandatory)][string]$Scenario,
+    [Parameter(ParameterSetName = 'Plan', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief')]
+    [string]$Scenario,
 
     # The action this study is about: its name, canonical URN, or display name,
     # as returned by -ListActions. Matched against the live list. The scenario
     # is what executes; the action is what the study claims to have tested, and
     # the readiness gates are evaluated against it.
-    [Parameter(ParameterSetName = 'Plan', Mandatory)][string]$Action,
+    [Parameter(ParameterSetName = 'Plan', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief')]
+    [string]$Action,
 
     # The numeric objective this study tries to break, e.g. 'successRate >= 99.5'.
-    [Parameter(ParameterSetName = 'Plan', Mandatory)][string]$SteadyState,
+    [Parameter(ParameterSetName = 'Plan', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief')]
+    [string]$SteadyState,
+
+    # A confirmed study brief from chaos-study-design. Every parameter not given
+    # explicitly on this command line is hydrated from it, so a decision the
+    # customer already confirmed is never retyped — and anything passed
+    # explicitly still wins, so the brief is a starting point, not a cage.
+    [Parameter(ParameterSetName = 'Brief', Mandatory)][string]$Brief,
 
     [ValidateRange(1, 240)][int]$DurationMinutes = 10,
     [ValidateRange(0, 240)][int]$BaselineMinutes = 5,
@@ -183,8 +195,30 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib' 'ActionDiscovery.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'Workspace.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'Readiness.ps1')
+. (Join-Path $PSScriptRoot 'lib' 'BriefHandoff.ps1')
 
 $ChaosStudyPlanVersion = 'study-plan.v3'
+
+# -- Brief hydration -------------------------------------------------------
+# Runs before anything else so every downstream reference sees final values.
+# Explicit arguments always win: the brief fills gaps, it never overrides a
+# decision the caller stated on this command line.
+if ($PSCmdlet.ParameterSetName -eq 'Brief') {
+    $hydrated = Import-ChaosBriefHandoff -BriefPath $Brief -Bound $PSBoundParameters
+    foreach ($name in $hydrated.Keys) {
+        Set-Variable -Name $name -Value $hydrated[$name] -Force
+    }
+    foreach ($required in @('Scenario', 'Action', 'SteadyState')) {
+        $value = Get-Variable -Name $required -ValueOnly -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            Write-ChaosStudyFailure -Title 'Brief is incomplete' `
+                -Message "The brief does not supply -$required and it was not passed explicitly." `
+                -Remediation "Pass -$required, or re-run chaos-study-design so the confirmed brief carries it."
+            exit (Get-ChaosStudyExitCode 'DesignIncomplete')
+        }
+    }
+    Write-ChaosStudyNote "Hydrated $($hydrated.Count) parameter(s) from brief $(Split-Path $Brief -Leaf)."
+}
 
 # -- Steady state ----------------------------------------------------------
 

@@ -89,6 +89,8 @@ $ChaosStudyExit = @{
     InsufficientExposure       = 21
     AdapterUnavailable         = 22
     StudyIncompatibleVersion   = 23
+    DesignIncomplete           = 24
+    RerunNotReproducible       = 25
 }
 
 function Get-ChaosStudyExitCode {
@@ -211,6 +213,30 @@ function ConvertTo-ChaosList {
     }
 
     return , @($flat.ToArray())
+}
+
+function Get-ChaosItems {
+    <#
+    .SYNOPSIS
+        Enumerate a stored list safely, in any expression position.
+
+    .DESCRIPTION
+        ConvertTo-ChaosList returns ",@(...)" so that a single-element result
+        survives an assignment intact. That idiom only holds for a direct
+        assignment: used inline - wrapped in "@(...)" or piped into a filter -
+        the whole array arrives as ONE element, so a count reports 1 for an
+        empty list and 1 for a list of five, and a join prints
+        "System.Object[]".
+
+        This emits the elements one at a time, so "@(Get-ChaosItems ...)" and
+        "Get-ChaosItems ... | Where-Object" both behave the way they read.
+        Prefer it anywhere the result is not being assigned straight to a
+        variable.
+    #>
+    param([AllowNull()][object]$InputObject)
+
+    $list = ConvertTo-ChaosList -InputObject $InputObject
+    foreach ($item in $list) { $item }
 }
 
 # -- Time -------------------------------------------------

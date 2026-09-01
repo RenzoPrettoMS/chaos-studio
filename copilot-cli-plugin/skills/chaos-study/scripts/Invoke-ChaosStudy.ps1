@@ -68,62 +68,73 @@ param(
 
     [Parameter(ParameterSetName = 'ListActions', Mandatory)]
     [Parameter(ParameterSetName = 'ListScenarios', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief', Mandatory)]
     [Parameter(ParameterSetName = 'Study', Mandatory)][string]$SubscriptionId,
     [Parameter(ParameterSetName = 'ListActions', Mandatory)]
     [Parameter(ParameterSetName = 'ListScenarios', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief', Mandatory)]
     [Parameter(ParameterSetName = 'Study', Mandatory)][string]$ResourceGroup,
 
     # The workspace is the lifecycle root: scopes, discovered resources,
     # scenarios and runs all hang off one.
     [Parameter(ParameterSetName = 'ListActions', Mandatory)]
     [Parameter(ParameterSetName = 'ListScenarios', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief', Mandatory)]
     [Parameter(ParameterSetName = 'Study', Mandatory)][string]$WorkspaceName,
 
     # Create the workspace when it does not exist, over the given ARM scopes.
-    [Parameter(ParameterSetName = 'Study')][switch]$CreateWorkspace,
-    [Parameter(ParameterSetName = 'Study')][string[]]$Scope = @(),
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][switch]$CreateWorkspace,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string[]]$Scope = @(),
     [Parameter(ParameterSetName = 'ListActions')]
-    [Parameter(ParameterSetName = 'Study')][string]$Location,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$Location,
 
-    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$Scenario,
-    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$Action,
-    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$SteadyState,
-    [Parameter(ParameterSetName = 'Study')][ValidateRange(1, 240)][int]$DurationMinutes = 10,
-    [Parameter(ParameterSetName = 'Study')][ValidateRange(0, 240)][int]$BaselineMinutes = 5,
-    [Parameter(ParameterSetName = 'Study')][ValidateRange(0, 240)][int]$RecoveryMinutes = 10,
-    [Parameter(ParameterSetName = 'Study')][hashtable]$Parameters,
-    [Parameter(ParameterSetName = 'Study')][string]$Hypothesis,
-    [Parameter(ParameterSetName = 'Study')][string[]]$SignalSource = @(),
+    [Parameter(ParameterSetName = 'Study', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief')][string]$Scenario,
+    [Parameter(ParameterSetName = 'Study', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief')][string]$Action,
+    [Parameter(ParameterSetName = 'Study', Mandatory)]
+    [Parameter(ParameterSetName = 'Brief')][string]$SteadyState,
+
+    # A confirmed brief from chaos-study-design. Supplies every study input the
+    # customer already agreed, so the decision reached in the design phase is
+    # the decision that runs. Anything passed explicitly still wins.
+    [Parameter(ParameterSetName = 'Brief', Mandatory)][string]$Brief,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][ValidateRange(1, 240)][int]$DurationMinutes = 10,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][ValidateRange(0, 240)][int]$BaselineMinutes = 5,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][ValidateRange(0, 240)][int]$RecoveryMinutes = 10,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][hashtable]$Parameters,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$Hypothesis,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string[]]$SignalSource = @(),
 
     # Falsifiability inputs (Req B). Readiness blocks without them, so the front
     # door has to be able to carry them; a study whose mechanism cannot be stated
     # is a guess, and the entry point should not be the reason it slips through.
-    [Parameter(ParameterSetName = 'Study')][string]$FailureMechanism,
-    [Parameter(ParameterSetName = 'Study')][string]$MechanismEvidence,
-    [Parameter(ParameterSetName = 'Study')][hashtable]$MechanismProbe,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$FailureMechanism,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$MechanismEvidence,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][hashtable]$MechanismProbe,
 
     # Exercise arithmetic (Req E). Unsupplied values stay unsupplied.
-    [Parameter(ParameterSetName = 'Study')][double]$EventRatePerSecond,
-    [Parameter(ParameterSetName = 'Study')][double]$VulnerableWindowSeconds,
-    [Parameter(ParameterSetName = 'Study')][ValidateRange(0, 1)][double]$EligibleFraction,
-    [Parameter(ParameterSetName = 'Study')][switch]$AcceptWeakExercise,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][double]$EventRatePerSecond,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][double]$VulnerableWindowSeconds,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][ValidateRange(0, 1)][double]$EligibleFraction,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][switch]$AcceptWeakExercise,
 
     # Blast radius, forwarded to the scenario configuration.
-    [Parameter(ParameterSetName = 'Study')][string[]]$FilterLocation = @(),
-    [Parameter(ParameterSetName = 'Study')][string[]]$ExcludeResource = @(),
-    [Parameter(ParameterSetName = 'Study')][string[]]$ExcludeType = @(),
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string[]]$FilterLocation = @(),
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string[]]$ExcludeResource = @(),
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string[]]$ExcludeType = @(),
 
-    [Parameter(ParameterSetName = 'Study')][string]$StudyRoot,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$StudyRoot,
     [Parameter(ParameterSetName = 'ListActions')]
     [Parameter(ParameterSetName = 'ListScenarios')]
-    [Parameter(ParameterSetName = 'Study')][ValidateSet('local-az', 'external')][string]$Adapter,
-    [Parameter(ParameterSetName = 'Study')][string]$AcceptPartialScenario,
-    [Parameter(ParameterSetName = 'Study')][bool]$DryRun = $true,
-    [Parameter(ParameterSetName = 'Study')][string]$Consent,
-    [Parameter(ParameterSetName = 'Study')][string]$ApprovePermissions,
-    [Parameter(ParameterSetName = 'Study')][switch]$KeepConfiguration,
-    [Parameter(ParameterSetName = 'Study')][switch]$SkipDiscovery,
-    [Parameter(ParameterSetName = 'Study')][switch]$PlanOnly
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][ValidateSet('local-az', 'external')][string]$Adapter,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$AcceptPartialScenario,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][bool]$DryRun = $true,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$Consent,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$ApprovePermissions,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][switch]$KeepConfiguration,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][switch]$SkipDiscovery,
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][switch]$PlanOnly
 )
 
 Set-StrictMode -Version Latest
@@ -134,18 +145,19 @@ $libDir = Join-Path $PSScriptRoot 'lib'
 . (Join-Path $libDir 'Study.ps1')
 
 $skillsRoot = Join-Path $PSScriptRoot '..' '..'
+$designScript = Join-Path $skillsRoot 'chaos-study-design' 'scripts' 'Invoke-ChaosStudyDesign.ps1'
 $scopeScript = Join-Path $skillsRoot 'chaos-study-scope' 'scripts' 'Invoke-ChaosStudyScope.ps1'
 $runScript = Join-Path $skillsRoot 'chaos-study-run' 'scripts' 'Invoke-ChaosStudyRun.ps1'
 $reportScript = Join-Path $skillsRoot 'chaos-study-report' 'scripts' 'Invoke-ChaosStudyReport.ps1'
 
-foreach ($required in @($scopeScript, $runScript, $reportScript)) {
+foreach ($required in @($designScript, $scopeScript, $runScript, $reportScript)) {
     if (-not (Test-Path -LiteralPath $required)) {
         Write-Error-Card -Title 'Skill suite incomplete' -Body @"
 Expected phase script not found:
 
   $required
 
-chaos-study chains the focused skills rather than duplicating them, so all four
+chaos-study chains the focused skills rather than duplicating them, so all six
 skill directories must be installed together.
 "@
         exit (Get-ChaosStudyExitCode -Name 'Error')
@@ -293,13 +305,17 @@ $scopeArgs = @{
     SubscriptionId  = $SubscriptionId
     ResourceGroup   = $ResourceGroup
     WorkspaceName   = $WorkspaceName
-    Scenario        = $Scenario
-    Action          = $Action
-    SteadyState     = $SteadyState
     DurationMinutes = $DurationMinutes
     BaselineMinutes = $BaselineMinutes
     RecoveryMinutes = $RecoveryMinutes
 }
+# In Brief mode these three may be absent here and supplied by the brief, so
+# only forward what was actually stated. Passing an empty string would look
+# explicit to the hydrator and suppress the brief's value.
+if ($Scenario) { $scopeArgs['Scenario'] = $Scenario }
+if ($Action) { $scopeArgs['Action'] = $Action }
+if ($SteadyState) { $scopeArgs['SteadyState'] = $SteadyState }
+if ($PSCmdlet.ParameterSetName -eq 'Brief') { $scopeArgs['Brief'] = $Brief }
 if ($CreateWorkspace) { $scopeArgs['CreateWorkspace'] = [switch]::Present }
 if ($Scope.Count -gt 0) { $scopeArgs['Scope'] = $Scope }
 if ($Location) { $scopeArgs['Location'] = $Location }

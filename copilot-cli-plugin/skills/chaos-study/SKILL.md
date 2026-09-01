@@ -9,32 +9,32 @@ Chaos engineering is an experiment in the scientific sense, not a stunt. This
 skill runs it: it asks a question that can be proven **wrong**, executes a real
 action against real resources, and reports what the evidence actually showed.
 
-## The question this suite answers
-
 > Does **`<steady state>`** hold when I execute **`<action>`** across
 > **`<workspace scope>`**?
 
-If you cannot phrase the goal that way, stop and reframe it. "Test resilience"
-is not a study — there is no way for it to fail, so it cannot teach you anything.
+If you cannot phrase the goal that way, start with `chaos-study-design`. "Test
+resilience" is not a study — there is no way for it to fail, so it cannot teach
+you anything.
 
 ## Principles
 
 **A study is a falsifiable claim.** Every study needs a steady-state predicate
-that is measurable beforehand and could plausibly break during the run.
+measurable beforehand that could plausibly break during the run.
+
+**What to test is decided before it is scoped.** Picking an action because it is
+available is how studies end up proving nothing. `chaos-study-design` reads the
+system, interviews you, and ranks candidates against real dependency edges first.
 
 **The platform decides what is possible, not this plugin.** The available
 actions are read live from Chaos Studio for the workspace's region, every time.
 This suite ships **no** action catalogue, and there is no offline fallback: if
 the service cannot be asked, scoping stops with exit `16` rather than guessing.
-
-**What is in scope is read from the service.** The resources a run will touch
-come from the workspace's discovered resources, not from an assertion in the
-plan. If the scope is empty, or the action applies to nothing in it, the study
-is refused before anything runs.
+Likewise the resources a run will touch come from the workspace's discovered
+resources, not from an assertion in the plan.
 
 **Evidence beats vibes.** A verdict is only as good as the signals behind it. If
 a signal was not collected, the report says *not measured* — never `0`, never a
-plausible-looking guess. Absent evidence is reported as absent.
+plausible-looking guess.
 
 **Nothing runs without consent.** `-DryRun` defaults to `$true`. Arming a study
 takes both `-DryRun:$false` and typing back the exact phrase the plan prints.
@@ -42,45 +42,50 @@ There is no flag that skips this.
 
 **Blast radius is bounded before it is armed.** Workspace, scope, filters,
 exclusions, action, parameters and duration are frozen into the plan and hashed.
-If the plan changed after you approved it, the run refuses rather than executing
-something you did not review.
+If the plan changed after you approved it, the run refuses.
 
 **A clean result is not automatically good news.** If the action never actually
 reached the resources, "steady state held" means nothing. The report says
 *Inconclusive* rather than claiming a pass it cannot support.
 
-## The five skills
+## The six skills
 
 This is a suite, not a monolith. Use the front door unless you need one phase.
 
 | Skill | Owns |
 | --- | --- |
 | **chaos-study** | chains the phases below; the default entry point |
+| **chaos-study-design** | reading the system, interviewing you, recommending what to test |
 | **chaos-study-scope** | workspace, scope, live action discovery, freezing the plan |
 | **chaos-study-run** | configuration, validation, consent, execution, evidence |
 | **chaos-study-report** | interpretation, findings, the HTML report |
 | **chaos-study-history** | list, compare, and re-run past studies |
 
-Each phase persists its own output, so a chain that fails partway can be resumed
-from that phase — you never have to restart from scratch.
+Each phase persists its own output, so a chain that fails partway resumes there.
 
 ## Usage
 
-**1. Ask the platform what it can do here.** The answer depends on the region and
-what is in scope, and it changes as Chaos Studio ships new actions:
+**1. Decide what is worth testing.** If the goal is still "test resilience",
+start here — this reads the system, then asks the questions that turn an
+intention into a falsifiable claim, ending with a brief that feeds scoping:
+
+```powershell
+./scripts/Invoke-ChaosStudy.ps1 -Phase design -System orders-api
+```
+
+**2. Ask the platform what it can do here.** The answer depends on the region and
+what is in scope, and changes as Chaos Studio ships new actions:
 
 ```powershell
 ./scripts/Invoke-ChaosStudy.ps1 -ListActions `
     -SubscriptionId $sub -ResourceGroup rg-prod -WorkspaceName ws-payments
-
-./scripts/Invoke-ChaosStudy.ps1 -ListScenarios `
-    -SubscriptionId $sub -ResourceGroup rg-prod -WorkspaceName ws-payments
+# ...and -ListScenarios for the scenarios the workspace recommends
 ```
 
-Each action is printed with its canonical id, its type, what it applies to and
-its parameter schema — all as the service reported them.
+Each action is printed with its canonical id, type, what it applies to and its
+parameter schema — all as the service reported them.
 
-**2. Plan and preview.** This executes nothing:
+**3. Plan and preview.** This executes nothing:
 
 ```powershell
 ./scripts/Invoke-ChaosStudy.ps1 `
@@ -90,10 +95,10 @@ its parameter schema — all as the service reported them.
     -SteadyState 'successRate >= 99.5' -SignalSource 'metrics:Availability'
 ```
 
-Read the preview. It shows what is in scope after filters and exclusions, the
-windows, and the configuration that would be created.
+Read the preview: what is in scope after filters and exclusions, the windows,
+and the configuration that would be created.
 
-**3. Arm it.** Only after the preview matches your intent:
+**4. Arm it.** Only after the preview matches your intent:
 
 ```powershell
 ./scripts/Invoke-ChaosStudy.ps1 ... -DryRun:$false -Consent '<phrase from the preview>'
@@ -109,6 +114,7 @@ executes, collects during, waits out recovery, then reports and seals the study.
 | **Steady state held** | The action landed and the objective survived it |
 | **Degraded but recovered** | Breached during the run, recovered afterwards |
 | **Steady state breached** | Breached and still breached after recovery |
+| **Not exercised** | The action never applied enough work to test anything |
 | **Inconclusive** | The action could not be proven to have landed |
 
 Severity follows recovery, not drama: a breach that never recovers is `critical`;
@@ -124,30 +130,26 @@ on the system under study. Two forms:
   scope holding several resources has no implied metric target, so pin it.
 - `logs:<workspaceId>#<kql>` — a Log Analytics query
 
-Name at least one signal that would be expected to *move* under the action. That
-is what separates "resilient" from "the action never landed".
+Name at least one signal expected to *move* under the action. That is what
+separates "resilient" from "the action never landed".
 
 ## Before you run against production
 
-Scoping checks readiness first. A study whose objective cannot be measured, or
-whose parameters do not satisfy the live schema, teaches nothing — so readiness
-failure (exit `10`) is a real answer, not a gate to bypass. Exit `14` means
-nothing is in scope or the action does not apply to what is; running anyway
-would produce a false pass. Exit `16` means the platform could not be asked what
-it offers, and the suite refuses to substitute its own list.
-
+Scoping checks readiness first: a study whose objective cannot be measured, or
+whose parameters do not satisfy the live schema, teaches nothing, so readiness
+failure (exit `10`) is a real answer rather than a gate to bypass.
 ## Progressive discovery
 
 Action identifiers, parameters and required permissions are **not** documented
 here, because they are the service's to state and this plugin's to relay. Get
 them from `-ListActions`. What lives here is the method:
 
-- **`references/study-method.md`** — the five-phase method and why it is split
+- **`references/design-method.md`** — how a study is chosen before it is scoped
+- **`references/study-method.md`** — the six-phase method and why it is split
 - **`references/report-contract.md`** — what the report may and may not claim
 
-Kubernetes/AKS-specific guidance is deliberately absent: those actions are not
-available from the actions endpoint yet, and will appear in `-ListActions`
-automatically when they ship.
+Kubernetes/AKS guidance is deliberately absent: those actions are not yet offered
+by the actions endpoint, and will appear in `-ListActions` when they ship.
 
 ## Exit codes
 
@@ -158,7 +160,7 @@ automatically when they ship.
 | `10` | Readiness gates failed |
 | `11` | Consent declined or phrase mismatch |
 | `12` | Plan changed after it was frozen |
-| `13` | Study already sealed |
+| `13` | Study or brief already sealed |
 | `14` | Scope unverified — nothing in scope, or the action does not fit it |
 | `15` | Studies not comparable |
 | `16` | Live action discovery unavailable — there is no fallback |
@@ -169,31 +171,29 @@ automatically when they ship.
 | `21` | The run would not exercise the failure often enough to mean anything |
 | `22` | No adapter can reach Azure — say which one to use |
 | `23` | Study was written by an older contract version |
+| `24` | Design incomplete — an unread area, a vague answer, or a missing field |
+| `25` | A past study cannot be re-run exactly, so no command was printed |
 
 `18`, `19` and `21` are **pauses, not failures**. Each names the one thing it
-needs; supply it and re-run the same command. Do not route around them by filling
-in the missing part yourself — a study that cannot show where its evidence came
-from cannot be sealed.
+needs; supply it and re-run the same command. Do not fill in the missing part
+yourself — a study that cannot show where its evidence came from cannot be sealed.
 
 ## Running where `az` is not usable
 
 Every Azure call goes through one adapter seam, selected with `-Adapter`:
 `local-az` runs `az` in-process; `external` cannot, so it writes each operation
-it needs into the study's `operations/` directory and exits `18`. Under
-`external` you are the executor: read the pending request, run exactly that call
-with your own authenticated tooling, write the response back as the matching
-result file, and re-run the identical command. Results are bound to the request
-hash and folded into the study's provenance, so a study that paused ten times is
-as auditable as one that never paused. Resuming is idempotent.
+into the study's `operations/` directory and exits `18`. Under `external` you are
+the executor: read the pending request, run exactly that call with your own
+authenticated tooling, write the response back as the matching result file, and
+re-run the identical command. Results are bound to the request hash and folded
+into the study's provenance, so a study that paused ten times is as auditable as
+one that never paused. Resuming is idempotent.
 
 ## Notes
 
 - Chaos Studio **V2** only: workspaces are the lifecycle root and resource
-  selection flows through workspace scopes. There is no V1 path and no fallback.
-- Core is `az` / Azure Resource Manager. There is no SRE Agent dependency and no
-  required MCP dependency.
-- Studies persist under a dated store, so later chats can list, compare, and
-  re-run them. Sealed studies are immutable — re-testing scopes a **new** study
-  rather than overwriting the record.
+  selection flows through workspace scopes. There is no V1 path or fallback.
+- Core is `az` / Azure Resource Manager: no SRE Agent or MCP dependency.
+- Sealed studies are immutable — re-testing scopes a **new** study.
 - Parameterised scenarios (`-Parameters`) are planned via `chaos-study-scope`
   directly; hashtables cannot cross the chained entry point.

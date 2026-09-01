@@ -74,6 +74,7 @@ $script:ChaosLimitationText = [ordered]@{
     L12 = 'Insufficient exposure - too little work reached the vulnerable path for the absence of failures to mean anything'
     L13 = 'Action timing approximate - the exact action-active window was not reported, so evidence is aligned to the observation window instead'
     L14 = 'Unresolved residue - resources or grants created by this study could not be confirmed removed'
+    L15 = 'Design provisional - candidate hypotheses were ranked without live action discovery, so platform availability is unconfirmed'
 }
 
 function Get-ChaosLimitationText {
