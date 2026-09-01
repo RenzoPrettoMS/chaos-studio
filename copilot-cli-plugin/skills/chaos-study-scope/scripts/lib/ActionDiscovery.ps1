@@ -32,6 +32,7 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Common.ps1')
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'ApiVersions.ps1')
+. (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Operation.ps1')
 
 # -- Region resolution -----------------------------------------------------
 
@@ -51,13 +52,14 @@ function Resolve-ChaosResourceRegion {
         hard stop, not as permission to pick one.
     #>
     param(
-        [Parameter(Mandatory)][string]$ResourceId
+        [Parameter(Mandatory)][string]$ResourceId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    if (-not (Get-Command Invoke-AzRest -ErrorAction SilentlyContinue)) { return $null }
-
     try {
-        $response = Invoke-AzRest -Method GET -Uri $ResourceId -ApiVersion (Get-ChaosApiVersion -Name 'resources')
+        $response = Invoke-ChaosStudyOperation -Kind 'resource.get' -Arguments @{ resourceId = $ResourceId } `
+            -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'read resource region'
     } catch {
         Write-ChaosStudyNote -Message "Could not read '$ResourceId' to resolve its region: $($_.Exception.Message)" -Level 'warn'
         return $null
@@ -149,14 +151,11 @@ function Get-ChaosAvailableAction {
     #>
     param(
         [Parameter(Mandatory)][string]$SubscriptionId,
-        [Parameter(Mandatory)][string]$Region
+        [Parameter(Mandatory)][string]$Region,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    if (-not (Get-Command Invoke-AzRest -ErrorAction SilentlyContinue)) {
-        throw 'The shared Invoke-AzRest helper is unavailable, so the live action list could not be read.'
-    }
-
-    $apiVersion = Get-ChaosApiVersion -Name 'chaosActions'
     $uri = "/subscriptions/$SubscriptionId/providers/Microsoft.Chaos/locations/$Region/actions"
 
     $actions = [System.Collections.Generic.List[object]]::new()
@@ -165,7 +164,8 @@ function Get-ChaosAvailableAction {
         $page++
         if ($page -gt 20) { throw "The actions list did not terminate after $page pages." }
 
-        $response = Invoke-AzRest -Method GET -Uri $uri -ApiVersion $apiVersion
+        $response = Invoke-ChaosStudyOperation -Kind 'actions.list' -Arguments @{ uri = $uri } `
+            -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint "list actions in $Region"
         if (-not $response -or -not $response.body) {
             throw "The actions endpoint returned no body for region '$Region'."
         }

@@ -37,7 +37,8 @@ param(
     [string[]]$SignalSource = @(),
     [int]$PollSeconds = 20,
     [switch]$KeepConfiguration,
-    [switch]$Force
+    [switch]$Force,
+    [ValidateSet('local-az', 'external')][string]$Adapter
 )
 
 Set-StrictMode -Version Latest
@@ -226,7 +227,7 @@ try {
     # is identical before validating. Either way, what runs is provably what was
     # scoped and consented to.
     Write-ChaosStudyNote -Message "Resolving the scenario configuration for $configurationName."
-    $resolvedConfig = Resolve-ChaosRunConfiguration -Plan $plan -ConfigurationName $configurationName
+    $resolvedConfig = Resolve-ChaosRunConfiguration -Plan $plan -ConfigurationName $configurationName -Adapter $Adapter -StudyPath $studyPath
     $configurationName = $resolvedConfig.configurationName
     if (-not $resolvedConfig.reused) {
         $configurationCreated = $true
@@ -251,12 +252,13 @@ try {
 
     Write-ChaosStudyNote -Message 'Starting the scenario run.'
     $injectStart = Get-ChaosUtcNow
-    $started = Start-ChaosStudyScenarioRun -Plan $plan -ConfigurationName $configurationName -Validation $validation
+    $started = Start-ChaosStudyScenarioRun -Plan $plan -ConfigurationName $configurationName -Validation $validation -Adapter $Adapter -StudyPath $studyPath
     $runId = $started.runId
     Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario run start' `
         -Arguments @($configurationName, $runId) -ExitCode 0 | Out-Null
 
     $waited = Wait-ChaosScenarioRunWindow -Plan $plan -RunId $runId -Minutes $plan.windows.injectMinutes -PollSeconds $PollSeconds `
+        -Adapter $Adapter -StudyPath $studyPath `
         -OnPoll { param($status) Write-ChaosStudyNote -Message "Scenario run $runId is $status." }
 
     $injectEnd = Get-ChaosUtcNow
@@ -278,10 +280,10 @@ try {
 } finally {
     if ($runId) {
         Write-ChaosStudyNote -Message "Cancelling scenario run $runId."
-        Stop-ChaosStudyScenarioRun -Plan $plan -RunId $runId
+        Stop-ChaosStudyScenarioRun -Plan $plan -RunId $runId -Adapter $Adapter -StudyPath $studyPath
     }
     if ($configurationCreated -and -not $KeepConfiguration) {
-        Remove-ChaosStudyConfiguration -Plan $plan -ConfigurationName $configurationName
+        Remove-ChaosStudyConfiguration -Plan $plan -ConfigurationName $configurationName -Adapter $Adapter -StudyPath $studyPath
     }
 }
 

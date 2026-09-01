@@ -68,6 +68,34 @@ function Get-ChaosOperationArg {
     return $Default
 }
 
+function Get-ChaosOperationCliArgs {
+    <#
+    .SYNOPSIS
+        Compose the argument list for an `az chaos` verb, preferring a caller
+        supplied `cliArgs` array over the named-argument form.
+
+    .DESCRIPTION
+        Callers differ in how much of the command line they need to control. A
+        workspace read needs only a group and a name; a workspace create also
+        carries a location, a scope list and an identity flag. Rather than grow
+        one named argument per flag - which would make the registry a second,
+        drifting copy of the CLI surface - a caller may hand the seam the exact
+        argument array it wants after the verb.
+
+        `cliArgs` is therefore the general form and the named arguments are the
+        convenience form. Both produce a request that normalises and hashes
+        identically, so an external host sees one shape.
+    #>
+    param(
+        [AllowNull()][hashtable]$Arguments,
+        [Parameter(Mandatory)][string[]]$Verb,
+        [AllowNull()][object]$Composed = $null
+    )
+    $explicit = Get-ChaosOperationArg -Arguments $Arguments -Name 'cliArgs' -Default $null
+    if ($null -ne $explicit) { return @($Verb) + @($explicit) }
+    return @($Verb) + @($Composed)
+}
+
 # -- Kind -> adapter-implementation registry --------------
 # Each entry maps a kind to:
 #   localAz  - a scriptblock (param $Arguments,$Body) that is the SOLE call
@@ -89,23 +117,21 @@ function Get-ChaosOperationRegistry {
         'workspace.get' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs @(
-                    'workspace', 'show',
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('workspace', 'show') -Composed @(
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName')
-                )
+                ))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'workspace show' }
         }
         'workspace.upsert' = @{
             localAz  = {
                 param($Arguments, $Body)
-                $chaosArgs = @(
-                    'workspace', 'create',
+                $chaosArgs = Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('workspace', 'create') -Composed @(
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName')
                 )
-                if ($Body) { Invoke-AzChaos -ChaosArgs $chaosArgs -JsonArg @{ 'parameters' = $Body } }
+                if ($Body) { Invoke-AzChaos -ChaosArgs $chaosArgs -JsonArg $Body }
                 else { Invoke-AzChaos -ChaosArgs $chaosArgs }
             }
             external = @{ tool = 'az-chaos'; methodHint = 'workspace create' }
@@ -113,16 +139,35 @@ function Get-ChaosOperationRegistry {
         'workspace.refreshRecommendations' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs @(
-                    'workspace', 'refresh-recommendations',
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('workspace', 'refresh-recommendations') -Composed @(
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName')
-                )
+                ))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'workspace refresh-recommendations' }
         }
+        'workspace.showEvaluation' = @{
+            localAz  = {
+                param($Arguments, $Body)
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('workspace', 'show-evaluation') -Composed @(
+                    '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
+                    '--name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName')
+                ))
+            }
+            external = @{ tool = 'az-chaos'; methodHint = 'workspace show-evaluation' }
+        }
 
         # -- Scopes / discovered resources -------------------
+        'resource.list' = @{
+            localAz  = {
+                param($Arguments, $Body)
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('discovered-resource', 'list') -Composed @(
+                    '--resource-group', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
+                    '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName')
+                ))
+            }
+            external = @{ tool = 'az-chaos'; methodHint = 'discovered-resource list' }
+        }
         'resource.get' = @{
             localAz  = {
                 param($Arguments, $Body)
@@ -146,11 +191,10 @@ function Get-ChaosOperationRegistry {
         'scenarios.list' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs @(
-                    'scenario', 'list',
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'list') -Composed @(
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName')
-                )
+                ))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario list' }
         }
@@ -159,8 +203,8 @@ function Get-ChaosOperationRegistry {
         'config.create' = @{
             localAz  = {
                 param($Arguments, $Body)
-                $chaosArgs = @('scenario', 'config', 'create') + @(Get-ChaosOperationArg -Arguments $Arguments -Name 'cliArgs' -Default @())
-                if ($Body) { Invoke-AzChaos -ChaosArgs $chaosArgs -JsonArg @{ 'parameters' = $Body } }
+                $chaosArgs = Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'config', 'create')
+                if ($Body) { Invoke-AzChaos -ChaosArgs $chaosArgs -JsonArg $Body }
                 else { Invoke-AzChaos -ChaosArgs $chaosArgs }
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario config create' }
@@ -168,35 +212,35 @@ function Get-ChaosOperationRegistry {
         'config.validate' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'validate') + @(Get-ChaosOperationArg -Arguments $Arguments -Name 'cliArgs' -Default @()))
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'config', 'validate'))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario config validate' }
         }
         'config.showValidation' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'show-validation') + @(Get-ChaosOperationArg -Arguments $Arguments -Name 'cliArgs' -Default @()))
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'config', 'show-validation'))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario config show-validation' }
         }
         'config.fixPermissions' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'fix-permissions') + @(Get-ChaosOperationArg -Arguments $Arguments -Name 'cliArgs' -Default @()))
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'config', 'fix-permissions'))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario config fix-permissions' }
         }
         'config.showPermissionFix' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'show-permission-fix') + @(Get-ChaosOperationArg -Arguments $Arguments -Name 'cliArgs' -Default @()))
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'config', 'show-permission-fix'))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario config show-permission-fix' }
         }
         'config.delete' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'delete') + @(Get-ChaosOperationArg -Arguments $Arguments -Name 'cliArgs' -Default @()))
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'config', 'delete'))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario config delete' }
         }
@@ -205,39 +249,36 @@ function Get-ChaosOperationRegistry {
         'run.start' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -ChaosArgs @(
-                    'scenario', 'run', 'start',
+                Invoke-AzChaos -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'run', 'start') -Composed @(
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName'),
                     '--scenario-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'scenarioName'),
                     '--config-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'configName')
-                )
+                ))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario run start' }
         }
         'run.show' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs @(
-                    'scenario', 'run', 'show',
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'run', 'show') -Composed @(
                     '-n', (Get-ChaosOperationArg -Arguments $Arguments -Name 'runId'),
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName'),
                     '--scenario-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'scenarioName')
-                )
+                ))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario run show' }
         }
         'run.cancel' = @{
             localAz  = {
                 param($Arguments, $Body)
-                Invoke-AzChaos -AllowFailure -ChaosArgs @(
-                    'scenario', 'run', 'cancel',
+                Invoke-AzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'run', 'cancel') -Composed @(
                     '-n', (Get-ChaosOperationArg -Arguments $Arguments -Name 'runId'),
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName'),
                     '--scenario-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'scenarioName')
-                )
+                ))
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario run cancel' }
         }

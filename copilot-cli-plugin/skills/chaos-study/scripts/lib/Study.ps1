@@ -424,6 +424,79 @@ function Add-ChaosOperationProvenance {
     return $Entry
 }
 
+# -- Pre-study staging store ------------------------------
+#
+# Scope-phase discovery necessarily runs before a study directory exists: the
+# study is keyed by a scope hash that is only known once discovery has answered.
+# Under the external adapter those discovery operations still have to pause
+# durably, so they are written into a staging directory keyed by the workspace
+# they are discovering, and folded into the study the moment it is created.
+# Without this the external adapter would have to skip discovery, which is the
+# one thing it must never do.
+
+function Get-ChaosStudyStagingPath {
+    <#
+    .SYNOPSIS
+        A stable staging directory for operations issued before the study
+        exists, keyed by the workspace being scoped. Created on demand.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [AllowNull()][AllowEmptyString()][string]$StudyRoot
+    )
+    if ([string]::IsNullOrWhiteSpace($StudyRoot)) { $StudyRoot = (Get-ChaosStudyRoot).path }
+    $digest = (Get-ChaosDigest -InputObject $Key).Substring(0, 12)
+    $dir = Join-Path (Join-Path $StudyRoot '_staging') $digest
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return $dir
+}
+
+function Move-ChaosStudyStaging {
+    <#
+    .SYNOPSIS
+        Fold a staging directory's operation requests, results and provenance
+        into a real study, then remove the staging directory.
+
+    .DESCRIPTION
+        Provenance is appended rather than replaced, so a study created after a
+        durable pause carries the full external-adapter trail of the discovery
+        that produced it. Silent on a missing or empty staging directory.
+        Returns the number of files carried over.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StudyPath,
+        [AllowNull()][AllowEmptyString()][string]$StagingPath
+    )
+    if ([string]::IsNullOrWhiteSpace($StagingPath)) { return 0 }
+    if (-not (Test-Path -LiteralPath $StagingPath)) { return 0 }
+
+    $sourceOps = Join-Path $StagingPath 'operations'
+    $moved = 0
+    if (Test-Path -LiteralPath $sourceOps) {
+        $targetOps = Get-ChaosStudyOperationsDir -StudyPath $StudyPath
+        foreach ($file in (Get-ChildItem -LiteralPath $sourceOps -File)) {
+            if ($file.Name -eq 'provenance.jsonl') {
+                $target = Join-Path $targetOps 'provenance.jsonl'
+                Add-Content -LiteralPath $target -Value ([System.IO.File]::ReadAllLines($file.FullName)) -Encoding utf8
+            }
+            else {
+                Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $targetOps $file.Name) -Force
+            }
+            $moved++
+        }
+    }
+
+    $sourceTrail = Join-Path $StagingPath 'commands.jsonl'
+    if (Test-Path -LiteralPath $sourceTrail) {
+        Add-Content -LiteralPath (Join-Path $StudyPath 'commands.jsonl') `
+            -Value ([System.IO.File]::ReadAllLines($sourceTrail)) -Encoding utf8
+        $moved++
+    }
+
+    Remove-Item -LiteralPath $StagingPath -Recurse -Force -ErrorAction SilentlyContinue
+    return $moved
+}
+
 function Get-ChaosStudyState {
     <#
     .SYNOPSIS

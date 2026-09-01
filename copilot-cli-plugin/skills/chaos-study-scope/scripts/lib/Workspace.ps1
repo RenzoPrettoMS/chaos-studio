@@ -17,9 +17,11 @@
       3. What can run here?          Microsoft.Chaos/locations/{region}/actions
       4. What will we execute?       az chaos scenario list  (recommended)
 
-    Steps 1, 2 and 4 go through `Invoke-AzChaos`, the shipped `az chaos` seam,
-    dot-sourced read-only. Step 3 has no CLI verb and stays on the REST surface
-    (see ActionDiscovery.ps1).
+    Steps 1, 2 and 4 have `az chaos` verbs; step 3 has none and stays on the
+    REST surface (see ActionDiscovery.ps1). All four are issued through
+    Invoke-ChaosStudyOperation rather than called directly, so the same code
+    works whether the operation runs against ambient credentials here or is
+    handed to an authenticated host to execute.
 
     Two properties are load-bearing:
 
@@ -39,26 +41,33 @@ Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Common.ps1')
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'ApiVersions.ps1')
+. (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Operation.ps1')
 
 # -- Availability ----------------------------------------------------------
 
 function Test-ChaosCliAvailable {
     <#
     .SYNOPSIS
-        Whether the `az chaos` seam can be called at all in this process.
+        Whether workspace operations can be dispatched at all.
 
     .DESCRIPTION
+        Every call in this file goes through the operation seam, so the only
+        thing worth asking is whether the selected adapter can be initialised.
+        That question is answered once, centrally, and includes the external
+        adapter - under which a study reaches Azure through a host and needs no
+        local CLI at all.
+
         Deliberately does not consult `az extension list`: the chaos extension
-        is resolvable by `az chaos` while being absent from that query, so
-        gating on it produces a false negative that blocks a working install.
-        `Invoke-AzChaos` installs or updates the extension itself on first use.
+        is resolvable while being absent from that query, so gating on it
+        produces a false negative that blocks a working install.
     #>
     [CmdletBinding()]
-    param()
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
+    )
 
-    if (-not (Get-Command Invoke-AzChaos -ErrorAction SilentlyContinue)) { return $false }
-    if (-not (Get-Command az -ErrorAction SilentlyContinue)) { return $false }
-    return $true
+    return (Test-ChaosOperationSeamReady -Adapter $Adapter -StudyPath $StudyPath)
 }
 
 function Get-ChaosWorkspaceId {
@@ -134,17 +143,20 @@ function Get-ChaosStudyWorkspace {
     param(
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$WorkspaceName,
-        [AllowNull()][AllowEmptyString()][string]$SubscriptionId
+        [AllowNull()][AllowEmptyString()][string]$SubscriptionId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    if (-not (Test-ChaosCliAvailable)) { return $null }
+    if (-not (Test-ChaosCliAvailable -Adapter $Adapter -StudyPath $StudyPath)) { return $null }
 
-    $chaosArgs = @('workspace', 'show', '--name', $WorkspaceName, '--resource-group', $ResourceGroup)
+    $cliArgs = @('--name', $WorkspaceName, '--resource-group', $ResourceGroup)
     if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
-        $chaosArgs += @('--subscription', $SubscriptionId)
+        $cliArgs += @('--subscription', $SubscriptionId)
     }
 
-    $response = Invoke-AzChaos -ChaosArgs $chaosArgs -AllowFailure
+    $response = Invoke-ChaosStudyOperation -Kind 'workspace.get' -Arguments @{ cliArgs = $cliArgs } `
+        -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'workspace show'
     if ($null -eq $response) { return $null }
     return ConvertTo-ChaosWorkspaceRecord -Workspace $response
 }
@@ -171,11 +183,13 @@ function New-ChaosStudyWorkspace {
         [Parameter(Mandatory)][string]$Location,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Scopes,
         [AllowNull()][AllowEmptyString()][string]$SubscriptionId,
-        [AllowNull()][AllowEmptyString()][string]$UserAssignedIdentityId
+        [AllowNull()][AllowEmptyString()][string]$UserAssignedIdentityId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    if (-not (Test-ChaosCliAvailable)) {
-        throw 'Cannot create a Chaos workspace: the az chaos seam is unavailable in this process.'
+    if (-not (Test-ChaosCliAvailable -Adapter $Adapter -StudyPath $StudyPath)) {
+        throw 'Cannot create a Chaos workspace: no operation adapter is available in this process.'
     }
     if (@($Scopes).Count -eq 0) {
         throw 'Cannot create a Chaos workspace with no scopes. A workspace with no scopes discovers nothing and can run nothing.'
@@ -187,8 +201,7 @@ function New-ChaosStudyWorkspace {
         }
     }
 
-    $chaosArgs = @(
-        'workspace', 'create',
+    $cliArgs = @(
         '--resource-group', $ResourceGroup,
         '--workspace-name', $WorkspaceName,
         '--location', $Location,
@@ -196,16 +209,17 @@ function New-ChaosStudyWorkspace {
     ) + @($Scopes)
 
     if (-not [string]::IsNullOrWhiteSpace($UserAssignedIdentityId)) {
-        $chaosArgs += @('--mi-user-assigned', $UserAssignedIdentityId)
+        $cliArgs += @('--mi-user-assigned', $UserAssignedIdentityId)
     } else {
-        $chaosArgs += @('--mi-system-assigned', '')
+        $cliArgs += @('--mi-system-assigned', '')
     }
 
     if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
-        $chaosArgs += @('--subscription', $SubscriptionId)
+        $cliArgs += @('--subscription', $SubscriptionId)
     }
 
-    $response = Invoke-AzChaos -ChaosArgs $chaosArgs
+    $response = Invoke-ChaosStudyOperation -Kind 'workspace.upsert' -Arguments @{ cliArgs = $cliArgs } `
+        -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'workspace create'
     if ($null -eq $response) {
         throw "Workspace '$WorkspaceName' creation returned no resource."
     }
@@ -236,10 +250,12 @@ function Resolve-ChaosStudyWorkspace {
         [AllowNull()][AllowEmptyString()][string]$Location,
         [AllowNull()][AllowEmptyCollection()][string[]]$Scopes,
         [AllowNull()][AllowEmptyString()][string]$UserAssignedIdentityId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath,
         [switch]$CreateWorkspace
     )
 
-    $existing = Get-ChaosStudyWorkspace -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName -SubscriptionId $SubscriptionId
+    $existing = Get-ChaosStudyWorkspace -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName -SubscriptionId $SubscriptionId -Adapter $Adapter -StudyPath $StudyPath
     if ($null -ne $existing) {
         return [pscustomobject]@{
             workspace = $existing
@@ -260,7 +276,9 @@ function Resolve-ChaosStudyWorkspace {
         -Location $Location `
         -Scopes @($Scopes) `
         -SubscriptionId $SubscriptionId `
-        -UserAssignedIdentityId $UserAssignedIdentityId
+        -UserAssignedIdentityId $UserAssignedIdentityId `
+        -Adapter $Adapter `
+        -StudyPath $StudyPath
 
     return [pscustomobject]@{
         workspace = $created
@@ -323,17 +341,20 @@ function Get-ChaosStudyScopedResource {
     param(
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$WorkspaceName,
-        [AllowNull()][AllowEmptyString()][string]$SubscriptionId
+        [AllowNull()][AllowEmptyString()][string]$SubscriptionId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    if (-not (Test-ChaosCliAvailable)) { return , @() }
+    if (-not (Test-ChaosCliAvailable -Adapter $Adapter -StudyPath $StudyPath)) { return , @() }
 
-    $chaosArgs = @('discovered-resource', 'list', '--resource-group', $ResourceGroup, '--workspace-name', $WorkspaceName)
+    $cliArgs = @('--resource-group', $ResourceGroup, '--workspace-name', $WorkspaceName)
     if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
-        $chaosArgs += @('--subscription', $SubscriptionId)
+        $cliArgs += @('--subscription', $SubscriptionId)
     }
 
-    $response = Invoke-AzChaos -ChaosArgs $chaosArgs -AllowFailure
+    $response = Invoke-ChaosStudyOperation -Kind 'resource.list' -Arguments @{ cliArgs = $cliArgs } `
+        -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'discovered-resource list'
     if ($null -eq $response) { return , @() }
 
     $items = @()
@@ -626,17 +647,20 @@ function Get-ChaosStudyScenario {
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$WorkspaceName,
         [AllowNull()][AllowEmptyString()][string]$SubscriptionId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath,
         [switch]$RecommendedOnly
     )
 
-    if (-not (Test-ChaosCliAvailable)) { return , @() }
+    if (-not (Test-ChaosCliAvailable -Adapter $Adapter -StudyPath $StudyPath)) { return , @() }
 
-    $chaosArgs = @('scenario', 'list', '--resource-group', $ResourceGroup, '--workspace-name', $WorkspaceName)
+    $cliArgs = @('--resource-group', $ResourceGroup, '--workspace-name', $WorkspaceName)
     if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
-        $chaosArgs += @('--subscription', $SubscriptionId)
+        $cliArgs += @('--subscription', $SubscriptionId)
     }
 
-    $response = Invoke-AzChaos -ChaosArgs $chaosArgs -AllowFailure
+    $response = Invoke-ChaosStudyOperation -Kind 'scenarios.list' -Arguments @{ cliArgs = $cliArgs } `
+        -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'scenario list'
     if ($null -eq $response) { return , @() }
 
     $items = @()
@@ -703,32 +727,35 @@ function Assert-ChaosWorkspaceEvaluation {
     param(
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$WorkspaceName,
-        [AllowNull()][AllowEmptyString()][string]$SubscriptionId
+        [AllowNull()][AllowEmptyString()][string]$SubscriptionId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    if (-not (Test-ChaosCliAvailable)) {
+    if (-not (Test-ChaosCliAvailable -Adapter $Adapter -StudyPath $StudyPath)) {
         return [pscustomobject]@{
             available = $false
             status    = $null
             evaluated = $null
             failed    = $null
-            note      = 'The az chaos seam was unavailable, so the workspace evaluation could not be read.'
+            note      = 'No operation adapter was available, so the workspace evaluation could not be read.'
         }
     }
 
-    $chaosArgs = @('workspace', 'show-evaluation', '--name', $WorkspaceName, '--resource-group', $ResourceGroup)
+    $cliArgs = @('--name', $WorkspaceName, '--resource-group', $ResourceGroup)
     if (-not [string]::IsNullOrWhiteSpace($SubscriptionId)) {
-        $chaosArgs += @('--subscription', $SubscriptionId)
+        $cliArgs += @('--subscription', $SubscriptionId)
     }
 
-    $response = Invoke-AzChaos -ChaosArgs $chaosArgs -AllowFailure
+    $response = Invoke-ChaosStudyOperation -Kind 'workspace.showEvaluation' -Arguments @{ cliArgs = $cliArgs } `
+        -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'workspace show-evaluation'
     if ($null -eq $response) {
         return [pscustomobject]@{
             available = $false
             status    = $null
             evaluated = $null
             failed    = $null
-            note      = 'The workspace has no evaluation result yet. Run az chaos workspace refresh-recommendation to produce one.'
+            note      = 'The workspace has no evaluation result yet. Refresh its recommendations to produce one.'
         }
     }
 

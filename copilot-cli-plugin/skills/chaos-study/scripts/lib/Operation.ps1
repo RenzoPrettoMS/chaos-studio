@@ -217,6 +217,38 @@ function Assert-ChaosAdapterAvailable {
     return $Adapter
 }
 
+function Test-ChaosOperationSeamReady {
+    <#
+    .SYNOPSIS
+        Whether operations can be dispatched at all, as a boolean.
+
+    .DESCRIPTION
+        Assert-ChaosAdapterAvailable is the hard stop used where an unusable
+        adapter must end the study. Some read-only callers instead need to
+        degrade - returning an empty list and a recorded caveat rather than
+        throwing - and this is the predicate they use. It answers the same
+        question with the same rules; it just declines to raise.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
+    )
+    if ([string]::IsNullOrWhiteSpace($Adapter)) { return $false }
+    if (-not (Get-Command Invoke-ChaosStudyOperation -ErrorAction SilentlyContinue)) { return $false }
+    if ($Adapter -notin $ChaosStudyAdapters) { return $false }
+    if ($Adapter -eq 'external') { return (-not [string]::IsNullOrWhiteSpace($StudyPath)) }
+
+    # local-az: the same readiness probe Assert uses, asked quietly. Assert
+    # renders a failure card on its way to throwing, which is right for a hard
+    # stop and wrong for a predicate, so the probe is repeated rather than
+    # reused.
+    if (-not (Get-Command Test-ChaosLocalAzAdapterReady -ErrorAction SilentlyContinue)) {
+        . (Join-Path $PSScriptRoot 'Adapters.ps1')
+    }
+    return (@(Test-ChaosLocalAzAdapterReady).Count -eq 0)
+}
+
 function Resolve-ChaosStudyAdapter {
     <#
     .SYNOPSIS

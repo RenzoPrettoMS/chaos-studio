@@ -28,15 +28,63 @@
     and exclusions frozen at scope time, and cancellation runs in a finally
     block so an interrupted study still cancels the run it started.
 
-    Everything here goes through the `az chaos` seam (Invoke-AzChaos), which is
-    the Chaos Studio V2 surface: workspaces, scopes, scenarios, scenario
-    configurations and scenario runs.
+    Every Azure operation here goes through Invoke-ChaosStudyOperation, the
+    adapter seam, rather than calling a CLI directly. The seam speaks the Chaos
+    Studio V2 surface - workspaces, scopes, scenarios, scenario configurations
+    and scenario runs - and can either execute against ambient credentials or
+    hand the operation to an authenticated host and resume when its result
+    arrives. Nothing in this file assumes it holds credentials of its own.
 #>
 
 Set-StrictMode -Version Latest
 
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Common.ps1')
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'ApiVersions.ps1')
+. (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Operation.ps1')
+
+# -- Adapter resolution ----------------------------------------------------
+
+function Get-ChaosExecutionAdapter {
+    <#
+    .SYNOPSIS
+        Resolve the adapter a control-plane operation must run through.
+
+    .DESCRIPTION
+        Deliberately has no default. Read-only evidence collection may fall back
+        to the ambient CLI because the worst case is a missing signal; creating
+        a configuration or starting a run may not, because the worst case is an
+        operation that silently ran somewhere the operator did not intend. An
+        unresolvable adapter stops the study instead.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$Plan,
+        [AllowNull()][AllowEmptyString()][string]$Adapter
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($Adapter)) { return $Adapter }
+    if ($null -ne $Plan -and ($Plan.PSObject.Properties.Name -contains 'adapter') -and
+        -not [string]::IsNullOrWhiteSpace([string]$Plan.adapter)) {
+        return [string]$Plan.adapter
+    }
+    throw 'AdapterUnavailable: no execution adapter was resolved for this operation, and there is no implicit fallback for control-plane work. Re-run scoping so the plan records an adapter, or pass -Adapter explicitly.'
+}
+
+function Get-ChaosConfigurationScopingArgument {
+    <#
+    .SYNOPSIS
+        The four arguments that identify a scenario configuration.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+    return @(
+        '-n', $ConfigurationName,
+        '-g', $Plan.workspace.resourceGroup,
+        '--workspace-name', $Plan.workspace.name,
+        '--scenario-name', $Plan.scenario.name
+    )
+}
 
 # -- Plan integrity --------------------------------------------------------
 
@@ -258,16 +306,12 @@ function New-ChaosStudyConfiguration {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ConfigurationName
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    $chaosArgs = @(
-        'scenario', 'config', 'create',
-        '-n', $ConfigurationName,
-        '-g', $Plan.workspace.resourceGroup,
-        '--workspace-name', $Plan.workspace.name,
-        '--scenario-name', $Plan.scenario.name
-    )
+    $cliArgs = Get-ChaosConfigurationScopingArgument -Plan $Plan -ConfigurationName $ConfigurationName
 
     $jsonArg = @{}
 
@@ -278,11 +322,10 @@ function New-ChaosStudyConfiguration {
     if ($null -ne $blast.filters) { $jsonArg['filters'] = $blast.filters }
     if ($null -ne $blast.exclusions) { $jsonArg['exclusions'] = $blast.exclusions }
 
-    $created = if ($jsonArg.Count -gt 0) {
-        Invoke-AzChaos -ChaosArgs $chaosArgs -JsonArg $jsonArg
-    } else {
-        Invoke-AzChaos -ChaosArgs $chaosArgs
-    }
+    $created = Invoke-ChaosStudyOperation -Kind 'config.create' -Arguments @{ cliArgs = $cliArgs } `
+        -Body $(if ($jsonArg.Count -gt 0) { $jsonArg } else { $null }) `
+        -ExpectedSchema 'any.v1' -Adapter (Get-ChaosExecutionAdapter -Plan $Plan -Adapter $Adapter) `
+        -StudyPath $StudyPath -OperationHint 'scenario config create'
 
     if ($null -eq $created) {
         throw "Chaos Studio did not return a scenario configuration for '$ConfigurationName'. The configuration was not created, so nothing was executed."
@@ -298,17 +341,15 @@ function Remove-ChaosStudyConfiguration {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ConfigurationName
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    Invoke-AzChaos -AllowFailure -ChaosArgs @(
-        'scenario', 'config', 'delete',
-        '-n', $ConfigurationName,
-        '-g', $Plan.workspace.resourceGroup,
-        '--workspace-name', $Plan.workspace.name,
-        '--scenario-name', $Plan.scenario.name,
-        '--yes'
-    ) | Out-Null
+    $cliArgs = (Get-ChaosConfigurationScopingArgument -Plan $Plan -ConfigurationName $ConfigurationName) + @('--yes')
+    return Invoke-ChaosStudyOperation -Kind 'config.delete' -Arguments @{ cliArgs = $cliArgs } `
+        -ExpectedSchema 'any.v1' -Adapter (Get-ChaosExecutionAdapter -Plan $Plan -Adapter $Adapter) `
+        -StudyPath $StudyPath -OperationHint 'scenario config delete'
 }
 
 # -- Validation and permissions --------------------------------------------
@@ -325,18 +366,21 @@ function Get-ChaosConfigurationValidation {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ConfigurationName
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    $scoping = @(
-        '-n', $ConfigurationName,
-        '-g', $Plan.workspace.resourceGroup,
-        '--workspace-name', $Plan.workspace.name,
-        '--scenario-name', $Plan.scenario.name
-    )
+    $cliArgs = Get-ChaosConfigurationScopingArgument -Plan $Plan -ConfigurationName $ConfigurationName
+    $resolvedAdapter = Get-ChaosExecutionAdapter -Plan $Plan -Adapter $Adapter
 
-    Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'validate') + $scoping) | Out-Null
-    return Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'show-validation') + $scoping)
+    Invoke-ChaosStudyOperation -Kind 'config.validate' -Arguments @{ cliArgs = $cliArgs } `
+        -ExpectedSchema 'any.v1' -Adapter $resolvedAdapter -StudyPath $StudyPath `
+        -OperationHint 'scenario config validate' | Out-Null
+
+    return Invoke-ChaosStudyOperation -Kind 'config.showValidation' -Arguments @{ cliArgs = $cliArgs } `
+        -ExpectedSchema 'any.v1' -Adapter $resolvedAdapter -StudyPath $StudyPath `
+        -OperationHint 'scenario config show-validation'
 }
 
 function Get-ChaosValidationStatus {
@@ -397,21 +441,23 @@ function Repair-ChaosConfigurationPermission {
     param(
         [Parameter(Mandatory)][object]$Plan,
         [Parameter(Mandatory)][string]$ConfigurationName,
-        [switch]$WhatIf
+        [switch]$WhatIf,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    $scoping = @(
-        '-n', $ConfigurationName,
-        '-g', $Plan.workspace.resourceGroup,
-        '--workspace-name', $Plan.workspace.name,
-        '--scenario-name', $Plan.scenario.name
-    )
+    $scoping = Get-ChaosConfigurationScopingArgument -Plan $Plan -ConfigurationName $ConfigurationName
+    $resolvedAdapter = Get-ChaosExecutionAdapter -Plan $Plan -Adapter $Adapter
 
-    $chaosArgs = @('scenario', 'config', 'fix-permissions') + $scoping
-    if ($WhatIf) { $chaosArgs += '--what-if' }
+    $fixArgs = if ($WhatIf) { $scoping + @('--what-if') } else { $scoping }
 
-    Invoke-AzChaos -AllowFailure -ChaosArgs $chaosArgs | Out-Null
-    return Invoke-AzChaos -AllowFailure -ChaosArgs (@('scenario', 'config', 'show-permission-fix') + $scoping)
+    Invoke-ChaosStudyOperation -Kind 'config.fixPermissions' -Arguments @{ cliArgs = $fixArgs } `
+        -ExpectedSchema 'any.v1' -Adapter $resolvedAdapter -StudyPath $StudyPath `
+        -OperationHint $(if ($WhatIf) { 'scenario config fix-permissions --what-if' } else { 'scenario config fix-permissions' }) | Out-Null
+
+    return Invoke-ChaosStudyOperation -Kind 'config.showPermissionFix' -Arguments @{ cliArgs = $scoping } `
+        -ExpectedSchema 'any.v1' -Adapter $resolvedAdapter -StudyPath $StudyPath `
+        -OperationHint 'scenario config show-permission-fix'
 }
 
 function Get-ChaosPermissionFixSummary {
@@ -519,10 +565,12 @@ function Resolve-ChaosConfigurationValidation {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ConfigurationName
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName
+    $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
     $status = Get-ChaosValidationStatus -Validation $validation
 
     if ($status -eq 'Succeeded') {
@@ -541,7 +589,7 @@ function Resolve-ChaosConfigurationValidation {
 
     Write-ChaosStudyNote -Message "Validation reported '$statusText'. Asking Chaos Studio which role assignments are missing." -Level 'warn'
 
-    $preview = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName -WhatIf
+    $preview = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName -WhatIf -Adapter $Adapter -StudyPath $StudyPath
     $previewSummary = Get-ChaosPermissionFixSummary -FixResult $preview
     $applicable = Test-ChaosPermissionFixApplicable -FixResult $preview
 
@@ -563,7 +611,7 @@ $decision
     $appliedSummary = $null
     if ($applicable) {
         Write-ChaosStudyNote -Message 'Applying the role assignments Chaos Studio reported as missing.' -Level 'warn'
-        $applied = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName
+        $applied = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
         $appliedSummary = Get-ChaosPermissionFixSummary -FixResult $applied
 
         if ($null -ne $appliedSummary) {
@@ -579,7 +627,7 @@ $decision
         }
 
         Write-ChaosStudyNote -Message 'Re-validating the configuration after the permission repair.'
-        $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName
+        $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
         $status = Get-ChaosValidationStatus -Validation $validation
     }
 
@@ -820,7 +868,9 @@ function Resolve-ChaosRunConfiguration {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$ConfigurationName
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
     $dve = $null
@@ -832,7 +882,7 @@ function Resolve-ChaosRunConfiguration {
 
     # 1. Reuse the exact validated preflight configuration when it still holds.
     if (-not [string]::IsNullOrWhiteSpace($preflightName) -and -not [string]::IsNullOrWhiteSpace($frozenHash)) {
-        $preflightValidation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $preflightName
+        $preflightValidation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $preflightName -Adapter $Adapter -StudyPath $StudyPath
         $preflightStatus = Get-ChaosValidationStatus -Validation $preflightValidation
         if ($preflightStatus -eq 'Succeeded') {
             $preflightHash = Get-ChaosRunEffectivePlanHash -Validation $preflightValidation
@@ -854,8 +904,8 @@ function Resolve-ChaosRunConfiguration {
     }
 
     # 2. Re-create, prove effective-plan equality when a plan was frozen, then return.
-    New-ChaosStudyConfiguration -Plan $Plan -ConfigurationName $ConfigurationName | Out-Null
-    $resolved = Resolve-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName
+    New-ChaosStudyConfiguration -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath | Out-Null
+    $resolved = Resolve-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
 
     if (-not [string]::IsNullOrWhiteSpace($frozenHash)) {
         # $resolved.validation is the object equality is proved over and is already
@@ -902,18 +952,20 @@ function Start-ChaosStudyScenarioRun {
     param(
         [Parameter(Mandatory)][object]$Plan,
         [Parameter(Mandatory)][string]$ConfigurationName,
-        [Parameter(Mandatory)][AllowNull()][object]$Validation
+        [Parameter(Mandatory)][AllowNull()][object]$Validation,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
     Assert-ChaosConfigurationValidated -Validation $Validation -ConfigurationName $ConfigurationName | Out-Null
 
-    $started = Invoke-AzChaos -ChaosArgs @(
-        'scenario', 'run', 'start',
-        '-g', $Plan.workspace.resourceGroup,
-        '--workspace-name', $Plan.workspace.name,
-        '--scenario-name', $Plan.scenario.name,
-        '--config-name', $ConfigurationName
-    )
+    $started = Invoke-ChaosStudyOperation -Kind 'run.start' -Arguments @{
+        resourceGroup = $Plan.workspace.resourceGroup
+        workspaceName = $Plan.workspace.name
+        scenarioName  = $Plan.scenario.name
+        configName    = $ConfigurationName
+    } -ExpectedSchema 'run.v1' -Adapter (Get-ChaosExecutionAdapter -Plan $Plan -Adapter $Adapter) `
+        -StudyPath $StudyPath -OperationHint 'scenario run start'
 
     if ($null -eq $started) {
         throw "Chaos Studio did not return a scenario run for configuration '$ConfigurationName'."
@@ -944,16 +996,18 @@ function Get-ChaosStudyScenarioRun {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$RunId
+        [Parameter(Mandatory)][string]$RunId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    return Invoke-AzChaos -AllowFailure -ChaosArgs @(
-        'scenario', 'run', 'show',
-        '-n', $RunId,
-        '-g', $Plan.workspace.resourceGroup,
-        '--workspace-name', $Plan.workspace.name,
-        '--scenario-name', $Plan.scenario.name
-    )
+    return Invoke-ChaosStudyOperation -Kind 'run.show' -Arguments @{
+        runId         = $RunId
+        resourceGroup = $Plan.workspace.resourceGroup
+        workspaceName = $Plan.workspace.name
+        scenarioName  = $Plan.scenario.name
+    } -ExpectedSchema 'any.v1' -Adapter (Get-ChaosExecutionAdapter -Plan $Plan -Adapter $Adapter) `
+        -StudyPath $StudyPath -OperationHint 'scenario run show'
 }
 
 function Stop-ChaosStudyScenarioRun {
@@ -968,16 +1022,18 @@ function Stop-ChaosStudyScenarioRun {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
-        [Parameter(Mandatory)][string]$RunId
+        [Parameter(Mandatory)][string]$RunId,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
-    Invoke-AzChaos -AllowFailure -ChaosArgs @(
-        'scenario', 'run', 'cancel',
-        '-n', $RunId,
-        '-g', $Plan.workspace.resourceGroup,
-        '--workspace-name', $Plan.workspace.name,
-        '--scenario-name', $Plan.scenario.name
-    ) | Out-Null
+    return Invoke-ChaosStudyOperation -Kind 'run.cancel' -Arguments @{
+        runId         = $RunId
+        resourceGroup = $Plan.workspace.resourceGroup
+        workspaceName = $Plan.workspace.name
+        scenarioName  = $Plan.scenario.name
+    } -ExpectedSchema 'any.v1' -Adapter (Get-ChaosExecutionAdapter -Plan $Plan -Adapter $Adapter) `
+        -StudyPath $StudyPath -OperationHint 'scenario run cancel'
 }
 
 function Get-ChaosScenarioRunStatus {
@@ -1097,7 +1153,9 @@ function Wait-ChaosScenarioRunWindow {
         [Parameter(Mandatory)][string]$RunId,
         [Parameter(Mandatory)][int]$Minutes,
         [int]$PollSeconds = 20,
-        [scriptblock]$OnPoll
+        [scriptblock]$OnPoll,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
     )
 
     $deadline = [datetime]::UtcNow.AddMinutes($Minutes)
@@ -1105,7 +1163,7 @@ function Wait-ChaosScenarioRunWindow {
     $terminal = $false
 
     while ([datetime]::UtcNow -lt $deadline) {
-        $last = Get-ChaosStudyScenarioRun -Plan $Plan -RunId $RunId
+        $last = Get-ChaosStudyScenarioRun -Plan $Plan -RunId $RunId -Adapter $Adapter -StudyPath $StudyPath
         $status = Get-ChaosScenarioRunStatus -Run $last
         if ($OnPoll) { & $OnPoll $status }
         if (Test-ChaosScenarioRunTerminal -Status $status) { $terminal = $true; break }
@@ -1116,7 +1174,7 @@ function Wait-ChaosScenarioRunWindow {
     }
 
     if (-not $terminal -and $null -eq $last) {
-        $last = Get-ChaosStudyScenarioRun -Plan $Plan -RunId $RunId
+        $last = Get-ChaosStudyScenarioRun -Plan $Plan -RunId $RunId -Adapter $Adapter -StudyPath $StudyPath
     }
 
     return [pscustomobject]@{

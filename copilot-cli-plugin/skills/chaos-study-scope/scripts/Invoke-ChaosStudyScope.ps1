@@ -313,7 +313,7 @@ function New-ChaosPreflightConfiguration {
 
     $name = Get-ChaosPreflightConfigurationName -StudyId $StudyId
     $scoping = @('-n', $name, '-g', $ResourceGroup, '--workspace-name', $WorkspaceName, '--scenario-name', $ScenarioName)
-    $body = if (@($Parameters).Count -gt 0) { @($Parameters) } else { $null }
+    $body = if (@($Parameters).Count -gt 0) { @{ parameters = @($Parameters) } } else { $null }
 
     $created = Invoke-ChaosStudyOperation -Kind 'config.create' -Arguments @{ cliArgs = $scoping } -Body $body `
         -ExpectedSchema 'configuration.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'preflight config create'
@@ -372,6 +372,12 @@ function ConvertTo-ChaosScenarioParameter {
 
 $workspaceId = Get-ChaosWorkspaceId -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName
 
+# Discovery has to run before the study directory exists, because the study is
+# keyed by a hash of what discovery returns. Under the external adapter those
+# operations still pause durably; they do it in a staging directory that is
+# folded into the study once it is created.
+$stagingPath = Get-ChaosStudyStagingPath -Key $workspaceId -StudyRoot $StudyRoot
+
 $workspace = $null
 $workspaceCreated = $false
 $scopedResources = @()
@@ -382,19 +388,22 @@ if ($SkipDiscovery) {
     Write-ChaosStudyNote -Message 'Discovery skipped. The plan will record what you asked for, not what the platform confirmed, and will carry limitation L10.'
 }
 else {
-    if (-not (Test-ChaosCliAvailable)) {
-        Assert-ChaosActionDiscovery -Reason 'The az CLI (or the shared Invoke-AzChaos helper) is unavailable, so the workspace could not be resolved.' `
-            -Remediation 'Install the Azure CLI and sign in with az login, then re-run scoping.'
+    if (-not (Test-ChaosCliAvailable -Adapter $Adapter -StudyPath $stagingPath)) {
+        Assert-ChaosActionDiscovery -Reason "No operation adapter is available for '$Adapter', so the workspace could not be resolved." `
+            -Remediation 'Install the Azure CLI and sign in with az login, or run with -Adapter external so the host executes the operations.'
     }
 
     $resolved = Resolve-ChaosStudyWorkspace -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup `
         -WorkspaceName $WorkspaceName -Scopes $Scope -Location $Location `
-        -UserAssignedIdentityId $UserAssignedIdentity -CreateWorkspace:$CreateWorkspace
+        -UserAssignedIdentityId $UserAssignedIdentity -CreateWorkspace:$CreateWorkspace `
+        -Adapter $Adapter -StudyPath $stagingPath
     $workspace = $resolved.workspace
     $workspaceCreated = [bool]$resolved.created
 
-    $scopedResources = ConvertTo-ChaosList (Get-ChaosStudyScopedResource -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName)
-    $evaluation = Assert-ChaosWorkspaceEvaluation -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName
+    $scopedResources = ConvertTo-ChaosList (Get-ChaosStudyScopedResource -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName `
+        -SubscriptionId $SubscriptionId -Adapter $Adapter -StudyPath $stagingPath)
+    $evaluation = Assert-ChaosWorkspaceEvaluation -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName `
+        -SubscriptionId $SubscriptionId -Adapter $Adapter -StudyPath $stagingPath
 
     $region = Get-ChaosScopeRegion -Workspace $workspace -ScopedResources $scopedResources
     if (-not $region) {
@@ -415,7 +424,8 @@ $discoveryPerformedAt = $null
 
 if (-not $SkipDiscovery) {
     try {
-        $availableActions = ConvertTo-ChaosList (Get-ChaosAvailableAction -SubscriptionId $SubscriptionId -Region $region)
+        $availableActions = ConvertTo-ChaosList (Get-ChaosAvailableAction -SubscriptionId $SubscriptionId -Region $region `
+            -Adapter $Adapter -StudyPath $stagingPath)
     }
     catch {
         Assert-ChaosActionDiscovery -Reason "The live action list for region '$region' could not be read: $($_.Exception.Message)" `
@@ -427,7 +437,8 @@ if (-not $SkipDiscovery) {
             -Remediation 'Pick a region where Chaos Studio publishes actions, or move the scoped resources.'
     }
 
-    $scenarios = ConvertTo-ChaosList (Get-ChaosStudyScenario -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName)
+    $scenarios = ConvertTo-ChaosList (Get-ChaosStudyScenario -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName `
+        -SubscriptionId $SubscriptionId -Adapter $Adapter -StudyPath $stagingPath)
     $discoveryPerformedAt = Get-ChaosUtcNow
 }
 
@@ -606,6 +617,7 @@ $scopeHash = Get-ChaosScopeHash -SubscriptionId $SubscriptionId -ResourceGroup $
 # the preflight configuration is recorded in this study's residue ledger.
 
 $study = New-ChaosStudy -ScopeHash $scopeHash -StudyRoot $StudyRoot
+Move-ChaosStudyStaging -StudyPath $study.path -StagingPath $stagingPath | Out-Null
 $scenarioParameters = ConvertTo-ChaosList (ConvertTo-ChaosScenarioParameter -Table $Parameters)
 $declaredVsEffective = $null
 
