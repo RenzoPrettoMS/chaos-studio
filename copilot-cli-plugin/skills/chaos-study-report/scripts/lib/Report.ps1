@@ -163,7 +163,8 @@ function New-ChaosStudyReportHtml {
         [Parameter(Mandatory)][object]$Findings,
         [Parameter(Mandatory)][object]$Evidence,
         [object]$Manifest,
-        [object[]]$CommandTrail = @()
+        [object[]]$CommandTrail = @(),
+        [object[]]$Provenance = @()
     )
 
     $template = [System.IO.File]::ReadAllText((Get-ChaosReportTemplatePath))
@@ -352,16 +353,87 @@ $(New-ChaosSignalTable -Evidence $Evidence)
     elseif ([int]$residue.unresolved -eq 0) { "$($residue.resolved) of $($residue.total) confirmed removed" }
     else { "$($residue.unresolved) of $($residue.total) NOT confirmed removed - see the table below" }
 
+    # Appendix data is read back from artifacts written by earlier phases, and an
+    # older or partially-written artifact legitimately lacks fields a newer phase
+    # adds. Reading those directly would fault the render under StrictMode and
+    # lose a report that is otherwise complete, so absence reads as absence.
+    function Get-ChaosReportField {
+        param([object]$Object, [string]$Name)
+        if ($null -eq $Object) { return $null }
+        if ($Object.PSObject.Properties.Name -notcontains $Name) { return $null }
+        return $Object.$Name
+    }
+
+    # Adapter provenance. Which seam actually carried each Azure call, and for
+    # the external seam the request/result hashes a reviewer can re-derive. A
+    # report with no provenance rows and an external adapter is a report whose
+    # operations were never proven to have run.
+    $adapterName = if (Get-ChaosReportField -Object $Plan -Name 'adapter') { [string]$Plan.adapter } else { 'not recorded' }
+    $provenanceRows = foreach ($entry in @($Provenance)) {
+        if ($null -eq $entry) { continue }
+        "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $entry -Name 'operationId')))</td><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $entry -Name 'adapter')))</td><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $entry -Name 'requestHash')))</td><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $entry -Name 'resultHash')))</td><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $entry -Name 'ingestedAt')))</td></tr>"
+    }
+
+    # Declared versus effective legs. The scenario name promises a set of
+    # actions; the service execution plan decides which of them can run. Naming
+    # only the scenario would let a report imply legs that never applied.
+    $effective = Get-ChaosReportField -Object $Plan -Name 'declaredVsEffective'
+    $legs = Get-ChaosReportField -Object $effective -Name 'legs'
+    $legsText = 'not inspected'
+    $legRows = @()
+    if ($null -ne (Get-ChaosReportField -Object $legs -Name 'total')) {
+        $legsText = "$($legs.executable) of $($legs.total) leg(s) executable"
+        foreach ($skipped in @(Get-ChaosReportField -Object $legs -Name 'skipped')) {
+            if ($null -eq $skipped) { continue }
+            $legRows += "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $skipped -Name 'leg')))</td><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $skipped -Name 'actionUrn')))</td><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $skipped -Name 'resource')))</td><td>$(ConvertTo-ChaosHtmlText -Text ([string](Get-ChaosReportField -Object $skipped -Name 'reason')))</td></tr>"
+        }
+    }
+
+    # Permission grants. What the service said was missing, whether a human
+    # approved it, and what changed - never inferred from the fault consent.
+    $permissionFix = Get-ChaosReportField -Object (Get-ChaosReportField -Object $RunRecord -Name 'configuration') -Name 'permissionFix'
+    $permissionRows = @()
+    if ($null -ne $permissionFix) {
+        $grantSet = @(Get-ChaosReportField -Object $permissionFix -Name 'grantSet')
+        $before = Get-ChaosReportField -Object $permissionFix -Name 'validationBefore'
+        $after = Get-ChaosReportField -Object $permissionFix -Name 'validationAfter'
+        $permissionRows += New-ChaosReportRow -Label 'Repair attempted' -Value $(if (Get-ChaosReportField -Object $permissionFix -Name 'attempted') { 'yes' } else { 'no' })
+        $permissionRows += New-ChaosReportRow -Label 'Grants approved' -Value $(if (Get-ChaosReportField -Object $permissionFix -Name 'approved') { 'yes - by explicit phrase' } else { 'no' })
+        $permissionRows += New-ChaosReportRow -Label 'Grant set hash' -Value ([string](Get-ChaosReportField -Object $permissionFix -Name 'grantSetHash'))
+        $permissionRows += New-ChaosReportRow -Label 'Grant set' -Value $(if ($grantSet.Count -gt 0) { $grantSet -join '; ' } else { $null })
+        $permissionRows += New-ChaosReportRow -Label 'Observed grants' -Value ([string](Get-ChaosReportField -Object $permissionFix -Name 'grantsObserved'))
+        $permissionRows += New-ChaosReportRow -Label 'Validation before then after' -Value "$(if ($before) { $before } else { 'unknown' }) then $(if ($after) { $after } else { 'unknown' })"
+    }
+
+    # The frozen exposure arithmetic, so a reader can disagree with the forecast
+    # rather than having to trust the verdict that rests on it.
+    $exercise = Get-ChaosReportField -Object $Plan -Name 'exercise'
+    $exerciseModel = Get-ChaosReportField -Object $exercise -Name 'model'
+    $exerciseKnown = [bool](Get-ChaosReportField -Object $exerciseModel -Name 'known')
+
     $appendix = @"
 <dl class="kv">
 $(New-ChaosReportRow -Label 'Study id' -Value ([string]$RunRecord.studyId))
 $(New-ChaosReportRow -Label 'Scope hash' -Value ([string]$RunRecord.scopeHash))
 $(New-ChaosReportRow -Label 'Frozen config hash' -Value ([string]$Plan.frozenConfigHash))
+$(New-ChaosReportRow -Label 'Execution adapter' -Value $adapterName)
+$(New-ChaosReportRow -Label 'Durable operations recorded' -Value ([string]@($Provenance).Count))
+$(New-ChaosReportRow -Label 'Effective legs' -Value $legsText)
+$(New-ChaosReportRow -Label 'Effective plan hash' -Value ([string](Get-ChaosReportField -Object $effective -Name 'effectivePlanHash')))
+$(New-ChaosReportRow -Label 'Partial scenario accepted' -Value $(if (Get-ChaosReportField -Object $effective -Name 'accepted') { "yes - $(Get-ChaosReportField -Object $effective -Name 'decision')" } else { 'no' }))
+$(New-ChaosReportRow -Label 'Expected vulnerable events' -Value $(if ($exerciseKnown) { [string]$exerciseModel.expectedEvents } else { $null }))
+$(New-ChaosReportRow -Label 'Probability of at least one event' -Value $(if ($exerciseKnown) { [string]$exerciseModel.probAtLeastOne } else { $null }))
+$(New-ChaosReportRow -Label 'Weak exercise accepted' -Value $(if (Get-ChaosReportField -Object $exercise -Name 'weakAccepted') { 'yes' } else { 'no' }))
+$(New-ChaosReportRow -Label 'Manifest content hash' -Value $(if ($Manifest) { [string]$Manifest.contentHash } else { 'not sealed yet' }))
+$(New-ChaosReportRow -Label 'Seal class' -Value $(if ($Manifest -and $Manifest.PSObject.Properties.Name -contains 'compliance') { [string]$Manifest.compliance.sealClass } else { 'not sealed yet' }))
 $(New-ChaosReportRow -Label 'Chaos api-version' -Value (Get-ChaosApiVersion -Name 'chaosStudio'))
 $(New-ChaosReportRow -Label 'Actions api-version' -Value (Get-ChaosApiVersion -Name 'chaosActions'))
 $(New-ChaosReportRow -Label 'Metrics api-version' -Value (Get-ChaosApiVersion -Name 'metrics'))
 $(New-ChaosReportRow -Label 'Residue' -Value $residueSummaryText)
 </dl>
+$(if (@($permissionRows).Count -gt 0) { "<h3>Permission approval</h3>`n<dl class=`"kv`">`n$($permissionRows -join "`n")`n</dl>" } else { '' })
+$(if (@($legRows).Count -gt 0) { "<h3>Skipped legs</h3>`n<table><thead><tr><th>Leg</th><th>Action</th><th>Resource</th><th>Service reason</th></tr></thead><tbody>`n$($legRows -join "`n")`n</tbody></table>" } else { '' })
+$(if (@($provenanceRows).Count -gt 0) { "<h3>Operation provenance</h3>`n<table><thead><tr><th>Operation</th><th>Adapter</th><th>Request hash</th><th>Result hash</th><th>Ingested</th></tr></thead><tbody>`n$($provenanceRows -join "`n")`n</tbody></table>" } else { '' })
 $(if (@($residueRows).Count -gt 0) { "<h3>Residue ledger</h3>`n<table><thead><tr><th>Kind</th><th>Id</th><th>Cleanup</th><th>Error or removal command</th></tr></thead><tbody>`n$($residueRows -join "`n")`n</tbody></table>" } else { '' })
 $(if (@($artifactRows).Count -gt 0) { "<h3>Artifact hashes</h3>`n<table><thead><tr><th>Artifact</th><th>SHA-256</th></tr></thead><tbody>`n$($artifactRows -join "`n")`n</tbody></table>" } else { '' })
 $(if (@($trailRows).Count -gt 0) { "<h3>Command trail</h3>`n<table><thead><tr><th>At</th><th>Command</th><th>Note</th></tr></thead><tbody>`n$($trailRows -join "`n")`n</tbody></table>" } else { '<p class="notmeasured">No command trail was recorded.</p>' })

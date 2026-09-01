@@ -99,7 +99,7 @@ Useful switches:
   limitation `L10` and records the scenario and action as `unverified-offline`;
   no metadata is fabricated, and the run still validates before executing.
 
-Output is a frozen `study-plan.v1.json` plus a study id. Nothing is executed.
+Output is a frozen `study-plan.v3.json` plus a study id. Nothing is executed.
 
 ## What the plan records
 

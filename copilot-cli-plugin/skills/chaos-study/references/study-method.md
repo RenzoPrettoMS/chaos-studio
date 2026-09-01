@@ -139,9 +139,9 @@ mode:
 | Skill | Owns | Produces |
 |---|---|---|
 | `chaos-study` | the opinionated end-to-end path | an orchestrated study |
-| `chaos-study-scope` | workspace, scope, discovery, readiness | `study-plan.v1.json` |
-| `chaos-study-run` | configuration, consent, execution, observation | `run-record.v1.json` |
-| `chaos-study-report` | interpretation, rendering, sealing | `findings.v1.json`, `report.html` |
+| `chaos-study-scope` | workspace, scope, discovery, readiness | `study-plan.v3.json` |
+| `chaos-study-run` | configuration, consent, execution, observation | `run-record.v3.json` |
+| `chaos-study-report` | interpretation, rendering, sealing | `findings.v2.json`, `report.html` |
 | `chaos-study-history` | recall and comparison | listings, diffs, reruns |
 
 Each is usable alone. `chaos-study` is the front door for anyone who does not

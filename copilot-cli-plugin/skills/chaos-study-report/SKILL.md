@@ -47,7 +47,7 @@ Options:
 - `-NoSeal` — render for review without sealing the study
 - `-OutputPath` — write the HTML somewhere else as well
 
-Writes `findings.v1.json` and `report.html` into the study directory, then seals
+Writes `findings.v2.json` and `report.html` into the study directory, then seals
 the study. Sealed studies are never overwritten: re-reporting a sealed study
 renders beside it as `report-<studyId>.html` and exits `0`.
 

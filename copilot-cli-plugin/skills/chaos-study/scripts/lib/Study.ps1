@@ -9,8 +9,8 @@
     A study is a directory. Its state is derived from which files exist, never
     from a status field that could disagree with reality:
 
-        PLANNED    study-plan.v1.json exists, run-record.v1.json does not
-        EXECUTED   run-record.v1.json exists, SEALED does not
+        PLANNED    the plan artifact exists, the run record does not
+        EXECUTED   the run record exists, SEALED does not
         SEALED     SEALED exists - the study is read-only forever
         ABANDONED  PLANNED, and older than the abandonment horizon
 
@@ -18,9 +18,9 @@
 
         <scopeHash>/<studyId>/
             manifest.json          identity, pins, hashes  (written at seal)
-            study-plan.v1.json     what we intended to test
-            run-record.v1.json     what actually happened
-            findings.v1.json       what it means
+            study-plan.v3.json     what we intended to test
+            run-record.v3.json     what actually happened
+            findings.v2.json       what it means
             report.html            the artifact a human reads
             commands.jsonl         append-only command trail
             evidence/{pre,during,post}/*.json
@@ -189,9 +189,13 @@ function Resolve-ChaosStudyPath {
     switch ($Artifact) {
         'root'           { return $dir }
         'manifest'       { return Join-Path $dir 'manifest.json' }
-        'plan'           { return Join-Path $dir 'study-plan.v1.json' }
-        'runRecord'      { return Join-Path $dir 'run-record.v1.json' }
-        'findings'       { return Join-Path $dir 'findings.v1.json' }
+        # Versioned artifacts resolve through the reader so an existing older
+        # generation opens under its own name, and a study with none yet points
+        # at the current-generation filename. The layout never hardcodes a
+        # generation.
+        'plan'           { return (Get-ChaosArtifactReader -StudyPath $dir -Artifact 'plan').path }
+        'runRecord'      { return (Get-ChaosArtifactReader -StudyPath $dir -Artifact 'runRecord').path }
+        'findings'       { return (Get-ChaosArtifactReader -StudyPath $dir -Artifact 'findings').path }
         'report'         { return Join-Path $dir 'report.html' }
         'commands'       { return Join-Path $dir 'commands.jsonl' }
         'sealed'         { return Join-Path $dir 'SEALED' }
@@ -505,8 +509,8 @@ function Get-ChaosStudyState {
     param([Parameter(Mandatory)][string]$StudyPath, [int]$AbandonAfterDays = $ChaosStudyAbandonHorizonDays)
     if (-not (Test-Path -LiteralPath $StudyPath)) { return 'MISSING' }
     if (Test-Path -LiteralPath (Join-Path $StudyPath 'SEALED')) { return 'SEALED' }
-    if (Test-Path -LiteralPath (Join-Path $StudyPath 'run-record.v1.json')) { return 'EXECUTED' }
-    if (Test-Path -LiteralPath (Join-Path $StudyPath 'study-plan.v1.json')) {
+    if ((Get-ChaosArtifactReader -StudyPath $StudyPath -Artifact 'runRecord').found) { return 'EXECUTED' }
+    if ((Get-ChaosArtifactReader -StudyPath $StudyPath -Artifact 'plan').found) {
         $age = (Get-Date).ToUniversalTime() - (Get-Item -LiteralPath $StudyPath).LastWriteTimeUtc
         if ($age.TotalDays -gt $AbandonAfterDays) { return 'ABANDONED' }
         return 'PLANNED'
@@ -537,9 +541,11 @@ function Get-ChaosStudy {
         hasReport = (Test-Path -LiteralPath (Join-Path $StudyPath 'report.html'))
     }
     if ($IncludeArtifacts) {
-        $result.plan = Read-ChaosJsonFile -Path (Join-Path $StudyPath 'study-plan.v1.json')
-        $result.runRecord = Read-ChaosJsonFile -Path (Join-Path $StudyPath 'run-record.v1.json')
-        $result.findings = Read-ChaosJsonFile -Path (Join-Path $StudyPath 'findings.v1.json')
+        # Read whatever generation is on disk. A legacy study stays readable;
+        # only writing a new-generation artifact into it is refused.
+        $result.plan = Read-ChaosJsonFile -Path (Get-ChaosArtifactReader -StudyPath $StudyPath -Artifact 'plan').path
+        $result.runRecord = Read-ChaosJsonFile -Path (Get-ChaosArtifactReader -StudyPath $StudyPath -Artifact 'runRecord').path
+        $result.findings = Read-ChaosJsonFile -Path (Get-ChaosArtifactReader -StudyPath $StudyPath -Artifact 'findings').path
     }
     return $result
 }

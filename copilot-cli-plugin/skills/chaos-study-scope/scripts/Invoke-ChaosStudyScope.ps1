@@ -901,7 +901,7 @@ $plan['frozenConfigHash'] = Get-ChaosDigest -InputObject $plan
 
 # -- Persist ---------------------------------------------------------------
 
-Save-ChaosStudyArtifact -StudyPath $study.path -RelativePath 'study-plan.v1.json' -Content $plan | Out-Null
+Save-ChaosStudyArtifact -StudyPath $study.path -RelativePath (Get-ChaosArtifactFileName -Artifact 'plan') -Content $plan | Out-Null
 
 Add-ChaosCommandTrailEntry -StudyPath $study.path -Command 'chaos-study-scope' `
     -Arguments ([ordered]@{

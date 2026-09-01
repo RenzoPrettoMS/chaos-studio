@@ -68,7 +68,7 @@ Could not find a study matching '$StudyId'.
 }
 
 $studyPath = $study.path
-$plan = Read-ChaosJsonFile -Path (Join-Path $studyPath 'study-plan.v1.json')
+$plan = Read-ChaosJsonFile -Path (Get-ChaosArtifactReader -StudyPath $studyPath -Artifact 'plan').path
 
 if (-not $plan) {
     Write-ChaosStudyFailure -Title 'Study has no plan' -Message @"
@@ -444,7 +444,7 @@ $runRecord = [ordered]@{
     residue       = Get-ChaosResidueSummary -StudyPath $studyPath
 }
 
-Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'run-record.v1.json' -Content $runRecord | Out-Null
+Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath (Get-ChaosArtifactFileName -Artifact 'runRecord') -Content $runRecord | Out-Null
 
 $status = if ($failureMessage) { 'error' } elseif ($coverage.missing -gt 0) { 'warning' } else { 'success' }
 $touched = if ($null -ne $runObservation -and $null -ne $runObservation.resourcesTouched) { $runObservation.resourcesTouched } else { 'not reported' }

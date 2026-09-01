@@ -92,7 +92,7 @@ Switches worth knowing:
 8. Collect the **during** window while the run is live
 9. Wait out recovery, then collect the **post** window
 10. Cancel any in-flight run and delete the configuration (always), then write
-    `run-record.v1.json` and evidence
+    `run-record.v3.json` and evidence
 
 Steps 3–5 run before step 6 deliberately. A configuration that cannot validate
 is a run that fails within seconds, and finding that out after a baseline window

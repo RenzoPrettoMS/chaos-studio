@@ -48,7 +48,7 @@ if ($ScopeHash) { $index = @($index | Where-Object { $_.scopeHash -eq $ScopeHash
 
 function Get-StudyFindings {
     param([Parameter(Mandatory)][object]$Entry)
-    $path = Join-Path $Entry.path 'findings.v1.json'
+    $path = (Get-ChaosArtifactReader -StudyPath $Entry.path -Artifact 'findings').path
     $findings = Read-ChaosJsonFile -Path $path
     if (-not $findings) { return ,@() }
     # A study with no findings round-trips as $null through @(); filter it out so
@@ -220,9 +220,10 @@ $($baseline.studyId): predicate $($comparison.baseline.predicateVerdict), study 
             Write-ChaosStudyFailure -Title 'Study not found' -Message "No study matched '$StudyId'." -Remediation 'Run this skill with -Action list to see available studies.'
             exit (Get-ChaosStudyExitCode -Name 'Error')
         }
-        $plan = Read-ChaosJsonFile -Path (Join-Path $entry.path 'study-plan.v1.json')
+        $planReader = Get-ChaosArtifactReader -StudyPath $entry.path -Artifact 'plan'
+        $plan = Read-ChaosJsonFile -Path $planReader.path
         if (-not $plan) {
-            Write-ChaosStudyFailure -Title 'Study has no plan' -Message "Study $($entry.studyId) has no study-plan.v1.json to repeat." -Remediation 'Plan a fresh study with the chaos-study-scope skill.'
+            Write-ChaosStudyFailure -Title 'Study has no plan' -Message "Study $($entry.studyId) has no plan artifact ($($planReader.fileName)) to repeat." -Remediation 'Plan a fresh study with the chaos-study-scope skill.'
             exit (Get-ChaosStudyExitCode -Name 'Error')
         }
         $scope = Join-Path $PSScriptRoot '..' '..' 'chaos-study-scope' 'scripts' 'Invoke-ChaosStudyScope.ps1'

@@ -52,8 +52,8 @@ if (-not $study) {
 }
 
 $studyPath = $study.path
-$plan = Read-ChaosJsonFile -Path (Join-Path $studyPath 'study-plan.v1.json')
-$runRecord = Read-ChaosJsonFile -Path (Join-Path $studyPath 'run-record.v1.json')
+$plan = Read-ChaosJsonFile -Path (Get-ChaosArtifactReader -StudyPath $studyPath -Artifact 'plan').path
+$runRecord = Read-ChaosJsonFile -Path (Get-ChaosArtifactReader -StudyPath $studyPath -Artifact 'runRecord').path
 
 if (-not $plan -or -not $runRecord) {
     Write-ChaosStudyFailure -Title 'Study has not been executed' -Message @"
@@ -82,7 +82,13 @@ if (Test-Path -LiteralPath $trailPath) {
 }
 
 $manifest = Read-ChaosJsonFile -Path (Join-Path $studyPath 'manifest.json')
-$html = New-ChaosStudyReportHtml -Plan $plan -RunRecord $runRecord -Findings $findings -Evidence $evidence -Manifest $manifest -CommandTrail $commandTrail
+
+# Adapter provenance rides in the appendix so a reviewer can re-derive the
+# request and result hashes of every operation the host executed on our behalf.
+# A hand-written report has no provenance to show.
+$provenance = @(Get-ChaosOperationProvenance -StudyPath $studyPath)
+
+$html = New-ChaosStudyReportHtml -Plan $plan -RunRecord $runRecord -Findings $findings -Evidence $evidence -Manifest $manifest -CommandTrail $commandTrail -Provenance $provenance
 
 if ($study.state -eq 'SEALED') {
     # A sealed study is immutable, so the report is rendered beside it -- in the
@@ -97,7 +103,7 @@ A fresh render was written outside the study directory instead.
     exit (Get-ChaosStudyExitCode -Name 'Success')
 }
 
-Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'findings.v1.json' -Content $findings | Out-Null
+Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath (Get-ChaosArtifactFileName -Artifact 'findings') -Content $findings | Out-Null
 Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'report.html' -Content $html -AsText -SkipRedaction | Out-Null
 Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'report' -Command 'Invoke-ChaosStudyReport' -ExitCode 0 -Note "$($findings.predicateVerdict) / $($findings.studyVerdict)" | Out-Null
 
