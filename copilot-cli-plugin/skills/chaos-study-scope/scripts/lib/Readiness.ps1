@@ -580,18 +580,24 @@ function Get-ChaosExecutionPlanLegs {
         $steps = Get-ChaosLegField -Leg $root -Names @('steps')
         if ($null -eq $steps) { continue }
         $expanded = @()
-        foreach ($step in @($steps)) {
+        # Null entries are dropped at every level on purpose. @($null) is a
+        # one-element array, so iterating an absent branches/actions list would
+        # manufacture a phantom leg with no action and no skip signal - and the
+        # default is "executes", so that phantom would count as executable. A
+        # plan shaped in a way this code cannot read must yield zero legs and be
+        # refused as unverifiable, never silently read as "everything runs".
+        foreach ($step in @($steps | Where-Object { $null -ne $_ })) {
             $branches = Get-ChaosLegField -Leg $step -Names @('branches')
-            foreach ($branch in @($branches)) {
+            foreach ($branch in @($branches | Where-Object { $null -ne $_ })) {
                 $actions = Get-ChaosLegField -Leg $branch -Names @('actions')
-                foreach ($action in @($actions)) {
+                foreach ($action in @($actions | Where-Object { $null -ne $_ })) {
                     $actionName = Get-ChaosLegField -Leg $action -Names @('name', 'actionName', 'type', 'actionId')
                     $targets = Get-ChaosLegField -Leg $action -Names @('targets', 'selectors', 'resources')
                     if ($null -eq $targets) {
                         $expanded += [ordered]@{ action = $actionName; target = $null; reason = (Get-ChaosLegField -Leg $action -Names @('reason', 'skipReason')); status = (Get-ChaosLegField -Leg $action -Names @('status', 'state')) }
                         continue
                     }
-                    foreach ($target in @($targets)) {
+                    foreach ($target in @($targets | Where-Object { $null -ne $_ })) {
                         $expanded += [ordered]@{
                             action   = $actionName
                             target   = $target

@@ -96,6 +96,17 @@ time. `L1` is always present — by design, because it is always true.
 - Every value is HTML-escaped on the way in; evidence is untrusted input.
 - Findings carry a stable `findingKey` so `chaos-study-history` can tell a
   persisting problem from a new one across studies.
+- **Never write this report by hand.** The renderer is the only thing that can
+  produce one, because the report's authority comes entirely from what it reads:
+  the frozen plan, the run record, the evidence, the operation provenance and the
+  manifest hashes. A hand-written HTML file with the same headings is a claim
+  without a chain of custody — it cannot be sealed, it cannot be compared by
+  `chaos-study-history`, and its verdict means nothing. If the study is missing
+  the artifacts this phase needs, the honest move is to finish or resume the
+  study, not to compose the conclusion yourself.
+- Appendix content is likewise generated, not narrated: adapter provenance,
+  effective legs, permission grants, residue and command trail all come from the
+  store. If something is unknown it renders as unknown, never as an assumption.
 
 See `../chaos-study/references/report-contract.md` for the full contract the
 renderer enforces.

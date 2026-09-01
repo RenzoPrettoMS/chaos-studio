@@ -23,6 +23,18 @@
       * Any non-zero exit from a phase stops the chain immediately. A partial
         study is left on disk, correctly stated, for inspection or resumption.
 
+    Three exits are deliberate pauses rather than failures, and the chain reports
+    them as such because treating them as errors invites exactly the wrong
+    reaction - working around the stop by inventing the missing part:
+
+      * 18  the phase needs an Azure call it cannot make in-process. It wrote the
+            request to the study directory. Execute it with your own tooling,
+            write the result back, and re-run the same command.
+      * 19  role assignments are required. Granting them is a separate decision
+            from approving the fault, so it needs its own approval phrase.
+      * 21  the exposure arithmetic says the run would not exercise the failure.
+            Strengthen the exercise, or accept a weak one explicitly.
+
     Resumption matters: because each phase persists its own output, a chain that
     fails in `run` can be resumed by invoking `run` directly against the same
     study id. Nothing here is a transaction that must be restarted from scratch.
@@ -102,6 +114,10 @@ param(
     [Parameter(ParameterSetName = 'Study')][string[]]$ExcludeType = @(),
 
     [Parameter(ParameterSetName = 'Study')][string]$StudyRoot,
+    [Parameter(ParameterSetName = 'ListActions')]
+    [Parameter(ParameterSetName = 'ListScenarios')]
+    [Parameter(ParameterSetName = 'Study')][ValidateSet('local-az', 'external')][string]$Adapter,
+    [Parameter(ParameterSetName = 'Study')][string]$AcceptPartialScenario,
     [Parameter(ParameterSetName = 'Study')][bool]$DryRun = $true,
     [Parameter(ParameterSetName = 'Study')][string]$Consent,
     [Parameter(ParameterSetName = 'Study')][string]$ApprovePermissions,
@@ -184,6 +200,49 @@ function Invoke-ChaosPhase {
     return $LASTEXITCODE
 }
 
+function Stop-OnResumableOperation {
+    <#
+    .SYNOPSIS
+    Reports a deliberate pause rather than a failure when a phase cannot reach
+    Azure in-process.
+
+    .DESCRIPTION
+    Under the external adapter a phase stops the moment it needs an Azure call it
+    cannot make itself. That is not an error: the phase wrote a canonical
+    operation request into the study directory and everything it had already
+    established is still on disk. The caller is expected to execute the pending
+    request with its own authenticated tooling, write the result back, and re-run
+    the very same command. Resuming is idempotent, so nothing is repeated and the
+    plan, run record and command trail stay intact.
+
+    Presenting this as a failure would be actively harmful, because the obvious
+    reaction to a failure is to work around it - and the only available
+    workaround is to hand-write the evidence, which destroys the study's
+    provenance.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][int]$ExitCode
+    )
+    if ($ExitCode -ne (Get-ChaosStudyExitCode -Name 'ResumableOperation')) { return }
+    Write-Card -Title "Study paused for a host operation: $Name" -Status 'warning' -Body @"
+$Name needs an Azure call it cannot make in this process, so it stopped and wrote
+the request to the study directory instead of guessing.
+
+Nothing failed and nothing was skipped. To continue:
+
+  1. Read the pending request under the study's operations directory.
+  2. Execute exactly that call with your own authenticated Azure tooling.
+  3. Write the response back as the matching result file.
+  4. Re-run this same command - the phase picks up where it stopped.
+
+The result is bound to the request hash and folded into the study's provenance,
+so a resumed study is as auditable as one that never paused. Do not reconstruct
+the outcome by hand: an invented result cannot be sealed as compliant.
+"@
+    exit $ExitCode
+}
+
 function Stop-OnPhaseFailure {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -221,10 +280,11 @@ if ($PSCmdlet.ParameterSetName -in @('ListActions', 'ListScenarios')) {
         $listArgs['ListScenarios'] = [switch]::Present
         $phaseName = 'chaos-study-scope (list scenarios)'
     }
+    if ($Adapter) { $listArgs['Adapter'] = $Adapter }
     $code = Invoke-ChaosPhase -Name $phaseName -Script $scopeScript -Arguments $listArgs
+    Stop-OnResumableOperation -Name $phaseName -ExitCode $code
     exit $code
 }
-
 # ---------------------------------------------------------------------------
 # Phase 1 - scope
 # ---------------------------------------------------------------------------
@@ -257,6 +317,8 @@ if ($FilterLocation.Count -gt 0) { $scopeArgs['FilterLocation'] = $FilterLocatio
 if ($ExcludeResource.Count -gt 0) { $scopeArgs['ExcludeResource'] = $ExcludeResource }
 if ($ExcludeType.Count -gt 0) { $scopeArgs['ExcludeType'] = $ExcludeType }
 if ($SkipDiscovery) { $scopeArgs['SkipDiscovery'] = [switch]::Present }
+if ($Adapter) { $scopeArgs['Adapter'] = $Adapter }
+if ($AcceptPartialScenario) { $scopeArgs['AcceptPartialScenario'] = $AcceptPartialScenario }
 if ($Parameters -and $Parameters.Count -gt 0) {
     # Hashtables cannot cross the pwsh -File boundary, so parameterised scenarios
     # are planned by calling the scope skill directly rather than through this chain.
@@ -272,6 +334,46 @@ skill against the resulting study id:
 }
 
 $scopeExit = Invoke-ChaosPhase -Name 'chaos-study-scope' -Script $scopeScript -Arguments $scopeArgs
+Stop-OnResumableOperation -Name 'chaos-study-scope' -ExitCode $scopeExit
+
+if ($scopeExit -eq (Get-ChaosStudyExitCode -Name 'InsufficientExposure')) {
+    # Not a failure. Scoping did the exposure arithmetic and concluded the run
+    # would not exercise the vulnerable path often enough for a clean result to
+    # mean anything. Running anyway would produce a false pass.
+    Write-Card -Title 'Study stopped: the run would not exercise the failure' -Status 'warning' -Body @"
+The exposure model says the fault window is very unlikely to catch the code path
+you are testing, so a study that reported no impact would be measuring nothing.
+
+Change the exercise rather than the verdict:
+
+  - raise -EventRatePerSecond or lengthen -DurationMinutes so real work meets the fault
+  - widen -EligibleFraction if more of the traffic is genuinely vulnerable
+  - drive load against the scope while the study runs
+
+If you accept a weak exercise deliberately, re-run with -AcceptWeakExercise. The
+study then records the arithmetic and reports "Not exercised" rather than
+claiming resilience it did not demonstrate.
+"@
+    exit $scopeExit
+}
+
+if ($scopeExit -eq (Get-ChaosStudyExitCode -Name 'PartialScenarioUnaccepted')) {
+    # Not a failure. Preflight validation revealed the service would run fewer
+    # legs than the scenario declares, and the default is to fail closed rather
+    # than let the scenario name imply coverage that will not happen.
+    Write-Card -Title 'Study stopped: the scenario would run fewer legs than it declares' -Status 'warning' -Body @"
+Preflight validation returned an execution plan in which some legs would be
+skipped. A partial scenario still produces a report, and that report would carry
+the scenario's full name while testing less than it claims.
+
+Read the skipped legs and the service's reason for each, then either fix the
+scope so every leg applies, or accept the reduced scenario explicitly with
+-AcceptPartialScenario '<phrase the scope printed>'. The acceptance is bound to
+this exact effective plan, so it cannot silently carry over to a different one.
+"@
+    exit $scopeExit
+}
+
 Stop-OnPhaseFailure -Name 'chaos-study-scope' -ExitCode $scopeExit -Guidance @"
 Scoping decides whether the study is worth running at all: it resolves the
 workspace, reads what is actually in its scopes, and checks the action applies to
@@ -315,8 +417,10 @@ if ($Consent) { $runArgs['Consent'] = $Consent }
 if ($ApprovePermissions) { $runArgs['ApprovePermissions'] = $ApprovePermissions }
 if ($KeepConfiguration) { $runArgs['KeepConfiguration'] = [switch]::Present }
 if ($SignalSource.Count -gt 0) { $runArgs['SignalSource'] = $SignalSource }
+if ($Adapter) { $runArgs['Adapter'] = $Adapter }
 
 $runExit = Invoke-ChaosPhase -Name 'chaos-study-run' -Script $runScript -Arguments $runArgs
+Stop-OnResumableOperation -Name 'chaos-study-run' -ExitCode $runExit
 
 if ($runExit -eq (Get-ChaosStudyExitCode -Name 'PermissionApprovalRequired')) {
     # Not a failure. The run stopped deliberately because the workspace identity
@@ -362,6 +466,7 @@ $reportArgs = @{ StudyId = $studyId }
 if ($StudyRoot) { $reportArgs['StudyRoot'] = $StudyRoot }
 
 $reportExit = Invoke-ChaosPhase -Name 'chaos-study-report' -Script $reportScript -Arguments $reportArgs
+Stop-OnResumableOperation -Name 'chaos-study-report' -ExitCode $reportExit
 Stop-OnPhaseFailure -Name 'chaos-study-report' -ExitCode $reportExit -Guidance @"
 The injection already happened and the evidence is on disk. Reporting is a pure
 read of what was collected, so it is safe to retry:

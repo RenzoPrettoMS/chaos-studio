@@ -127,6 +127,22 @@ silently alter behaviour.
 | `13` | Study already sealed |
 | `17` | Scenario configuration failed validation |
 | `19` | Role assignments needed; re-run with `-ApprovePermissions` |
+| `18` | Paused: an Azure operation must be executed by the host, then resumed |
+| `22` | No adapter can reach Azure — pass `-Adapter` explicitly |
+| `23` | Study was written by an older contract version |
+
+`18` is a pause, not a failure, and it is the one exit where the temptation to
+improvise is most dangerous. Under `-Adapter external` this phase cannot call
+Azure itself, so it wrote the exact request — including the scenario run start or
+status poll — into the study's `operations/` directory. Execute that call with
+your own authenticated tooling, write the response back as the matching result
+file, and re-run the identical command. The run resumes from where it stopped;
+consent and the frozen plan hash still hold, so nothing is re-armed and no fault
+is injected twice.
+
+Do not fabricate a run outcome or hand-write evidence to get past this. Results
+are hashed against their request and recorded in the study's provenance, and a
+report built on unprovenanced evidence cannot be sealed as compliant.
 
 ## If it fails partway
 

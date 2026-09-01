@@ -146,8 +146,8 @@ them from `-ListActions`. What lives here is the method:
 - **`references/report-contract.md`** — what the report may and may not claim
 
 Kubernetes/AKS-specific guidance is deliberately absent: those actions are not
-available from the actions endpoint yet. When they ship, they appear in
-`-ListActions` automatically, with no change to this suite.
+available from the actions endpoint yet, and will appear in `-ListActions`
+automatically when they ship.
 
 ## Exit codes
 
@@ -163,6 +163,28 @@ available from the actions endpoint yet. When they ship, they appear in
 | `15` | Studies not comparable |
 | `16` | Live action discovery unavailable — there is no fallback |
 | `17` | Scenario configuration failed validation |
+| `18` | Paused: an Azure operation must be executed by the host, then resumed |
+| `19` | Paused: role assignments need their own, separate approval |
+| `20` | Scenario would run fewer legs than it declares, and that was not accepted |
+| `21` | The run would not exercise the failure often enough to mean anything |
+| `22` | No adapter can reach Azure — say which one to use |
+| `23` | Study was written by an older contract version |
+
+`18`, `19` and `21` are **pauses, not failures**. Each names the one thing it
+needs; supply it and re-run the same command. Do not route around them by filling
+in the missing part yourself — a study that cannot show where its evidence came
+from cannot be sealed.
+
+## Running where `az` is not usable
+
+Every Azure call goes through one adapter seam, selected with `-Adapter`:
+`local-az` runs `az` in-process; `external` cannot, so it writes each operation
+it needs into the study's `operations/` directory and exits `18`. Under
+`external` you are the executor: read the pending request, run exactly that call
+with your own authenticated tooling, write the response back as the matching
+result file, and re-run the identical command. Results are bound to the request
+hash and folded into the study's provenance, so a study that paused ten times is
+as auditable as one that never paused. Resuming is idempotent.
 
 ## Notes
 

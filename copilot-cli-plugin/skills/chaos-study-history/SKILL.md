@@ -104,10 +104,18 @@ index can never hide a study.
 | `0` | Success |
 | `1` | Error |
 | `15` | Studies are not comparable — the reason is printed |
+| `23` | A study was written by an older contract version |
 
 ## Notes
 
-- Comparison reads only sealed artifacts. It calls no Azure APIs.
+- Comparison reads only sealed artifacts. It calls no Azure APIs, so it never
+  pauses for the host adapter and never needs credentials.
+- Findings carry a contract version. Studies written under different versions are
+  either compared on the fields they genuinely share, or refused with `15` — they
+  are never silently reinterpreted so a diff can be produced.
+- Both verdicts travel together: the predicate verdict says whether the steady
+  state held, the study verdict can be worse when collateral damage was found.
+  Read the pair; a comparison that moved only the study verdict is still news.
 - A scope with a single study reports that plainly rather than inventing a
   baseline to diff against.
 

@@ -147,6 +147,31 @@ What lives locally is the method:
 | `10` | Readiness gates failed |
 | `14` | Scope unverified — nothing in scope, or the action does not fit it |
 | `16` | Live action discovery unavailable — there is no fallback |
+| `18` | Paused: an Azure operation must be executed by the host, then resumed |
+| `19` | Paused: role assignments need their own, separate approval |
+| `20` | Scenario would run fewer legs than it declares, and that was not accepted |
+| `21` | The run would not exercise the failure often enough to mean anything |
+| `22` | No adapter can reach Azure — pass `-Adapter` explicitly |
+| `23` | Study was written by an older contract version |
+
+### The pauses
+
+`18`, `19`, `20` and `21` are stops with a specific missing input, not errors.
+Supply it and re-run the same command; scoping resumes rather than restarting.
+
+- **`18`** — under `-Adapter external` this phase cannot call Azure itself. It
+  wrote the exact request to the study's `operations/` directory. Execute it with
+  your own authenticated tooling, write the response back as the matching result
+  file, then re-run. Never answer the request from memory or inference: the
+  result is hashed and bound to the request, and invented evidence cannot seal.
+- **`19`** — preflight validation found the workspace identity is missing role
+  assignments. Granting them is a *separate* decision from approving the fault,
+  so it needs its own approval phrase. Approving the injection never implies it.
+- **`20`** — the service's execution plan skips legs the scenario name implies.
+  Fix the scope, or accept the reduced scenario explicitly.
+- **`21`** — the exposure arithmetic says the fault would rarely meet the code
+  path. Strengthen the exercise, or accept a weak one explicitly and let the
+  study report "Not exercised" rather than false resilience.
 
 ## Next
 
