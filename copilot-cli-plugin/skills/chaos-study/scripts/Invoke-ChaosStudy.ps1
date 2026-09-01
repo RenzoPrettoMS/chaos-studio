@@ -83,6 +83,19 @@ param(
     [Parameter(ParameterSetName = 'Study')][string]$Hypothesis,
     [Parameter(ParameterSetName = 'Study')][string[]]$SignalSource = @(),
 
+    # Falsifiability inputs (Req B). Readiness blocks without them, so the front
+    # door has to be able to carry them; a study whose mechanism cannot be stated
+    # is a guess, and the entry point should not be the reason it slips through.
+    [Parameter(ParameterSetName = 'Study')][string]$FailureMechanism,
+    [Parameter(ParameterSetName = 'Study')][string]$MechanismEvidence,
+    [Parameter(ParameterSetName = 'Study')][hashtable]$MechanismProbe,
+
+    # Exercise arithmetic (Req E). Unsupplied values stay unsupplied.
+    [Parameter(ParameterSetName = 'Study')][double]$EventRatePerSecond,
+    [Parameter(ParameterSetName = 'Study')][double]$VulnerableWindowSeconds,
+    [Parameter(ParameterSetName = 'Study')][ValidateRange(0, 1)][double]$EligibleFraction,
+    [Parameter(ParameterSetName = 'Study')][switch]$AcceptWeakExercise,
+
     # Blast radius, forwarded to the scenario configuration.
     [Parameter(ParameterSetName = 'Study')][string[]]$FilterLocation = @(),
     [Parameter(ParameterSetName = 'Study')][string[]]$ExcludeResource = @(),
@@ -233,6 +246,13 @@ if ($Location) { $scopeArgs['Location'] = $Location }
 if ($Hypothesis) { $scopeArgs['Hypothesis'] = $Hypothesis }
 if ($StudyRoot) { $scopeArgs['StudyRoot'] = $StudyRoot }
 if ($SignalSource.Count -gt 0) { $scopeArgs['SignalSource'] = $SignalSource }
+if ($FailureMechanism) { $scopeArgs['FailureMechanism'] = $FailureMechanism }
+if ($MechanismEvidence) { $scopeArgs['MechanismEvidence'] = $MechanismEvidence }
+if ($MechanismProbe) { $scopeArgs['MechanismProbe'] = $MechanismProbe }
+if ($PSBoundParameters.ContainsKey('EventRatePerSecond')) { $scopeArgs['EventRatePerSecond'] = $EventRatePerSecond }
+if ($PSBoundParameters.ContainsKey('VulnerableWindowSeconds')) { $scopeArgs['VulnerableWindowSeconds'] = $VulnerableWindowSeconds }
+if ($PSBoundParameters.ContainsKey('EligibleFraction')) { $scopeArgs['EligibleFraction'] = $EligibleFraction }
+if ($AcceptWeakExercise) { $scopeArgs['AcceptWeakExercise'] = [switch]::Present }
 if ($FilterLocation.Count -gt 0) { $scopeArgs['FilterLocation'] = $FilterLocation }
 if ($ExcludeResource.Count -gt 0) { $scopeArgs['ExcludeResource'] = $ExcludeResource }
 if ($ExcludeType.Count -gt 0) { $scopeArgs['ExcludeType'] = $ExcludeType }
@@ -259,6 +279,8 @@ those resources. A failure here is a real answer, not an obstacle to work around
 
   exit 10  readiness gates failed - the scope is empty or already unhealthy
   exit 14  discovery failed - the action or scenario is not offered here
+  exit 20  the scenario would run fewer legs than it declares
+  exit 21  the exposure arithmetic says nothing would be exercised
 "@
 
 $store = if ($StudyRoot) { $StudyRoot } else { (Get-ChaosStudyRoot).path }

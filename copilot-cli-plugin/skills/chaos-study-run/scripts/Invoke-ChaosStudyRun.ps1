@@ -50,6 +50,7 @@ $sharedLib = Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib'
 . (Join-Path $sharedLib 'Common.ps1')
 . (Join-Path $sharedLib 'ApiVersions.ps1')
 . (Join-Path $sharedLib 'Study.ps1')
+. (Join-Path $sharedLib 'Exercise.ps1')
 . (Join-Path $libDir 'Signals.ps1')
 . (Join-Path $libDir 'Execute.ps1')
 
@@ -338,6 +339,19 @@ Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'evidence/post/signa
 $allSignals = @($preEvidence) + @($duringEvidence) + @($postEvidence)
 $coverage = Test-ChaosSignalCoverage -Signals $allSignals
 
+# Was the vulnerable path actually exercised? This is deliberately separate from
+# whether the predicate held. A run that touched no resources, or whose frozen
+# arithmetic predicted no vulnerable events, proves nothing about resilience -
+# and the report has to be able to say so rather than reading zero failures as
+# a pass.
+$frozenExercise = $null
+if ($plan.PSObject.Properties.Name -contains 'exercise' -and $null -ne $plan.exercise) {
+    $frozenExercise = $plan.exercise.model
+}
+$exerciseEvidence = Get-ChaosExerciseEvidence -Model $frozenExercise `
+    -ObservedEvents $(if ($null -ne $runObservation -and $null -ne $runObservation.resourcesTouched -and $runObservation.resourcesTouched -eq 0) { 0 } else { $null }) `
+    -ObservationSource $(if ($null -ne $runObservation) { 'scenario run summary (resources touched)' } else { $null })
+
 $runRecord = [ordered]@{
     recordVersion = 'run-record.v2'
     studyId       = $study.studyId
@@ -376,6 +390,7 @@ $runRecord = [ordered]@{
         post   = 'evidence/post/signals.json'
     }
     coverage      = $coverage
+    exercise      = $exerciseEvidence
 }
 
 Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'run-record.v1.json' -Content $runRecord | Out-Null

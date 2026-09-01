@@ -34,6 +34,10 @@ $script:ChaosLimitationText = [ordered]@{
     L8 = 'Aborted - the run stopped before the planned window completed'
     L9 = 'Configuration drift - the scope changed between planning and execution'
     L10 = 'Discovery unverified - action metadata was not confirmed against the live Chaos Studio action list'
+    L11 = 'Partial scenario - the service execution plan ran fewer legs than the scenario declares, so some actions never applied'
+    L12 = 'Insufficient exposure - too little work reached the vulnerable path for the absence of failures to mean anything'
+    L13 = 'Action timing approximate - the exact action-active window was not reported, so evidence is aligned to the observation window instead'
+    L14 = 'Unresolved residue - resources or grants created by this study could not be confirmed removed'
 }
 
 function Get-ChaosLimitationText {
@@ -457,10 +461,18 @@ function Get-ChaosVerdict {
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Findings,
-        [Parameter(Mandatory)][AllowNull()][object]$MechanismProven
+        [Parameter(Mandatory)][AllowNull()][object]$MechanismProven,
+        [AllowNull()][object]$Exercise = $null
     )
     $severities = @($Findings | ForEach-Object { $_.severity })
     if ($severities -contains 'critical') { return 'Steady state breached' }
+
+    # Not exercised is not a weaker form of inconclusive - it is a stronger
+    # statement. Inconclusive means the evidence is ambiguous; not exercised
+    # means we know the vulnerable path never carried work, so the absence of
+    # failures says nothing at all and must not be reported as resilience.
+    if ($null -ne $Exercise -and $Exercise.exercised -eq $false) { return 'Not exercised' }
+
     if ($MechanismProven -ne $true) { return 'Inconclusive' }
     if ($severities -contains 'high' -or $severities -contains 'medium') { return 'Degraded but recovered' }
     return 'Steady state held'
@@ -618,12 +630,19 @@ function Build-StudyFindings {
     $order = @{ critical = 0; high = 1; medium = 2; low = 3 }
     $sorted = @($findings | Sort-Object -Property @{ Expression = { $order[$_.severity] } }, @{ Expression = { $_.title } })
 
+    $exercise = $null
+    if ($RunRecord.PSObject.Properties.Name -contains 'exercise') { $exercise = $RunRecord.exercise }
+    if ($null -ne $exercise -and $exercise.exercised -eq $false -and $limitations -notcontains 'L12') {
+        $limitations += 'L12'
+    }
+
     return [ordered]@{
         findingsVersion = 'findings.v1'
         studyId         = $RunRecord.studyId
         scopeHash       = $RunRecord.scopeHash
         planHash        = $Plan.frozenConfigHash
-        verdict         = Get-ChaosVerdict -Findings $sorted -MechanismProven $mechanismProven
+        verdict         = Get-ChaosVerdict -Findings $sorted -MechanismProven $mechanismProven -Exercise $exercise
+        exercise        = $exercise
         mechanismProven = $mechanismProven
         mechanismDetail = $mechanismDetail
         predicate       = [ordered]@{

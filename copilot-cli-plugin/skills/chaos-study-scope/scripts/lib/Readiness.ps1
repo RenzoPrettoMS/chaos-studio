@@ -448,6 +448,8 @@ function Invoke-ChaosReadinessGates {
         [AllowNull()][AllowEmptyString()][string]$FailureMechanism = $null,
         [AllowNull()][AllowEmptyString()][string]$MechanismEvidence = $null,
         [AllowNull()][object]$MechanismProbe = $null,
+        [AllowNull()][object]$ExerciseModel = $null,
+        [switch]$AcceptWeakExercise,
         [switch]$DiscoverySkipped
     )
 
@@ -467,6 +469,7 @@ function Invoke-ChaosReadinessGates {
         Test-ChaosActionReversibility -Action $Action
         Test-ChaosInjectionWindow -InjectMinutes $InjectMinutes
         Test-ChaosObservabilityCoverage -AvailableSources $AvailableSources -SteadyState $SteadyState
+        Test-ChaosExerciseSufficient -Model $ExerciseModel -Accepted:$AcceptWeakExercise
     )
 
     $blockingFailures = @($gates | Where-Object { $_.severity -eq 'blocking' -and $_.status -eq 'fail' })
@@ -483,7 +486,14 @@ function Invoke-ChaosReadinessGates {
 function Assert-ChaosReadiness {
     <#
     .SYNOPSIS
-        Fail loudly with exit code 10 when a blocking gate failed.
+        Fail loudly when a blocking gate failed.
+
+    .DESCRIPTION
+        Most blocking failures are readiness failures (exit 10). Insufficient
+        exposure gets its own exit code (21) because it is a different kind of
+        problem with a different fix: the study is well-formed, it simply would
+        not exercise anything, and the caller needs to change load or window
+        rather than change the plan.
     #>
     param([Parameter(Mandatory)][object]$Readiness)
 
@@ -492,11 +502,14 @@ function Assert-ChaosReadiness {
     $lines = $Readiness.blockingFailures | ForEach-Object { "  - [$($_.id)] $($_.detail)" }
     $remediation = ($Readiness.blockingFailures | Where-Object { $_.remediation } | Select-Object -First 1).remediation
 
+    $exposureOnly = (@($Readiness.blockingFailures | Where-Object { $_.id -ne 'exercise-sufficient' }).Count -eq 0)
+    $exitName = if ($exposureOnly) { 'InsufficientExposure' } else { 'ReadinessFailed' }
+
     Write-ChaosStudyFailure -Title 'Study preconditions not met' `
         -Message ("This study would not produce an interpretable result:`n" + ($lines -join "`n") + "`n`nScoping stopped before writing a study plan.") `
         -Remediation $remediation
 
-    exit (Get-ChaosStudyExitCode -Name 'ReadinessFailed')
+    exit (Get-ChaosStudyExitCode -Name $exitName)
 }
 
 # -- Effective legs (declared vs effective, Req C) -------------------------

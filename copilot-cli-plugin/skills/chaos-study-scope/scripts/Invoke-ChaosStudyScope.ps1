@@ -120,6 +120,29 @@ param(
     # Signal sources: 'metrics:<name>' or 'logs:<workspaceId>#<kql>'.
     [string[]]$SignalSource = @(),
 
+    # Exercise arithmetic (Req E). A fault only proves something if work reaches
+    # the path it breaks, so the study computes the exposure it is about to buy
+    # and refuses to run when that exposure rounds to nothing. Every input here
+    # is optional and stays null when unsupplied - an unmeasured rate must never
+    # become an assumed one.
+    #
+    #   EventRatePerSecond      how often work reaches the vulnerable path
+    #   VulnerableWindowSeconds how long that path is actually vulnerable. Left
+    #                           unset it is inferred from the injection window,
+    #                           but only for continuous actions, where the two
+    #                           genuinely coincide. For discrete actions the
+    #                           configured duration is an observation budget,
+    #                           not a fault duration, so nothing is inferred.
+    #   EligibleFraction        share of that work the blast radius can reach
+    [double]$EventRatePerSecond,
+    [double]$VulnerableWindowSeconds,
+    [ValidateRange(0, 1)][double]$EligibleFraction,
+    [string[]]$ExerciseAssumption = @(),
+
+    # Run a study whose computed exposure is below the threshold. The result is
+    # recorded as not-exercised rather than as evidence of resilience.
+    [switch]$AcceptWeakExercise,
+
     # Blast radius. These become the scenario configuration's filters and
     # exclusions, which is the only mechanism V2 offers for bounding a run.
     [string[]]$FilterLocation = @(),
@@ -156,6 +179,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Study.ps1')
 . (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Operation.ps1')
 . (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Residue.ps1')
+. (Join-Path $PSScriptRoot '..' '..' 'chaos-study' 'scripts' 'lib' 'Exercise.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'ActionDiscovery.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'Workspace.ps1')
 . (Join-Path $PSScriptRoot 'lib' 'Readiness.ps1')
@@ -590,6 +614,31 @@ $projected = ConvertTo-ChaosList (Resolve-ChaosBlastRadiusResource -ScopedResour
 
 $scopeTypesForGates = @(@($projected) | ForEach-Object { [string]$_.resourceType } | Where-Object { $_ } | Select-Object -Unique)
 
+# Exercise arithmetic. The vulnerable window is only inferred from the injection
+# window when the live action is continuous, because that is the one case where
+# the configured duration really is how long the fault is present. For a discrete
+# action the same number is an observation budget, and treating it as fault time
+# is precisely the error Req F exists to prevent - so nothing is inferred and the
+# gate reports the exposure as unknown until someone supplies it.
+$actionType = if ($selectedAction.PSObject.Properties.Name -contains 'actionType') { [string]$selectedAction.actionType } else { '' }
+$actionIsContinuous = ($actionType -match '(?i)continuous|cancel')
+
+$vulnerableWindow = $null
+$exerciseAssumptions = @($ExerciseAssumption)
+if ($PSBoundParameters.ContainsKey('VulnerableWindowSeconds')) {
+    $vulnerableWindow = $VulnerableWindowSeconds
+}
+elseif ($actionIsContinuous) {
+    $vulnerableWindow = $DurationMinutes * 60
+    $exerciseAssumptions += "vulnerableWindowSeconds was inferred from the $DurationMinutes-minute injection window because '$($selectedAction.name)' is a $actionType action, so the fault is present for the whole window."
+}
+
+$exerciseModel = New-ChaosExerciseModel `
+    -EventRatePerSecond $(if ($PSBoundParameters.ContainsKey('EventRatePerSecond')) { $EventRatePerSecond } else { $null }) `
+    -VulnerableWindowSeconds $vulnerableWindow `
+    -EligibleFraction $(if ($PSBoundParameters.ContainsKey('EligibleFraction')) { $EligibleFraction } else { $null }) `
+    -Assumption $exerciseAssumptions
+
 $readiness = Invoke-ChaosReadinessGates -Action $selectedAction `
     -ScopedResourceTypes $scopeTypesForGates `
     -ScopedResources $projected `
@@ -600,6 +649,8 @@ $readiness = Invoke-ChaosReadinessGates -Action $selectedAction `
     -FailureMechanism $FailureMechanism `
     -MechanismEvidence $MechanismEvidence `
     -MechanismProbe $mechanismProbe `
+    -ExerciseModel $exerciseModel `
+    -AcceptWeakExercise:$AcceptWeakExercise `
     -DiscoverySkipped:$SkipDiscovery
 
 $limitationCodes = @($readiness.limitationCodes)
@@ -734,6 +785,15 @@ $plan = [ordered]@{
         failureMechanism    = if ([string]::IsNullOrWhiteSpace($FailureMechanism)) { $null } else { $FailureMechanism.Trim() }
         mechanismEvidence   = if ([string]::IsNullOrWhiteSpace($MechanismEvidence)) { $null } else { $MechanismEvidence.Trim() }
         mechanismProbe      = $mechanismProbe
+    }
+
+    exercise    = [ordered]@{
+        # Frozen exposure arithmetic. Its assumptions travel with it so a
+        # reviewer can disagree with the forecast, and weakAccepted records that
+        # a study known to prove little was run deliberately - which the report
+        # must repeat rather than presenting the run as a passed test.
+        model        = $exerciseModel
+        weakAccepted = [bool]$AcceptWeakExercise
     }
 
     workspace   = [ordered]@{
