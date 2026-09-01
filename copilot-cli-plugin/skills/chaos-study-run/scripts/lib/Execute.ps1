@@ -534,11 +534,222 @@ function Format-ChaosPermissionFixSummary {
     return ($lines -join "`n")
 }
 
+function Get-ChaosPermissionGrantDetail {
+    <#
+    .SYNOPSIS
+        Pull the individual grants out of a permission-fix result, when the
+        service names them.
+
+    .DESCRIPTION
+        The fix-permissions contract guarantees counts, not a list. Some
+        responses carry the individual assignments and some do not, so this
+        looks for the collection under the property names the service has used
+        and returns null - never an empty list - when it finds none. Null means
+        "the service did not tell us"; an empty list would claim it told us
+        there were none, and those are different facts.
+    #>
+    param([AllowNull()][object]$FixResult)
+
+    if ($null -eq $FixResult) { return $null }
+
+    $container = $FixResult
+    if ($FixResult.PSObject.Properties.Name -contains 'properties' -and $null -ne $FixResult.properties) {
+        $container = $FixResult.properties
+    }
+
+    foreach ($name in @('permissionAssignments', 'roleAssignments', 'assignments', 'requiredPermissions', 'permissions')) {
+        if ($container.PSObject.Properties.Name -contains $name) {
+            $value = $container.$name
+            if ($null -ne $value) {
+                $list = @($value)
+                if ($list.Count -gt 0) { return $list }
+            }
+        }
+    }
+    return $null
+}
+
+function Get-ChaosPermissionGrantSet {
+    <#
+    .SYNOPSIS
+        Normalise a permission-fix preview into the grant set an approval binds
+        to, plus a hash of it.
+
+    .DESCRIPTION
+        Approval has to name what is being approved, and it has to stop being
+        valid the moment that changes. Hashing the normalised grant set gives
+        both: the operator sees the roles and scopes, and a preview that later
+        widens produces a different hash and therefore needs a fresh approval.
+
+        The hash covers the configuration and workspace as well as the grants,
+        so an approval for one study can never be replayed against another.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [AllowNull()][object]$FixResult
+    )
+
+    $summary = Get-ChaosPermissionFixSummary -FixResult $FixResult
+    $details = Get-ChaosPermissionGrantDetail -FixResult $FixResult
+
+    $roles = $null
+    $scopes = $null
+    $missingActions = $null
+    if ($null -ne $details) {
+        $roles = @($details | ForEach-Object {
+                foreach ($p in @('roleDefinitionName', 'roleName', 'roleDefinitionId', 'role')) {
+                    if ($_.PSObject.Properties.Name -contains $p -and $_.$p) { return [string]$_.$p }
+                }
+                $null
+            } | Where-Object { $_ } | Sort-Object -Unique)
+        $scopes = @($details | ForEach-Object {
+                foreach ($p in @('scope', 'resourceId', 'targetResourceId')) {
+                    if ($_.PSObject.Properties.Name -contains $p -and $_.$p) { return [string]$_.$p }
+                }
+                $null
+            } | Where-Object { $_ } | Sort-Object -Unique)
+        $missingActions = @($details | ForEach-Object {
+                foreach ($p in @('missingActions', 'actions', 'action')) {
+                    if ($_.PSObject.Properties.Name -contains $p -and $_.$p) { return @($_.$p) }
+                }
+                @()
+            } | ForEach-Object { $_ } | Where-Object { $_ } | Sort-Object -Unique)
+        if ($roles.Count -eq 0) { $roles = $null }
+        if ($scopes.Count -eq 0) { $scopes = $null }
+        if ($null -eq $missingActions -or $missingActions.Count -eq 0) { $missingActions = $null }
+    }
+
+    $grantSet = [ordered]@{
+        workspace         = [string]$Plan.workspace.name
+        resourceGroup     = [string]$Plan.workspace.resourceGroup
+        configurationName = $ConfigurationName
+        workspacePrincipal = if ($Plan.workspace.PSObject.Properties.Name -contains 'principalId') { $Plan.workspace.principalId } else { $null }
+        totalRequired     = if ($null -eq $summary) { $null } else { $summary.totalRequired }
+        recommendedRoles  = $roles
+        scopes            = $scopes
+        missingActions    = $missingActions
+    }
+
+    $hash = Get-ChaosDigest -InputObject $grantSet
+    return [pscustomobject]@{
+        grantSet = $grantSet
+        hash     = $hash
+        details  = $details
+    }
+}
+
+function Get-ChaosPermissionApprovalPhrase {
+    <#
+    .SYNOPSIS
+        The exact phrase that approves widening RBAC for this study.
+
+    .DESCRIPTION
+        Deliberately different in shape from the injection phrase. Approving a
+        role assignment and approving a fault are different decisions with
+        different blast radii - one outlives the study - so neither phrase can
+        be mistaken for, or satisfy, the other. It carries the grant-set hash so
+        approving a smaller set never authorises a larger one.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$GrantSetHash
+    )
+
+    $shortGrant = ([string]$GrantSetHash).Substring(0, 8)
+    return "grant access on $($Plan.workspace.name) $shortGrant"
+}
+
+function Test-ChaosPermissionApproval {
+    <#
+    .SYNOPSIS
+        Whether the operator supplied the exact approval phrase for this grant
+        set. Case-sensitive, like every other consent in this suite.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$GrantSetHash,
+        [AllowNull()][AllowEmptyString()][string]$Approval
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Approval)) { return $false }
+    $expected = Get-ChaosPermissionApprovalPhrase -Plan $Plan -GrantSetHash $GrantSetHash
+    return ($Approval.Trim() -ceq $expected)
+}
+
+function Get-ChaosRoleAssignmentSnapshot {
+    <#
+    .SYNOPSIS
+        A read-only snapshot of the role assignments on a scope.
+
+    .DESCRIPTION
+        Taken either side of a repair so the study can report the assignments it
+        actually created rather than the count the service was asked for. Read
+        failures are not fatal and are not silently treated as "no assignments":
+        the snapshot returns null, and a null on either side means the delta is
+        unknown rather than empty.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Scope,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Scope)) { return $null }
+
+    try {
+        $response = Invoke-ChaosStudyOperation -Kind 'roleAssignments.list' -Arguments @{ scope = $Scope } `
+            -ExpectedSchema 'any.v1' -Adapter $Adapter -StudyPath $StudyPath `
+            -OperationHint 'role assignment list'
+    } catch {
+        return $null
+    }
+
+    if ($null -eq $response) { return $null }
+    $body = if ($response.PSObject.Properties.Name -contains 'body') { $response.body } else { $response }
+    if ($null -eq $body) { return $null }
+    if ($body.PSObject.Properties.Name -contains 'value') { return @($body.value) }
+    return @($body)
+}
+
+function Get-ChaosRoleAssignmentDelta {
+    <#
+    .SYNOPSIS
+        The assignments present after a repair that were not present before.
+
+    .DESCRIPTION
+        Returns null when either snapshot is unknown. A repair whose effect
+        could not be observed must not be reported as having granted nothing -
+        that is the difference between "we checked and it was clean" and "we
+        could not check", and only one of those is safe to act on.
+    #>
+    param(
+        [AllowNull()][object]$Before,
+        [AllowNull()][object]$After
+    )
+
+    if ($null -eq $Before -or $null -eq $After) { return $null }
+
+    $beforeIds = @{}
+    foreach ($item in @($Before)) {
+        if ($null -ne $item -and $item.PSObject.Properties.Name -contains 'id' -and $item.id) { $beforeIds[[string]$item.id] = $true }
+    }
+
+    $new = @()
+    foreach ($item in @($After)) {
+        if ($null -eq $item) { continue }
+        if (-not ($item.PSObject.Properties.Name -contains 'id') -or -not $item.id) { continue }
+        if (-not $beforeIds.ContainsKey([string]$item.id)) { $new += $item }
+    }
+    return @($new)
+}
+
 function Resolve-ChaosConfigurationValidation {
     <#
     .SYNOPSIS
-        Validate a scenario configuration, repair the permissions the service
-        reports as missing, and return both the outcome and what was done.
+        Validate a scenario configuration and, when it fails for want of access,
+        preview the grants it needs - applying them only under a separate,
+        grant-bound approval.
 
     .DESCRIPTION
         Validation always runs, and it runs before any evidence is collected or
@@ -546,18 +757,18 @@ function Resolve-ChaosConfigurationValidation {
         run that will fail in seconds - and finding that out after a baseline
         window has already elapsed wastes the window and the operator's time.
 
-        When validation does not succeed the missing grants are previewed with
-        --what-if and shown before anything changes. They are applied only if
-        the service named grants to make, and the configuration is validated
-        again afterwards.
+        Widening RBAC is not part of approving a fault. An injection ends when
+        the run ends; a role assignment does not, and it changes who can reach
+        the scoped resources long after this study is forgotten. So the two
+        decisions are separated: this function previews with --what-if and, if
+        grants are needed, returns approvalRequired without changing anything.
+        The caller surfaces the exact approval phrase and stops. Only a
+        subsequent call carrying that phrase applies the grants.
 
-        Repair is not optional here. This code path is already past the typed
-        consent phrase, so the operator has approved acting on this scope; a
-        switch that merely decides whether to fix the permissions that approval
-        requires adds a way to fail without adding a decision worth making.
-        What matters is that the change is visible, which is why the preview,
-        the applied result and the validation status either side of it are all
-        returned and persisted.
+        When grants are applied, role assignments are snapshotted either side of
+        the repair so the study records what was actually created rather than
+        what the service was asked to create, and each new assignment is written
+        to the residue ledger with the command that removes it.
 
         This does not decide whether to execute. Assert-ChaosConfigurationValidated
         is the gate, and Start-ChaosStudyScenarioRun applies it again.
@@ -567,7 +778,8 @@ function Resolve-ChaosConfigurationValidation {
         [Parameter(Mandatory)][object]$Plan,
         [Parameter(Mandatory)][string]$ConfigurationName,
         [AllowNull()][AllowEmptyString()][string]$Adapter,
-        [AllowNull()][AllowEmptyString()][string]$StudyPath
+        [AllowNull()][AllowEmptyString()][string]$StudyPath,
+        [AllowNull()][AllowEmptyString()][string]$PermissionApproval
     )
 
     $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
@@ -575,9 +787,12 @@ function Resolve-ChaosConfigurationValidation {
 
     if ($status -eq 'Succeeded') {
         return [pscustomobject]@{
-            validation    = $validation
-            status        = $status
-            permissionFix = $null
+            validation       = $validation
+            status           = $status
+            permissionFix    = $null
+            approvalRequired = $false
+            approvalPhrase   = $null
+            grantSet         = $null
         }
     }
 
@@ -592,59 +807,118 @@ function Resolve-ChaosConfigurationValidation {
     $preview = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName -WhatIf -Adapter $Adapter -StudyPath $StudyPath
     $previewSummary = Get-ChaosPermissionFixSummary -FixResult $preview
     $applicable = Test-ChaosPermissionFixApplicable -FixResult $preview
+    $grant = Get-ChaosPermissionGrantSet -Plan $Plan -ConfigurationName $ConfigurationName -FixResult $preview
 
-    $decision = if ($applicable) {
-        'These grants will now be applied, and the configuration validated again.'
-    } else {
-        'Chaos Studio named no grants to make, so nothing will be changed. The validation gate below will refuse the run.'
+    $permissionFix = [ordered]@{
+        attempted        = $true
+        applicable       = [bool]$applicable
+        preview          = $previewSummary
+        grantSet         = $grant.grantSet
+        grantSetHash     = $grant.hash
+        grantDetails     = $grant.details
+        approved         = $false
+        approvalPhrase   = $null
+        applied          = $null
+        grantsObserved   = $null
+        validationBefore = $before
+        validationAfter  = $null
     }
 
-    Write-ChaosStudyCard -Title 'Permission repair preview - nothing has been granted yet' -Body @"
-Validation reported '$statusText'. Chaos Studio checks the workspace identity's
-access to every scoped resource, so this is what it says is missing.
+    if (-not $applicable) {
+        # The service named nothing to grant. Widening access on the strength of
+        # a result that reported nothing would be inventing a reason to change
+        # RBAC, so nothing happens and the gate below refuses the run.
+        Write-ChaosStudyCard -Title 'Validation failed and no grants were named' -Body @"
+Validation reported '$statusText'. Chaos Studio was asked which role assignments
+are missing and named none, so nothing has been changed.
 
 $(Format-ChaosPermissionFixSummary -Summary $previewSummary)
 
-$decision
+The validation gate will refuse this run.
 "@
-
-    $appliedSummary = $null
-    if ($applicable) {
-        Write-ChaosStudyNote -Message 'Applying the role assignments Chaos Studio reported as missing.' -Level 'warn'
-        $applied = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
-        $appliedSummary = Get-ChaosPermissionFixSummary -FixResult $applied
-
-        if ($null -ne $appliedSummary) {
-            if ($appliedSummary.whatIfMode -eq $true) {
-                # The fix was requested without --what-if, so this means the
-                # service previewed instead of acting and nothing was granted.
-                Write-ChaosStudyNote -Message 'Chaos Studio reported whatIfMode on an applied fix, so no role assignments were actually created.' -Level 'warn'
-            }
-            $failedCount = 0
-            if ($null -ne $appliedSummary.failed -and [int]::TryParse([string]$appliedSummary.failed, [ref]$failedCount) -and $failedCount -gt 0) {
-                Write-ChaosStudyNote -Message "$failedCount role assignment(s) could not be created; the workspace identity may lack roleAssignments/write on the scope." -Level 'warn'
-            }
+        $permissionFix.validationAfter = $before
+        return [pscustomobject]@{
+            validation       = $validation
+            status           = $status
+            permissionFix    = $permissionFix
+            approvalRequired = $false
+            approvalPhrase   = $null
+            grantSet         = $grant.grantSet
         }
+    }
 
-        Write-ChaosStudyNote -Message 'Re-validating the configuration after the permission repair.'
-        $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
-        $status = Get-ChaosValidationStatus -Validation $validation
+    $phrase = Get-ChaosPermissionApprovalPhrase -Plan $Plan -GrantSetHash $grant.hash
+    $permissionFix.approvalPhrase = $phrase
+
+    if (-not (Test-ChaosPermissionApproval -Plan $Plan -GrantSetHash $grant.hash -Approval $PermissionApproval)) {
+        # Not approved. Nothing is granted, and the caller decides how to stop.
+        $permissionFix.validationAfter = $before
+        return [pscustomobject]@{
+            validation       = $validation
+            status           = $status
+            permissionFix    = $permissionFix
+            approvalRequired = $true
+            approvalPhrase   = $phrase
+            grantSet         = $grant.grantSet
+        }
+    }
+
+    Write-ChaosStudyNote -Message 'Permission approval accepted. Applying the role assignments Chaos Studio reported as missing.' -Level 'warn'
+
+    $scope = if ($Plan.workspace.PSObject.Properties.Name -contains 'id') { [string]$Plan.workspace.id } else { $null }
+    $beforeAssignments = Get-ChaosRoleAssignmentSnapshot -Scope $scope -Adapter $Adapter -StudyPath $StudyPath
+
+    $applied = Repair-ChaosConfigurationPermission -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
+    $appliedSummary = Get-ChaosPermissionFixSummary -FixResult $applied
+    $permissionFix.approved = $true
+    $permissionFix.applied = $appliedSummary
+
+    if ($null -ne $appliedSummary) {
+        if ($appliedSummary.whatIfMode -eq $true) {
+            # The fix was requested without --what-if, so this means the service
+            # previewed instead of acting and nothing was granted.
+            Write-ChaosStudyNote -Message 'Chaos Studio reported whatIfMode on an applied fix, so no role assignments were actually created.' -Level 'warn'
+        }
+        $failedCount = 0
+        if ($null -ne $appliedSummary.failed -and [int]::TryParse([string]$appliedSummary.failed, [ref]$failedCount) -and $failedCount -gt 0) {
+            Write-ChaosStudyNote -Message "$failedCount role assignment(s) could not be created; the workspace identity may lack roleAssignments/write on the scope." -Level 'warn'
+        }
+    }
+
+    $afterAssignments = Get-ChaosRoleAssignmentSnapshot -Scope $scope -Adapter $Adapter -StudyPath $StudyPath
+    $created = Get-ChaosRoleAssignmentDelta -Before $beforeAssignments -After $afterAssignments
+    $permissionFix.grantsObserved = if ($null -eq $created) { $null } else { @($created | ForEach-Object { [string]$_.id }) }
+
+    if ($null -ne $created -and -not [string]::IsNullOrWhiteSpace($StudyPath)) {
+        foreach ($assignment in @($created)) {
+            $props = if ($assignment.PSObject.Properties.Name -contains 'properties') { $assignment.properties } else { $assignment }
+            Add-ChaosRoleAssignmentResidueEntry -StudyPath $StudyPath -AssignmentId ([string]$assignment.id) `
+                -RoleDefinitionId $(if ($props -and $props.PSObject.Properties.Name -contains 'roleDefinitionId') { [string]$props.roleDefinitionId } else { $null }) `
+                -PrincipalId $(if ($props -and $props.PSObject.Properties.Name -contains 'principalId') { [string]$props.principalId } else { $null }) `
+                -Scope $scope -Adapter $Adapter -ApprovalPhrase $phrase | Out-Null
+        }
+    }
+
+    # Re-validation is a read. If RBAC has not propagated yet this reports a
+    # failure and the gate refuses the run - which is correct. Retrying the read
+    # is safe; retrying the grant would create duplicate assignments to work
+    # around a delay that is not this study's to fix.
+    Write-ChaosStudyNote -Message 'Re-validating the configuration after the permission repair.'
+    $validation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
+    $status = Get-ChaosValidationStatus -Validation $validation
+
+    $permissionFix.validationAfter = [ordered]@{
+        status = $status
+        errors = @(Get-ChaosValidationError -Validation $validation)
     }
 
     return [pscustomobject]@{
-        validation    = $validation
-        status        = $status
-        permissionFix = [ordered]@{
-            attempted        = $true
-            applicable       = [bool]$applicable
-            preview          = $previewSummary
-            applied          = $appliedSummary
-            validationBefore = $before
-            validationAfter  = [ordered]@{
-                status = $status
-                errors = @(Get-ChaosValidationError -Validation $validation)
-            }
-        }
+        validation       = $validation
+        status           = $status
+        permissionFix    = $permissionFix
+        approvalRequired = $false
+        approvalPhrase   = $phrase
+        grantSet         = $grant.grantSet
     }
 }
 
@@ -863,14 +1137,16 @@ function Resolve-ChaosRunConfiguration {
         was skipped at scope time) this falls back to the historical create +
         validate path unchanged.
 
-        Returns { configurationName; validation; status; permissionFix; reused }.
+        Returns { configurationName; validation; status; permissionFix; reused;
+        approvalRequired; approvalPhrase; grantSet }.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Plan,
         [Parameter(Mandatory)][string]$ConfigurationName,
         [AllowNull()][AllowEmptyString()][string]$Adapter,
-        [AllowNull()][AllowEmptyString()][string]$StudyPath
+        [AllowNull()][AllowEmptyString()][string]$StudyPath,
+        [AllowNull()][AllowEmptyString()][string]$PermissionApproval
     )
 
     $dve = $null
@@ -894,6 +1170,9 @@ function Resolve-ChaosRunConfiguration {
                     status            = $preflightStatus
                     permissionFix     = $null
                     reused            = $true
+                    approvalRequired  = $false
+                    approvalPhrase    = $null
+                    grantSet          = $null
                 }
             }
             Write-ChaosStudyNote -Message "The preflight configuration $preflightName no longer matches the scoped effective plan; re-creating a fresh configuration." -Level 'warn'
@@ -905,13 +1184,29 @@ function Resolve-ChaosRunConfiguration {
 
     # 2. Re-create, prove effective-plan equality when a plan was frozen, then return.
     New-ChaosStudyConfiguration -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath | Out-Null
-    $resolved = Resolve-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath
+    $resolved = Resolve-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $ConfigurationName -Adapter $Adapter -StudyPath $StudyPath -PermissionApproval $PermissionApproval
+
+    if ($resolved.approvalRequired) {
+        # Grants are needed and have not been approved. Return before proving
+        # effective-plan equality: the configuration validated for want of access,
+        # so its effective plan is not evidence of drift and reporting it as such
+        # would bury the real reason under a misleading one.
+        return [pscustomobject]@{
+            configurationName = $ConfigurationName
+            validation        = $resolved.validation
+            status            = $resolved.status
+            permissionFix     = $resolved.permissionFix
+            reused            = $false
+            approvalRequired  = $true
+            approvalPhrase    = $resolved.approvalPhrase
+            grantSet          = $resolved.grantSet
+        }
+    }
 
     if (-not [string]::IsNullOrWhiteSpace($frozenHash)) {
-        # $resolved.validation is the object equality is proved over and is already
-        # Succeeded (Resolve-ChaosConfigurationValidation would have exited otherwise).
-        # Proving equality here - rather than re-fetching after - keeps the returned
-        # plan identical to the one the proof covered and avoids a redundant
+        # $resolved.validation is the object equality is proved over. Equality is
+        # proved here - rather than after a re-fetch - so the returned plan is
+        # identical to the one the proof covered, and to avoid a redundant
         # validate/show round-trip on every re-created run. When no plan was frozen
         # (discovery skipped at scope time) this proof is skipped and the historical
         # create + validate result is returned unchanged.
@@ -925,6 +1220,9 @@ function Resolve-ChaosRunConfiguration {
         status            = $resolved.status
         permissionFix     = $resolved.permissionFix
         reused            = $false
+        approvalRequired  = $false
+        approvalPhrase    = $resolved.approvalPhrase
+        grantSet          = $resolved.grantSet
     }
 }
 

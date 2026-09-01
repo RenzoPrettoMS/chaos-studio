@@ -20,6 +20,11 @@ consent phrase — and executes nothing. Read it before arming anything.
 `11`. There is no `-Yes`, no `-Force` that bypasses it, and no environment
 variable that pre-approves it.
 
+**Granting access is a second, separate consent.** Injecting a fault is
+reversible and bounded; a role assignment is neither. So `-ApprovePermissions`
+takes its own phrase, derived from the grants the service actually previewed,
+and one consent can never stand in for the other.
+
 **The plan is verified, not trusted.** The plan hash is recomputed before
 execution. Any drift since scoping exits `12`. If the blast radius changed after
 you approved it, this refuses rather than running something you did not review.
@@ -27,12 +32,12 @@ you approved it, this refuses rather than running something you did not review.
 **Validation is a gate, not advice.** The scenario configuration is created and
 validated *before* any evidence is collected or anything is injected, and the run
 is refused unless the service reports `Succeeded`. If validation fails, the
-missing role assignments are previewed with `--what-if`, shown, applied when the
-service names any, and validation is repeated. Repair is not a switch: this path
-is already past typed consent, so the operator has approved acting on this scope,
-and an opt-in flag for the permissions that approval requires would only add a
-way to fail. What matters is that the change is visible and recorded, which it
-is.
+missing role assignments are previewed with `--what-if` and shown — and then the
+study stops. Granting them is not covered by the injection consent: a role
+assignment outlives the study and changes who can reach those resources
+afterwards, whereas the injection ends when the run ends. So it takes its own
+phrase, bound to the exact grant set the service previewed. Neither consent
+implies the other, and a preview that widens invalidates the phrase.
 
 **Evidence is collected around the run, not just during it.** Baseline, during,
 and post windows are all collected. Without baseline there is no "normal" to
@@ -77,8 +82,9 @@ Switches worth knowing:
 2. Render the consent phrase and require it back verbatim
 3. Create the scenario configuration on the workspace, carrying the plan's
    frozen parameters, filters and exclusions
-4. Validate it; on failure, preview the missing grants with `--what-if`, apply
-   them if the service names any, and validate again
+4. Validate it; on failure, preview the missing grants with `--what-if` and stop
+   with exit 19 unless `-ApprovePermissions '<phrase>'` matches that preview —
+   only then apply the grants, record them, and validate again
 5. Refuse to continue unless validation now says `Succeeded`
 6. Collect the **baseline** window
 7. Execute the configuration; poll the scenario run until it reaches a terminal
@@ -120,6 +126,7 @@ silently alter behaviour.
 | `12` | Plan changed after it was frozen |
 | `13` | Study already sealed |
 | `17` | Scenario configuration failed validation |
+| `19` | Role assignments needed; re-run with `-ApprovePermissions` |
 
 ## If it fails partway
 

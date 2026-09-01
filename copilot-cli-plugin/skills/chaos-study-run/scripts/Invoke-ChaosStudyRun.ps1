@@ -38,7 +38,8 @@ param(
     [int]$PollSeconds = 20,
     [switch]$KeepConfiguration,
     [switch]$Force,
-    [ValidateSet('local-az', 'external')][string]$Adapter
+    [ValidateSet('local-az', 'external')][string]$Adapter,
+    [string]$ApprovePermissions
 )
 
 Set-StrictMode -Version Latest
@@ -227,7 +228,7 @@ try {
     # is identical before validating. Either way, what runs is provably what was
     # scoped and consented to.
     Write-ChaosStudyNote -Message "Resolving the scenario configuration for $configurationName."
-    $resolvedConfig = Resolve-ChaosRunConfiguration -Plan $plan -ConfigurationName $configurationName -Adapter $Adapter -StudyPath $studyPath
+    $resolvedConfig = Resolve-ChaosRunConfiguration -Plan $plan -ConfigurationName $configurationName -Adapter $Adapter -StudyPath $studyPath -PermissionApproval $ApprovePermissions
     $configurationName = $resolvedConfig.configurationName
     if (-not $resolvedConfig.reused) {
         $configurationCreated = $true
@@ -240,8 +241,39 @@ try {
     $permissionFix = $resolvedConfig.permissionFix
 
     if ($null -ne $permissionFix) {
-        Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config fix-permissions' `
-            -Arguments @($configurationName, "applicable=$($permissionFix.applicable)") -ExitCode 0 | Out-Null
+        Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config fix-permissions --what-if' `
+            -Arguments @($configurationName, "applicable=$($permissionFix.applicable)", "approved=$($permissionFix.approved)") -ExitCode 0 | Out-Null
+        Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'permission-approval.json' -Content $permissionFix | Out-Null
+    }
+
+    if ($resolvedConfig.approvalRequired) {
+        # Injection consent has already been given, and it is not enough. A role
+        # assignment outlives this study and changes who can reach these resources
+        # afterwards, so it gets its own decision, made against the grants the
+        # service actually named. The study stops here and can be resumed with the
+        # approval; nothing has been granted and nothing has been injected.
+        $grants = $resolvedConfig.grantSet
+        Write-ChaosStudyCard -Title 'Permission approval required before this study can run' -Body @"
+The scenario configuration did not validate because the workspace identity is
+missing access. Chaos Studio previewed the grants it needs. Nothing has been
+changed - this is a preview.
+
+$(Format-ChaosPermissionFixSummary -Summary $permissionFix.preview)
+  - workspace: $($grants.workspace)
+  - recommended roles: $(if ($null -eq $grants.recommendedRoles) { 'not reported by the service' } else { ($grants.recommendedRoles -join ', ') })
+  - scopes: $(if ($null -eq $grants.scopes) { 'not reported by the service' } else { ($grants.scopes -join ', ') })
+
+These grants persist after the study ends. Approving them is a separate decision
+from approving the fault, and neither implies the other.
+
+To approve them, re-run this study adding:
+
+  -ApprovePermissions '$($resolvedConfig.approvalPhrase)'
+
+The phrase is bound to the grants above. If the preview changes, it stops working
+and you will be asked again.
+"@
+        exit (Get-ChaosStudyExitCode -Name 'PermissionApprovalRequired')
     }
 
     Assert-ChaosConfigurationValidated -Validation $validation -ConfigurationName $configurationName | Out-Null

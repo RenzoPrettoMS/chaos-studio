@@ -168,6 +168,19 @@ function Get-ChaosOperationRegistry {
             }
             external = @{ tool = 'az-chaos'; methodHint = 'discovered-resource list' }
         }
+        'roleAssignments.list' = @{
+            # Read-only RBAC snapshot. Chaos Studio's fix-permissions response
+            # does not name the assignments it creates, so the only honest way
+            # to know what a repair actually granted is to look before and after.
+            localAz  = {
+                param($Arguments, $Body)
+                $scope = Get-ChaosOperationArg -Arguments $Arguments -Name 'scope'
+                Invoke-AzRest -AllowFailure -Method GET `
+                    -Uri "$scope/providers/Microsoft.Authorization/roleAssignments" `
+                    -ApiVersion (Get-ChaosApiVersion -Name 'roleAssignments')
+            }
+            external = @{ tool = 'az-rest'; methodHint = 'GET roleAssignments' }
+        }
         'resource.get' = @{
             localAz  = {
                 param($Arguments, $Body)

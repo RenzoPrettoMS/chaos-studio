@@ -32,6 +32,10 @@ $ChaosStudyApiVersions = [ordered]@{
     chaosActions             = '2026-05-01-preview'
     # Generic ARM resource read - used to resolve a scoped resource's region
     resources                = '2021-04-01'
+    # Microsoft.Authorization role assignments - read-only before/after snapshots
+    # around a permission repair, so a study can report what was actually granted
+    # rather than what the service was asked to grant.
+    roleAssignments          = '2022-04-01'
     # Azure Monitor metrics - Microsoft.Insights/metrics
     metrics                  = '2024-02-01'
     # Log Analytics query API

@@ -153,6 +153,46 @@ function Add-ChaosResidueEntry {
     return $updated
 }
 
+function Add-ChaosRoleAssignmentResidueEntry {
+    <#
+    .SYNOPSIS
+        Record a role assignment a permission repair created, so a grant this
+        study made can later be found and revoked by id rather than guessed at.
+
+    .DESCRIPTION
+        Chaos Studio's fix-permissions response reports counts, not assignment
+        ids, so the ids here come from diffing a read-only role-assignment
+        snapshot taken either side of the repair. That diff is the only evidence
+        a study has that it changed someone's RBAC, which is exactly why it is
+        written to the ledger the moment it is observed.
+
+        The removal command is recorded alongside the entry because the operator
+        who has to undo this may not be the one who ran the study.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StudyPath,
+        [Parameter(Mandatory)][string]$AssignmentId,
+        [AllowNull()][AllowEmptyString()][string]$RoleDefinitionId = $null,
+        [AllowNull()][AllowEmptyString()][string]$PrincipalId = $null,
+        [AllowNull()][AllowEmptyString()][string]$Scope = $null,
+        [AllowNull()][AllowEmptyString()][string]$Adapter = $null,
+        [AllowNull()][AllowEmptyString()][string]$ApprovalPhrase = $null
+    )
+
+    $provenance = [ordered]@{
+        origin           = 'permissionRepair'
+        adapter          = if ([string]::IsNullOrWhiteSpace($Adapter)) { $null } else { $Adapter }
+        roleDefinitionId = if ([string]::IsNullOrWhiteSpace($RoleDefinitionId)) { $null } else { $RoleDefinitionId }
+        principalId      = if ([string]::IsNullOrWhiteSpace($PrincipalId)) { $null } else { $PrincipalId }
+        scope            = if ([string]::IsNullOrWhiteSpace($Scope)) { $null } else { $Scope }
+        approvedBy       = if ([string]::IsNullOrWhiteSpace($ApprovalPhrase)) { $null } else { $ApprovalPhrase }
+        removalCommand   = "az role assignment delete --ids $AssignmentId"
+    }
+
+    $entry = New-ChaosResidueEntry -Kind 'roleAssignment' -Id $AssignmentId -Name $RoleDefinitionId -Provenance $provenance
+    return Add-ChaosResidueEntry -StudyPath $StudyPath -Entry $entry
+}
+
 function Add-ChaosPreflightResidueEntry {
     <#
     .SYNOPSIS

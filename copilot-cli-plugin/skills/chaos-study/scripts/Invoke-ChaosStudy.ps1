@@ -91,6 +91,7 @@ param(
     [Parameter(ParameterSetName = 'Study')][string]$StudyRoot,
     [Parameter(ParameterSetName = 'Study')][bool]$DryRun = $true,
     [Parameter(ParameterSetName = 'Study')][string]$Consent,
+    [Parameter(ParameterSetName = 'Study')][string]$ApprovePermissions,
     [Parameter(ParameterSetName = 'Study')][switch]$KeepConfiguration,
     [Parameter(ParameterSetName = 'Study')][switch]$SkipDiscovery,
     [Parameter(ParameterSetName = 'Study')][switch]$PlanOnly
@@ -289,10 +290,29 @@ $runArgs = @{
 }
 if ($StudyRoot) { $runArgs['StudyRoot'] = $StudyRoot }
 if ($Consent) { $runArgs['Consent'] = $Consent }
+if ($ApprovePermissions) { $runArgs['ApprovePermissions'] = $ApprovePermissions }
 if ($KeepConfiguration) { $runArgs['KeepConfiguration'] = [switch]::Present }
 if ($SignalSource.Count -gt 0) { $runArgs['SignalSource'] = $SignalSource }
 
 $runExit = Invoke-ChaosPhase -Name 'chaos-study-run' -Script $runScript -Arguments $runArgs
+
+if ($runExit -eq (Get-ChaosStudyExitCode -Name 'PermissionApprovalRequired')) {
+    # Not a failure. The run stopped deliberately because the workspace identity
+    # needs role assignments this study has not been authorised to create.
+    # Nothing was granted and nothing was injected; the preview is on disk.
+    Write-Card -Title 'Study paused for permission approval' -Status 'warning' -Body @"
+The scenario configuration could not validate because the workspace identity is
+missing access, and granting it is a separate decision from approving the fault.
+
+The run printed the exact approval phrase and wrote the preview to the study
+directory. Approving role assignments widens access beyond this study, so read
+the preview before you approve it, then resume:
+
+  chaos-study ... -DryRun:`$false -Consent '<phrase>' -ApprovePermissions '<phrase the run printed>'
+"@
+    exit $runExit
+}
+
 Stop-OnPhaseFailure -Name 'chaos-study-run' -ExitCode $runExit -Guidance @"
   exit 11  consent was not given - re-run with the exact phrase the plan printed
   exit 12  the plan changed after it was frozen - re-scope rather than force it

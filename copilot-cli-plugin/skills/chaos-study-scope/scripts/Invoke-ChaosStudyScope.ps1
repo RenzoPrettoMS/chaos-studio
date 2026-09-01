@@ -321,16 +321,31 @@ function New-ChaosPreflightConfiguration {
     $validation = Invoke-ChaosStudyOperation -Kind 'config.validate' -Arguments @{ cliArgs = $scoping } `
         -ExpectedSchema 'validation.v1' -Adapter $Adapter -StudyPath $StudyPath -OperationHint 'preflight config validate'
 
+    $status = Get-ChaosPreflightValidationStatus -Validation $validation
+
+    # If validation failed, ask the service which grants are missing - in what-if
+    # mode only. This happens before any consent, so the operator learns that RBAC
+    # would have to be widened while there is still nothing at stake, rather than
+    # discovering it mid-run. Nothing is granted here under any circumstances.
+    $permissionPreview = $null
+    if ($status -ne 'Succeeded') {
+        $permissionPreview = Invoke-ChaosStudyOperation -Kind 'config.fixPermissions' `
+            -Arguments @{ cliArgs = ($scoping + @('--what-if')) } `
+            -ExpectedSchema 'permissionFix.v1' -Adapter $Adapter -StudyPath $StudyPath `
+            -OperationHint 'preflight fix-permissions --what-if'
+    }
+
     return [pscustomobject]@{
-        name          = $name
-        adapter       = $Adapter
-        created       = $created
-        validation    = $validation
-        status        = Get-ChaosPreflightValidationStatus -Validation $validation
+        name              = $name
+        adapter           = $Adapter
+        created           = $created
+        validation        = $validation
+        status            = $status
+        permissionPreview = $permissionPreview
         # executionPlan intentionally aliases the same validation object: config
         # validate returns the execution plan inline, so Resolve-ChaosEffectiveLegs
         # reads the plan straight from it. Not a copy-paste error - do not "dedupe".
-        executionPlan = $validation
+        executionPlan     = $validation
     }
 }
 
@@ -665,6 +680,11 @@ if (-not $SkipDiscovery) {
         preflight  = [ordered]@{
             configurationName = $preflight.name
             validationStatus  = $preflight.status
+            # What-if only. Present when preflight validation failed and the
+            # service named the grants it would need; null when it validated or
+            # when the service named nothing. Never a grant that was applied -
+            # applying one is a separate, separately consented decision at run time.
+            permissionPreview = $preflight.permissionPreview
         }
         decision   = $legsDecision.kind
         accepted   = [bool]$legsDecision.accepted
@@ -675,6 +695,12 @@ if (-not $SkipDiscovery) {
         }
     }
     $declaredVsEffective['effectivePlanHash'] = $effectivePlanHash
+
+    if ($null -ne $preflight.permissionPreview) {
+        Add-ChaosCommandTrailEntry -StudyPath $study.path -Command 'az chaos scenario config fix-permissions --what-if' -Phase 'scope' `
+            -Arguments @($preflight.name) -ExitCode 0 -Note 'preview only; nothing granted' | Out-Null
+        Write-ChaosStudyNote -Message 'Preflight validation failed on access. The grants it would need are previewed in the plan; approving them is a separate step at run time.' -Level 'warn'
+    }
 }
 else {
     # Discovery was skipped, so there is no execution plan to inspect. The
