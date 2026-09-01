@@ -1358,6 +1358,124 @@ function Test-ChaosScenarioRunTerminal {
     return ($Status -in @('Succeeded', 'Failed', 'Canceled', 'Cancelled'))
 }
 
+function Get-ChaosActionWindow {
+    <#
+    .SYNOPSIS
+        When was the action actually live? Not when we were watching.
+
+    .DESCRIPTION
+        The configured duration is a budget, not a measurement, and the two
+        coincide only for a continuous action that ran the whole window. For a
+        discrete action the fault is an instant somewhere inside the window;
+        labelling the whole window "action active" would inflate the exposure
+        by minutes and let a study claim a resilience it never tested.
+
+        So the window is derived, in order of preference, from what the service
+        reported:
+
+          continuous  the run's own start/end interval, else the per-leg times,
+                      else - only as a last resort - the interval we observed,
+                      marked approximate.
+          discrete    the per-leg action times and nothing else. With no per-leg
+                      times the window is unknown, and unknown is recorded as
+                      unknown. The configured duration is never substituted.
+
+        An unrecognised actionType is treated as discrete, because that is the
+        assumption that cannot overstate what was tested.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$Observation,
+        [AllowNull()][AllowEmptyString()][string]$ActionType,
+        [AllowNull()][object]$ObservationWindow
+    )
+
+    $continuous = Test-ChaosActionIsContinuous -ActionType $ActionType
+
+    $window = [ordered]@{
+        actionType = if ([string]::IsNullOrWhiteSpace($ActionType)) { $null } else { [string]$ActionType }
+        continuous = $continuous
+        startUtc   = $null
+        endUtc     = $null
+        source     = $null
+        timing     = 'unknown'
+        legsTotal  = 0
+        legsTimed  = 0
+        detail     = $null
+    }
+
+    # -- per-leg times ---------------------------------------------------
+    $legStarts = @()
+    $legEnds = @()
+    $legsTotal = 0
+    $legsFullyTimed = 0
+    if ($null -ne $Observation -and $Observation.PSObject.Properties.Name -contains 'actions') {
+        foreach ($leg in @($Observation.actions)) {
+            if ($null -eq $leg) { continue }
+            $legsTotal++
+            $s = ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$leg.startedAt)
+            $e = ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$leg.completedAt)
+            if ($null -ne $s) { $legStarts += $s }
+            if ($null -ne $e) { $legEnds += $e }
+            if ($null -ne $s -and $null -ne $e) { $legsFullyTimed++ }
+        }
+    }
+    $window['legsTotal'] = $legsTotal
+    $window['legsTimed'] = $legsFullyTimed
+
+    $legStart = if ($legStarts.Count -gt 0) { ($legStarts | Sort-Object)[0] } else { $null }
+    $legEnd = if ($legEnds.Count -gt 0) { ($legEnds | Sort-Object)[-1] } else { $null }
+
+    # -- run interval ----------------------------------------------------
+    $runStart = $null
+    $runEnd = $null
+    if ($null -ne $Observation) {
+        if ($Observation.PSObject.Properties.Name -contains 'startedAt') { $runStart = ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$Observation.startedAt) }
+        if ($Observation.PSObject.Properties.Name -contains 'completedAt') { $runEnd = ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$Observation.completedAt) }
+    }
+
+    $set = {
+        param($start, $end, $source, $timing, $detail)
+        $window['startUtc'] = if ($null -ne $start) { ConvertTo-ChaosUtcIso -Instant $start } else { $null }
+        $window['endUtc'] = if ($null -ne $end) { ConvertTo-ChaosUtcIso -Instant $end } else { $null }
+        $window['source'] = $source
+        $window['timing'] = $timing
+        $window['detail'] = $detail
+        return [pscustomobject]$window
+    }
+
+    if ($continuous -eq $true) {
+        if ($null -ne $runStart -and $null -ne $runEnd) {
+            return & $set $runStart $runEnd 'run' 'exact' "The action is continuous, so it was live for the whole scenario run interval the service reported."
+        }
+        if ($null -ne $legStart -and $null -ne $legEnd) {
+            return & $set $legStart $legEnd 'perLeg' 'exact' "The action is continuous and the service reported per-leg start and completion times; the window spans them."
+        }
+        if ($null -ne $ObservationWindow) {
+            return & $set (ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$ObservationWindow.startUtc)) (ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$ObservationWindow.endUtc)) 'observation' 'approximate' "The service reported no run or per-leg times, so the interval we observed stands in for the action window. It includes the time taken to start and cancel the run."
+        }
+        return & $set $null $null $null 'unknown' 'The action is continuous but neither the service nor the local observation supplied an interval.'
+    }
+
+    # Discrete, or an actionType we do not recognise. Either way the configured
+    # duration is not evidence of anything, so it is not used.
+    $kindText = if ($continuous -eq $false) { 'discrete' } else { "of an unrecognised type ('$ActionType'), so it is treated as discrete" }
+
+    if ($null -ne $legStart) {
+        $end = if ($null -ne $legEnd) { $legEnd } else { $legStart }
+        $timing = if ($legsFullyTimed -eq $legsTotal -and $legsTotal -gt 0) { 'exact' } else { 'approximate' }
+        $detail = if ($timing -eq 'exact') {
+            "The action is $kindText; the window spans the per-leg start and completion times the service reported for all $legsTotal leg(s)."
+        }
+        else {
+            "The action is $kindText; only $legsFullyTimed of $legsTotal leg(s) reported both a start and a completion, so the window is approximate."
+        }
+        return & $set $legStart $end 'perLeg' $timing $detail
+    }
+
+    return & $set $null $null $null 'unknown' "The action is $kindText and the service reported no per-leg times, so when it was actually applied is unknown. The configured duration is an observation budget and is deliberately not substituted for it."
+}
+
 function Get-ChaosScenarioRunObservation {
     <#
     .SYNOPSIS

@@ -168,12 +168,28 @@ function New-ChaosStudyReportHtml {
     # an empty cell in the delivered report; say plainly that it is unknown.
     $scopedCountText = if ($null -eq $Plan.scope.projectedResourceCount) { 'not resolved (discovery skipped)' } else { [string]$Plan.scope.projectedResourceCount }
 
+    # The configured window and the window in which the action was actually
+    # live are different facts, and a reader who conflates them will credit the
+    # system with surviving minutes of a fault that lasted an instant. Both are
+    # stated, and an unknown action window says so.
+    $observationWindowText = "$($Plan.windows.injectMinutes) minutes (configured)"
+    $actionWindowText = 'unknown - the service reported no action times'
+    $actionWindow = if ($Findings.PSObject.Properties.Name -contains 'actionWindow') { $Findings.actionWindow } else { $null }
+    if ($null -ne $actionWindow -and $actionWindow.startUtc) {
+        $actionWindowText = "$($actionWindow.startUtc) to $(if ($actionWindow.endUtc) { $actionWindow.endUtc } else { 'unknown' })"
+        if ($actionWindow.timing -ne 'exact') { $actionWindowText += " ($($actionWindow.timing))" }
+    }
+    elseif ($null -ne $actionWindow -and $actionWindow.detail) {
+        $actionWindowText = "unknown - $($actionWindow.detail)"
+    }
+
     $headerFacts = @(
         New-ChaosReportRow -Label 'Workspace' -Value $systemUnderStudy
         New-ChaosReportRow -Label 'Scoped resources' -Value $scopedCountText
         New-ChaosReportRow -Label 'Action' -Value ([string]$Plan.action.displayName)
         New-ChaosReportRow -Label 'Steady state' -Value ([string]$Plan.question.steadyState.raw)
-        New-ChaosReportRow -Label 'Injection window' -Value "$($Plan.windows.injectMinutes) minutes"
+        New-ChaosReportRow -Label 'Observation window' -Value $observationWindowText
+        New-ChaosReportRow -Label 'Action window' -Value $actionWindowText
         New-ChaosReportRow -Label 'Run started' -Value ([string]$RunRecord.startedAt)
         New-ChaosReportRow -Label 'Sealed' -Value $(if ($Manifest) { [string]$Manifest.sealedAt } else { $null })
     ) -join "`n"
@@ -230,7 +246,9 @@ $(New-ChaosReportRow -Label 'Scenario' -Value ([string]$Plan.scenario.name))
 $(New-ChaosReportRow -Label 'Action URN' -Value ([string]$Plan.action.canonicalId))
 $(New-ChaosReportRow -Label 'Action type' -Value ([string]$Plan.action.actionType))
 $(New-ChaosReportRow -Label 'Action metadata' -Value $(if ([string]$Plan.action.source -eq 'live-discovery') { 'discovered live from Microsoft.Chaos/locations/{region}/actions' } else { $null }))
-$(New-ChaosReportRow -Label 'Windows' -Value "baseline $($Plan.windows.baselineMinutes) min, injection $($Plan.windows.injectMinutes) min, recovery $($Plan.windows.recoveryMinutes) min")
+$(New-ChaosReportRow -Label 'Configured windows' -Value "baseline $($Plan.windows.baselineMinutes) min, observation $($Plan.windows.injectMinutes) min, recovery $($Plan.windows.recoveryMinutes) min")
+$(New-ChaosReportRow -Label 'Actual action window' -Value $actionWindowText)
+$(New-ChaosReportRow -Label 'Action window derived from' -Value $(if ($null -ne $actionWindow) { "$(if ($actionWindow.source) { $actionWindow.source } else { 'nothing - unavailable' }); timing $($actionWindow.timing); $($actionWindow.legsTimed) of $($actionWindow.legsTotal) leg(s) timed" } else { $null }))
 </dl>
 <h3>Scenario parameters</h3>
 <table><thead><tr><th>Parameter</th><th>Value</th></tr></thead><tbody>

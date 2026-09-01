@@ -352,8 +352,17 @@ $exerciseEvidence = Get-ChaosExerciseEvidence -Model $frozenExercise `
     -ObservedEvents $(if ($null -ne $runObservation -and $null -ne $runObservation.resourcesTouched -and $runObservation.resourcesTouched -eq 0) { 0 } else { $null }) `
     -ObservationSource $(if ($null -ne $runObservation) { 'scenario run summary (resources touched)' } else { $null })
 
+$observationWindow = New-ChaosWindow -Name 'observation' -Start $injectStart -End $injectEnd
+# What the service says about when the action was actually applied. For a
+# discrete action this is usually a much narrower slice of the observation
+# window, and where the service says nothing it stays unknown rather than
+# borrowing the configured duration.
+$actionWindow = Get-ChaosActionWindow -Observation $runObservation -ActionType $(
+    if ($plan.PSObject.Properties.Name -contains 'action' -and $null -ne $plan.action -and $plan.action.PSObject.Properties.Name -contains 'actionType') { [string]$plan.action.actionType } else { '' }
+) -ObservationWindow $observationWindow
+
 $runRecord = [ordered]@{
-    recordVersion = 'run-record.v2'
+    recordVersion = 'run-record.v3'
     studyId       = $study.studyId
     scopeHash     = $study.scopeHash
     planHash      = $plan.frozenConfigHash
@@ -380,9 +389,14 @@ $runRecord = [ordered]@{
         failure     = $failureMessage
     }
     windows       = [ordered]@{
-        pre    = $preWindow
-        during = New-ChaosWindow -Name 'during' -Start $injectStart -End $injectEnd
-        post   = $postWindow
+        pre         = $preWindow
+        # 'during' is retained under its old name because it is what the
+        # evidence files actually cover: everything we measured between
+        # starting and finishing the run. It is an observation window.
+        during      = $observationWindow
+        observation = $observationWindow
+        action      = $actionWindow
+        post        = $postWindow
     }
     evidence      = [ordered]@{
         pre    = 'evidence/pre/signals.json'

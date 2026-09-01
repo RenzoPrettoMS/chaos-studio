@@ -621,7 +621,7 @@ $scopeTypesForGates = @(@($projected) | ForEach-Object { [string]$_.resourceType
 # is precisely the error Req F exists to prevent - so nothing is inferred and the
 # gate reports the exposure as unknown until someone supplies it.
 $actionType = if ($selectedAction.PSObject.Properties.Name -contains 'actionType') { [string]$selectedAction.actionType } else { '' }
-$actionIsContinuous = ($actionType -match '(?i)continuous|cancel')
+$actionIsContinuous = (Test-ChaosActionIsContinuous -ActionType $actionType) -eq $true
 
 $vulnerableWindow = $null
 $exerciseAssumptions = @($ExerciseAssumption)

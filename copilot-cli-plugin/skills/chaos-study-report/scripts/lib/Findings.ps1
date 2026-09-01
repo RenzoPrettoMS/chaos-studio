@@ -636,6 +636,19 @@ function Build-StudyFindings {
         $limitations += 'L12'
     }
 
+    # When the action window is anything less than exact, every statement in
+    # this report about "during the action" is really about the window we
+    # watched, which is wider. That has to be said out loud rather than left
+    # for a reader to infer from a timestamp.
+    $actionWindow = $null
+    if ($RunRecord.PSObject.Properties.Name -contains 'windows' -and $null -ne $RunRecord.windows -and
+        $RunRecord.windows.PSObject.Properties.Name -contains 'action') {
+        $actionWindow = $RunRecord.windows.action
+    }
+    if ($null -ne $actionWindow -and $actionWindow.timing -ne 'exact' -and $limitations -notcontains 'L13') {
+        $limitations += 'L13'
+    }
+
     return [ordered]@{
         findingsVersion = 'findings.v1'
         studyId         = $RunRecord.studyId
@@ -643,6 +656,7 @@ function Build-StudyFindings {
         planHash        = $Plan.frozenConfigHash
         verdict         = Get-ChaosVerdict -Findings $sorted -MechanismProven $mechanismProven -Exercise $exercise
         exercise        = $exercise
+        actionWindow    = $actionWindow
         mechanismProven = $mechanismProven
         mechanismDetail = $mechanismDetail
         predicate       = [ordered]@{

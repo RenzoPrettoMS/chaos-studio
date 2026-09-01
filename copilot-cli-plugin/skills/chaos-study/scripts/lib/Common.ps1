@@ -234,6 +234,45 @@ function ConvertFrom-ChaosUtcIso {
     return [datetime]::Parse($Text, [System.Globalization.CultureInfo]::InvariantCulture, $styles)
 }
 
+function ConvertFrom-ChaosUtcIsoOrNull {
+    <#
+    .SYNOPSIS
+        Parse a timestamp that the service may or may not have supplied.
+
+    .DESCRIPTION
+        Service payloads omit or blank timestamps routinely. A missing time is
+        an unknown, never an epoch, so this returns $null rather than throwing
+        or defaulting - the caller decides what an unknown means.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    try { return ConvertFrom-ChaosUtcIso -Text $Text } catch { return $null }
+}
+
+function Test-ChaosActionIsContinuous {
+    <#
+    .SYNOPSIS
+        Is a discovered action live for a duration, or is it a single event?
+
+    .DESCRIPTION
+        The distinction decides what the configured duration MEANS. For a
+        continuous action the duration is how long the fault is present. For a
+        discrete action it is only how long we watch afterwards - the fault
+        itself is instantaneous, and treating the configured duration as
+        fault-active time would overstate the exposure by the whole window.
+
+        The answer comes from the live action metadata, never from a bundled
+        table. An unrecognised or absent actionType returns $null, and every
+        caller must treat that unknown conservatively rather than assuming
+        continuous.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$ActionType)
+    if ([string]::IsNullOrWhiteSpace($ActionType)) { return $null }
+    if ($ActionType -match '(?i)continuous|cancel') { return $true }
+    if ($ActionType -match '(?i)discrete|instant|one-?shot') { return $false }
+    return $null
+}
+
 function New-ChaosWindow {
     <#
     .SYNOPSIS
