@@ -305,6 +305,30 @@ $(New-ChaosSignalTable -Evidence $Evidence)
         }
     } else { @() }
 
+    # Residue: every resource and grant this study created, with the observed
+    # outcome of its removal and the exact command that removes what is left.
+    # A reader who has to clean up after a failed study should not have to
+    # reconstruct these from resource ids.
+    $residue = if ($Findings.PSObject.Properties.Name -contains 'residue') { $Findings.residue } else { $null }
+    $residueRows = if ($null -ne $residue -and $residue.PSObject.Properties.Name -contains 'entries') {
+        foreach ($entry in @($residue.entries)) {
+            if ($null -eq $entry) { continue }
+            $detail = if (-not [string]::IsNullOrWhiteSpace([string]$entry.error)) { [string]$entry.error }
+            elseif (-not [string]::IsNullOrWhiteSpace([string]$entry.command)) { [string]$entry.command }
+            else { 'no removal command recorded' }
+            $statusCell = if ([string]$entry.status -eq 'succeeded') {
+                ConvertTo-ChaosHtmlText -Text ([string]$entry.status)
+            } else {
+                "<strong>$(ConvertTo-ChaosHtmlText -Text ([string]$entry.status))</strong>"
+            }
+            "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string]$entry.kind))</td><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string]$entry.id))</td><td>$statusCell</td><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text $detail)</td></tr>"
+        }
+    } else { @() }
+    $residueSummaryText = if ($null -eq $residue) { 'not recorded' }
+    elseif ([int]$residue.total -eq 0) { 'nothing was created' }
+    elseif ([int]$residue.unresolved -eq 0) { "$($residue.resolved) of $($residue.total) confirmed removed" }
+    else { "$($residue.unresolved) of $($residue.total) NOT confirmed removed - see the table below" }
+
     $appendix = @"
 <dl class="kv">
 $(New-ChaosReportRow -Label 'Study id' -Value ([string]$RunRecord.studyId))
@@ -313,7 +337,9 @@ $(New-ChaosReportRow -Label 'Frozen config hash' -Value ([string]$Plan.frozenCon
 $(New-ChaosReportRow -Label 'Chaos api-version' -Value (Get-ChaosApiVersion -Name 'chaosStudio'))
 $(New-ChaosReportRow -Label 'Actions api-version' -Value (Get-ChaosApiVersion -Name 'chaosActions'))
 $(New-ChaosReportRow -Label 'Metrics api-version' -Value (Get-ChaosApiVersion -Name 'metrics'))
+$(New-ChaosReportRow -Label 'Residue' -Value $residueSummaryText)
 </dl>
+$(if (@($residueRows).Count -gt 0) { "<h3>Residue ledger</h3>`n<table><thead><tr><th>Kind</th><th>Id</th><th>Cleanup</th><th>Error or removal command</th></tr></thead><tbody>`n$($residueRows -join "`n")`n</tbody></table>" } else { '' })
 $(if (@($artifactRows).Count -gt 0) { "<h3>Artifact hashes</h3>`n<table><thead><tr><th>Artifact</th><th>SHA-256</th></tr></thead><tbody>`n$($artifactRows -join "`n")`n</tbody></table>" } else { '' })
 $(if (@($trailRows).Count -gt 0) { "<h3>Command trail</h3>`n<table><thead><tr><th>At</th><th>Command</th><th>Note</th></tr></thead><tbody>`n$($trailRows -join "`n")`n</tbody></table>" } else { '<p class="notmeasured">No command trail was recorded.</p>' })
 "@

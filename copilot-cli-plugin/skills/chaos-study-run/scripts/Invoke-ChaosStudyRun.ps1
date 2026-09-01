@@ -206,6 +206,7 @@ $preWindow = New-ChaosWindow -Name 'pre' -Start (ConvertTo-ChaosUtcIso -Instant 
 $injectStart = $null
 $injectEnd = $null
 $configurationCreated = $false
+$configurationResidueKind = $null
 $runId = $null
 $runObservation = $null
 $validationStatus = $null
@@ -233,8 +234,16 @@ try {
     $configurationName = $resolvedConfig.configurationName
     if (-not $resolvedConfig.reused) {
         $configurationCreated = $true
+        $configurationResidueKind = 'executionConfiguration'
+        Add-ChaosExecutionResidueEntry -StudyPath $studyPath -ConfigurationName $configurationName `
+            -Workspace $plan.workspace -Adapter $Adapter | Out-Null
         Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config create' `
             -Arguments @($configurationName) -ExitCode 0 | Out-Null
+    } else {
+        # The preflight configuration created during scope is what runs. It is
+        # still this study's residue, so cleanup targets that ledger entry
+        # rather than leaving it behind under a different kind.
+        $configurationResidueKind = 'preflightConfiguration'
     }
 
     $validation = $resolvedConfig.validation
@@ -287,6 +296,8 @@ and you will be asked again.
     $injectStart = Get-ChaosUtcNow
     $started = Start-ChaosStudyScenarioRun -Plan $plan -ConfigurationName $configurationName -Validation $validation -Adapter $Adapter -StudyPath $studyPath
     $runId = $started.runId
+    Add-ChaosScenarioRunResidueEntry -StudyPath $studyPath -RunId $runId -Workspace $plan.workspace `
+        -ScenarioName $plan.scenario.name -ConfigurationName $configurationName -Adapter $Adapter | Out-Null
     Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario run start' `
         -Arguments @($configurationName, $runId) -ExitCode 0 | Out-Null
 
@@ -311,12 +322,37 @@ and you will be asked again.
     $outcome = 'Failed'
     Write-ChaosStudyNote -Message "Injection failed: $failureMessage" -Level 'warn'
 } finally {
+    # Cleanup is observed, not assumed. Each removal reports what actually
+    # happened and that outcome is written to the residue ledger, so a failure
+    # here survives as unresolved residue (L14) instead of disappearing into a
+    # pipeline. Nothing in this block throws; the study may already be unwinding
+    # from a real failure and masking it would be worse than any of this.
     if ($runId) {
         Write-ChaosStudyNote -Message "Cancelling scenario run $runId."
-        Stop-ChaosStudyScenarioRun -Plan $plan -RunId $runId -Adapter $Adapter -StudyPath $studyPath
+        $cancelResidue = Invoke-ChaosResidueRemoval -StudyPath $studyPath -Kind 'scenarioRun' -Id $runId -Removal {
+            Stop-ChaosStudyScenarioRun -Plan $plan -RunId $runId -Adapter $Adapter -StudyPath $studyPath
+        }
+        if ($cancelResidue.status -ne 'succeeded') {
+            Write-ChaosStudyNote -Message "Scenario run $runId could not be confirmed cancelled: $($cancelResidue.error)" -Level 'warn'
+        }
+        Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario run cancel' `
+            -Arguments @($runId, "cleanup=$($cancelResidue.status)") -ExitCode $(if ($cancelResidue.status -eq 'succeeded') { 0 } else { 1 }) | Out-Null
     }
-    if ($configurationCreated -and -not $KeepConfiguration) {
-        Remove-ChaosStudyConfiguration -Plan $plan -ConfigurationName $configurationName -Adapter $Adapter -StudyPath $studyPath
+    if ($configurationResidueKind) {
+        if ($KeepConfiguration) {
+            Set-ChaosResidueCleanup -StudyPath $studyPath -Kind $configurationResidueKind -Id $configurationName `
+                -Status 'skipped' -ErrorText 'Kept on purpose (-KeepConfiguration).' | Out-Null
+        } else {
+            Write-ChaosStudyNote -Message "Deleting scenario configuration $configurationName."
+            $configResidue = Invoke-ChaosResidueRemoval -StudyPath $studyPath -Kind $configurationResidueKind -Id $configurationName -Removal {
+                Remove-ChaosStudyConfiguration -Plan $plan -ConfigurationName $configurationName -Adapter $Adapter -StudyPath $studyPath
+            }
+            if ($configResidue.status -ne 'succeeded') {
+                Write-ChaosStudyNote -Message "Scenario configuration $configurationName could not be confirmed deleted: $($configResidue.error)" -Level 'warn'
+            }
+            Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config delete' `
+                -Arguments @($configurationName, "cleanup=$($configResidue.status)") -ExitCode $(if ($configResidue.status -eq 'succeeded') { 0 } else { 1 }) | Out-Null
+        }
     }
 }
 
@@ -405,21 +441,32 @@ $runRecord = [ordered]@{
     }
     coverage      = $coverage
     exercise      = $exerciseEvidence
+    residue       = Get-ChaosResidueSummary -StudyPath $studyPath
 }
 
 Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'run-record.v1.json' -Content $runRecord | Out-Null
 
 $status = if ($failureMessage) { 'error' } elseif ($coverage.missing -gt 0) { 'warning' } else { 'success' }
 $touched = if ($null -ne $runObservation -and $null -ne $runObservation.resourcesTouched) { $runObservation.resourcesTouched } else { 'not reported' }
+$residueSummary = $runRecord.residue
+$residueText = if ($residueSummary.total -eq 0) {
+    'nothing created'
+} elseif ($residueSummary.unresolved -eq 0) {
+    "$($residueSummary.resolved) of $($residueSummary.total) removed"
+} else {
+    "$($residueSummary.unresolved) of $($residueSummary.total) NOT confirmed removed"
+}
 
 Write-Card -Title "Run complete - study $($study.studyId)" -Status $status -Body @"
-The scenario run has stopped and the configuration has been cleaned up. Evidence
-is recorded; it has not yet been interpreted.
+The scenario run has stopped. Cleanup outcomes are recorded in the residue
+ledger, including anything that could not be confirmed removed. Evidence is
+recorded; it has not yet been interpreted.
 "@ -Properties ([ordered]@{
     'Scenario run'      = if ($runId) { $runId } else { '(never started)' }
     'Outcome'           = $outcome
     'Resources touched' = $touched
     'Signals measured'  = "$($coverage.measured) of $($coverage.total)"
+    'Residue'           = $residueText
     'Study directory'   = $studyPath
 })
 

@@ -599,11 +599,19 @@ function Complete-ChaosStudy {
     $residuePath = Join-Path $StudyPath 'residue-ledger.json'
     $provenancePresent = Test-Path -LiteralPath $provenancePath
     $residuePresent = Test-Path -LiteralPath $residuePath
+    # Unresolved residue does not block sealing - a study whose cleanup failed is
+    # still a real study - but the seal must carry the count, so no reader can
+    # take a sealed manifest as proof that nothing was left behind.
+    $residueUnresolved = $null
+    if ($residuePresent -and (Get-Command Get-ChaosResidueSummary -ErrorAction SilentlyContinue)) {
+        try { $residueUnresolved = [int](Get-ChaosResidueSummary -StudyPath $StudyPath).unresolved } catch { $residueUnresolved = $null }
+    }
     $compliance = [ordered]@{
         provenanceHash     = if ($provenancePresent) { Get-ChaosSha256 -Path $provenancePath } else { $null }
         residueLedgerHash  = if ($residuePresent) { Get-ChaosSha256 -Path $residuePath } else { $null }
         provenancePresent  = [bool]$provenancePresent
         residueLedgerPresent = [bool]$residuePresent
+        residueUnresolved  = $residueUnresolved
         sealClass          = if ($provenancePresent -and $residuePresent) { 'compliant' } else { 'partial' }
     }
 

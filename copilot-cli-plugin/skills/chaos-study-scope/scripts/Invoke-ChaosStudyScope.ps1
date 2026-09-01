@@ -722,6 +722,13 @@ if (-not $SkipDiscovery) {
         -Workspace ([pscustomobject]@{ resourceGroup = $ResourceGroup; name = $WorkspaceName; scenario = $selectedScenario.name }) `
         -Adapter $Adapter -ValidationStatus $preflight.status -EffectivePlanHash $effectivePlanHash | Out-Null
 
+    # Only when this study created it. A reused workspace is someone else's
+    # resource and must never be listed here as ours to remove.
+    if ($workspaceCreated) {
+        Add-ChaosWorkspaceResidueEntry -StudyPath $study.path -WorkspaceName $WorkspaceName -ResourceGroup $ResourceGroup `
+            -WorkspaceId ([string]$workspace.id) -SubscriptionId $SubscriptionId -Adapter $Adapter | Out-Null
+    }
+
     Add-ChaosCommandTrailEntry -StudyPath $study.path -Command 'az chaos scenario config validate' -Phase 'scope' `
         -Arguments @($preflight.name, "executable=$($effectiveLegs.executable)", "total=$($effectiveLegs.total)") `
         -ExitCode 0 -Note "preflight legs $($effectiveLegs.executable) of $($effectiveLegs.total)" | Out-Null

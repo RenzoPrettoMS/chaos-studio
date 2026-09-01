@@ -649,6 +649,18 @@ function Build-StudyFindings {
         $limitations += 'L13'
     }
 
+    # Residue: anything this study created that it cannot show it removed. The
+    # ledger records observed cleanup outcomes, so "not confirmed removed" here
+    # means a removal was tried and failed, was deliberately skipped, or was
+    # never reached - not that nobody looked. Sealing with residue is allowed;
+    # hiding it is not.
+    $residue = $null
+    if ($RunRecord.PSObject.Properties.Name -contains 'residue') { $residue = $RunRecord.residue }
+    if ($null -ne $residue -and $residue.PSObject.Properties.Name -contains 'unresolved' -and
+        [int]$residue.unresolved -gt 0 -and $limitations -notcontains 'L14') {
+        $limitations += 'L14'
+    }
+
     return [ordered]@{
         findingsVersion = 'findings.v1'
         studyId         = $RunRecord.studyId
@@ -657,6 +669,7 @@ function Build-StudyFindings {
         verdict         = Get-ChaosVerdict -Findings $sorted -MechanismProven $mechanismProven -Exercise $exercise
         exercise        = $exercise
         actionWindow    = $actionWindow
+        residue         = $residue
         mechanismProven = $mechanismProven
         mechanismDetail = $mechanismDetail
         predicate       = [ordered]@{
