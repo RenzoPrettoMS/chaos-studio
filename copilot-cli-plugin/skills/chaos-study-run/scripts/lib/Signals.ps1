@@ -116,6 +116,30 @@ function ConvertFrom-ChaosSignalSourceSpec {
 
 # -- Collectors ------------------------------------------------------------
 
+function Get-ChaosWindowTimespan {
+    <#
+    .SYNOPSIS
+        The Azure Monitor "start/end" timespan for a study window.
+
+    .DESCRIPTION
+        New-ChaosWindow emits startUtc/endUtc - already ISO-8601 - and that is
+        the only window shape this suite produces. Reading .start/.end instead
+        finds nothing: under StrictMode that throws, and without it the timespan
+        silently becomes garbage. Both failures land in the same place, an
+        evidence window that does not describe the time we actually measured, so
+        the field names live here once rather than at each collector.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Window)
+
+    $start = [string]$Window.startUtc
+    $end = [string]$Window.endUtc
+    if ([string]::IsNullOrWhiteSpace($start) -or [string]::IsNullOrWhiteSpace($end)) {
+        throw "Window '$($Window.name)' carries no startUtc/endUtc, so no evidence window can be named for it."
+    }
+    return "$start/$end"
+}
+
 function Get-ChaosMetricSignal {
     <#
     .SYNOPSIS
@@ -139,7 +163,7 @@ function Get-ChaosMetricSignal {
         return New-ChaosSignalResult -Source $Spec.id -Window $windowName `
             -Caveat "No resource could be resolved for metric '$($Spec.metricName)'. Pin one with 'metrics:$($Spec.metricName)@<resourceId>' - a study over several scoped resources has no single implied resource."
     }
-    $timespan = "$(ConvertTo-ChaosUtcIso -Instant $Window.start)/$(ConvertTo-ChaosUtcIso -Instant $Window.end)"
+    $timespan = Get-ChaosWindowTimespan -Window $Window
     $query = [ordered]@{
         resourceId  = $metricTarget
         metric      = $Spec.metricName
@@ -168,9 +192,9 @@ function Get-ChaosMetricSignal {
 
     $series = @()
     if ($response -and $response.body -and $response.body.PSObject.Properties.Name -contains 'value') {
-        foreach ($metric in @($response.body.value)) {
-            foreach ($timeseries in @($metric.timeseries)) {
-                foreach ($point in @($timeseries.data)) {
+        foreach ($metric in @($response.body.value | Where-Object { $null -ne $_ })) {
+            foreach ($timeseries in @($metric.timeseries | Where-Object { $null -ne $_ })) {
+                foreach ($point in @($timeseries.data | Where-Object { $null -ne $_ })) {
                     $value = $null
                     foreach ($candidate in @('average', 'total', 'maximum', 'minimum', 'count')) {
                         if ($point.PSObject.Properties.Name -contains $candidate -and $null -ne $point.$candidate) {
@@ -205,7 +229,7 @@ function Get-ChaosLogSignal {
     )
 
     $windowName = $Window.name
-    $timespan = "$(ConvertTo-ChaosUtcIso -Instant $Window.start)/$(ConvertTo-ChaosUtcIso -Instant $Window.end)"
+    $timespan = Get-ChaosWindowTimespan -Window $Window
     $query = [ordered]@{ workspaceId = $Spec.workspaceId; kql = $Spec.query; timespan = $timespan }
 
     if (-not (Get-Command Invoke-ChaosStudyOperation -ErrorAction SilentlyContinue)) {
@@ -230,8 +254,8 @@ function Get-ChaosLogSignal {
     if ($response -and $response.PSObject.Properties.Name -contains 'tables') {
         $table = @($response.tables) | Select-Object -First 1
         if ($table) {
-            $columns = @($table.columns | ForEach-Object { $_.name })
-            foreach ($row in @($table.rows)) {
+            $columns = @($table.columns | Where-Object { $null -ne $_ } | ForEach-Object { $_.name })
+            foreach ($row in @($table.rows | Where-Object { $null -ne $_ })) {
                 $record = [ordered]@{}
                 for ($i = 0; $i -lt $columns.Count; $i++) { $record[$columns[$i]] = $row[$i] }
                 $rows += $record

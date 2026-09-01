@@ -90,7 +90,7 @@ function New-ChaosSignalTable {
 
     $rows = @()
     foreach ($window in @('pre', 'during', 'post')) {
-        foreach ($signal in @($Evidence.$window)) {
+        foreach ($signal in @($Evidence.$window | Where-Object { $null -ne $_ })) {
             $valueCell = if ($null -eq $signal.values) {
                 '<span class="notmeasured">not measured</span>'
             } else {
@@ -127,7 +127,7 @@ function New-ChaosFindingsHtml {
     }
 
     $blocks = foreach ($finding in $Findings) {
-        $evidence = foreach ($ref in @($finding.evidence)) {
+        $evidence = foreach ($ref in @($finding.evidence | Where-Object { $null -ne $_ })) {
             "$(ConvertTo-ChaosHtmlText -Text ([string]$ref.signal)) during the <strong>$(ConvertTo-ChaosHtmlText -Text ([string]$ref.window))</strong> window"
         }
         $remediation = if (@($finding.remediation).Count -gt 0) {
@@ -312,7 +312,7 @@ $(if (@($errorRows).Count -gt 0) { "<h3>Execution errors</h3>`n<table><thead><tr
 $(New-ChaosSignalTable -Evidence $Evidence)
 "@
 
-    $limitationRows = foreach ($limitation in @($Findings.limitations)) {
+    $limitationRows = foreach ($limitation in @($Findings.limitations | Where-Object { $null -ne $_ })) {
         "  <tr><td class=`"mono`">$(ConvertTo-ChaosHtmlText -Text ([string]$limitation.code))</td><td>$(ConvertTo-ChaosHtmlText -Text ([string]$limitation.text))</td></tr>"
     }
     $limitations = "<table><thead><tr><th>Code</th><th>Limitation</th></tr></thead><tbody>`n$($limitationRows -join "`n")`n</tbody></table>"

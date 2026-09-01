@@ -888,6 +888,9 @@ The validation gate will refuse this run.
 
     $afterAssignments = Get-ChaosRoleAssignmentSnapshot -Scope $scope -Adapter $Adapter -StudyPath $StudyPath
     $created = Get-ChaosRoleAssignmentDelta -Before $beforeAssignments -After $afterAssignments
+    # A null element here would become a grant we claim to have created but cannot
+    # name - the residue ledger must never carry an entry it cannot point at.
+    if ($null -ne $created) { $created = @($created | Where-Object { $null -ne $_ }) }
     $permissionFix.grantsObserved = if ($null -eq $created) { $null } else { @($created | ForEach-Object { [string]$_.id }) }
 
     if ($null -ne $created -and -not [string]::IsNullOrWhiteSpace($StudyPath)) {
@@ -1410,8 +1413,9 @@ function Get-ChaosActionWindow {
     $legEnds = @()
     $legsTotal = 0
     $legsFullyTimed = 0
-    if ($null -ne $Observation -and $Observation.PSObject.Properties.Name -contains 'actions') {
-        foreach ($leg in @($Observation.actions)) {
+    $obsActions = Get-ChaosMember -InputObject $Observation -Name 'actions'
+    if ($null -ne $obsActions) {
+        foreach ($leg in @($obsActions | Where-Object { $null -ne $_ })) {
             if ($null -eq $leg) { continue }
             $legsTotal++
             $s = ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$leg.startedAt)
@@ -1431,8 +1435,8 @@ function Get-ChaosActionWindow {
     $runStart = $null
     $runEnd = $null
     if ($null -ne $Observation) {
-        if ($Observation.PSObject.Properties.Name -contains 'startedAt') { $runStart = ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$Observation.startedAt) }
-        if ($Observation.PSObject.Properties.Name -contains 'completedAt') { $runEnd = ConvertFrom-ChaosUtcIsoOrNull -Text ([string]$Observation.completedAt) }
+        $runStart = ConvertFrom-ChaosUtcIsoOrNull -Text ([string](Get-ChaosMember -InputObject $Observation -Name 'startedAt'))
+        $runEnd = ConvertFrom-ChaosUtcIsoOrNull -Text ([string](Get-ChaosMember -InputObject $Observation -Name 'completedAt'))
     }
 
     $set = {

@@ -402,6 +402,44 @@ function ConvertTo-ChaosCanonical {
     return [string]$InputObject
 }
 
+function Get-ChaosMember {
+    <#
+    .SYNOPSIS
+        Read one field from an object that may be a dictionary or a
+        PSCustomObject.
+
+    .DESCRIPTION
+        Every artifact in this suite has two lives: an ordered dictionary while
+        it is being built in-process, and a PSCustomObject once it has been
+        written to disk and read back through ConvertFrom-Json. A guard written
+        for one shape is not merely useless against the other, it is silently
+        false - `.PSObject.Properties.Name` on a dictionary reports Count, Keys,
+        Values and IsReadOnly, never the caller's keys. The reader then
+        concludes "field absent" and carries on with a null, which is how a
+        window derived from exact per-leg times can quietly become "timing
+        unknown".
+
+        Returns $null when the field is absent, which callers read as "not
+        reported".
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$InputObject,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $InputObject) { return $null }
+
+    if ($InputObject -is [System.Collections.IDictionary]) {
+        if (-not $InputObject.Contains($Name)) { return $null }
+        return $InputObject[$Name]
+    }
+
+    $prop = $InputObject.PSObject.Properties[$Name]
+    if ($null -eq $prop) { return $null }
+    return $prop.Value
+}
+
 function ConvertTo-ChaosCanonicalJson {
     <#
     .SYNOPSIS
