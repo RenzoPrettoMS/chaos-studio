@@ -82,12 +82,14 @@ switch ($Action) {
 
     'list' {
         $rows = foreach ($entry in ($index | Sort-Object -Property studyId -Descending)) {
+            $verdicts = if ($entry.summary) { Get-ChaosStudyVerdicts -Study $entry } else { $null }
             [pscustomobject]@{
                 Study     = $entry.studyId
                 State     = $entry.state
                 Workspace = $(if ($entry.identity) { [string]$entry.identity.workspace } else { '-' })
                 Action    = $(if ($entry.identity) { [string]$entry.identity.action } else { '-' })
-                Verdict   = $(if ($entry.summary) { [string]$entry.summary.verdict } else { '-' })
+                Predicate = $(if ($verdicts -and $verdicts.predicateVerdict) { $verdicts.predicateVerdict } else { '-' })
+                Verdict   = $(if ($verdicts) { $verdicts.studyVerdict } else { '-' })
                 Findings  = $(if ($entry.summary) { $entry.summary.findingCount } else { '-' })
                 Scope     = $entry.scopeHash
             }
@@ -117,16 +119,19 @@ switch ($Action) {
             $shownAction = if ([string]::IsNullOrWhiteSpace($entry.identity.actionUrn)) { [string]$entry.identity.action } else { [string]$entry.identity.actionUrn }
             if ([string]::IsNullOrWhiteSpace($shownAction)) { $shownAction = '-' }
         }
+        $shownVerdicts = if ($entry.summary) { Get-ChaosStudyVerdicts -Study $entry } else { $null }
         Write-Card -Title "Study $($entry.studyId)" -Status 'info' -Body @"
-$(if ($entry.summary) { [string]$entry.summary.verdict } else { 'Not yet reported.' })
+$(if ($shownVerdicts) { $shownVerdicts.studyVerdict } else { 'Not yet reported.' })
 "@ -Properties ([ordered]@{
-            'State'     = $entry.state
-            'Sealed'    = $entry.sealedAt
-            'Workspace' = $(if ($entry.identity) { [string]$entry.identity.workspace } else { '-' })
-            'Scenario'  = $(if ($entry.identity) { [string]$entry.identity.scenario } else { '-' })
-            'Action'    = $shownAction
-            'Predicate' = $(if ($entry.identity) { [string]$entry.identity.predicate } else { '-' })
-            'Report'    = (Join-Path $entry.path 'report.html')
+            'State'             = $entry.state
+            'Sealed'            = $entry.sealedAt
+            'Workspace'         = $(if ($entry.identity) { [string]$entry.identity.workspace } else { '-' })
+            'Scenario'          = $(if ($entry.identity) { [string]$entry.identity.scenario } else { '-' })
+            'Action'            = $shownAction
+            'Predicate'         = $(if ($entry.identity) { [string]$entry.identity.predicate } else { '-' })
+            'Predicate verdict' = $(if ($shownVerdicts -and $shownVerdicts.predicateVerdict) { $shownVerdicts.predicateVerdict } else { '-' })
+            'Study verdict'     = $(if ($shownVerdicts) { $shownVerdicts.studyVerdict } else { '-' })
+            'Report'            = (Join-Path $entry.path 'report.html')
         })
         if (@($findings).Count -gt 0) {
             Write-Table -Title 'Findings' -Data @($findings | ForEach-Object {
@@ -181,13 +186,14 @@ $(@($comparison.reasons | ForEach-Object { "  - $_" }) -join "`n")
             default     { 'warning' }
         }
         Write-Card -Title "Comparison: $($comparison.direction)" -Status $status -Body @"
-$($baseline.studyId) ($($comparison.baseline.verdict))
-  -> $($candidate.studyId) ($($comparison.candidate.verdict))
+$($baseline.studyId): predicate $($comparison.baseline.predicateVerdict), study $($comparison.baseline.studyVerdict)
+  -> $($candidate.studyId): predicate $($comparison.candidate.predicateVerdict), study $($comparison.candidate.studyVerdict)
 "@ -Properties ([ordered]@{
-            'Verdict changed' = $comparison.verdictChanged
-            'Introduced'      = @($comparison.introduced).Count
-            'Resolved'        = @($comparison.resolved).Count
-            'Persisted'       = @($comparison.persisted).Count
+            'Predicate verdict changed' = $comparison.predicateVerdictChanged
+            'Study verdict changed'     = $comparison.verdictChanged
+            'Introduced'                = @($comparison.introduced).Count
+            'Resolved'                  = @($comparison.resolved).Count
+            'Persisted'                 = @($comparison.persisted).Count
         })
 
         foreach ($group in @(

@@ -93,13 +93,13 @@ if ($study.state -eq 'SEALED') {
     Write-Card -Title 'Study already sealed' -Status 'info' -Body @"
 Study $($study.studyId) is sealed, so its stored artifacts were left untouched.
 A fresh render was written outside the study directory instead.
-"@ -Properties ([ordered]@{ 'Report' = $fallback; 'Verdict' = $findings.verdict })
+"@ -Properties ([ordered]@{ 'Report' = $fallback; 'Predicate verdict' = $findings.predicateVerdict; 'Study verdict' = $findings.studyVerdict })
     exit (Get-ChaosStudyExitCode -Name 'Success')
 }
 
 Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'findings.v1.json' -Content $findings | Out-Null
 Save-ChaosStudyArtifact -StudyPath $studyPath -RelativePath 'report.html' -Content $html -AsText -SkipRedaction | Out-Null
-Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'report' -Command 'Invoke-ChaosStudyReport' -ExitCode 0 -Note $findings.verdict | Out-Null
+Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'report' -Command 'Invoke-ChaosStudyReport' -ExitCode 0 -Note "$($findings.predicateVerdict) / $($findings.studyVerdict)" | Out-Null
 
 $reportPath = Join-Path $studyPath 'report.html'
 if ($OutputPath) {
@@ -127,35 +127,65 @@ if (-not $NoSeal) {
         planHash      = [string]$plan.frozenConfigHash
     }
     Complete-ChaosStudy -StudyPath $studyPath -Identity $identity -Summary ([ordered]@{
-        verdict         = $findings.verdict
-        mechanismProven = $findings.mechanismProven
-        findingCount    = @($findings.findings).Count
-        worstSeverity   = $(if (@($findings.findings).Count -gt 0) { @($findings.findings)[0].severity } else { 'none' })
+        predicateVerdict = $findings.predicateVerdict
+        studyVerdict     = $findings.studyVerdict
+        verdict          = $findings.studyVerdict
+        findingsVersion  = $findings.findingsVersion
+        mechanismProven  = $findings.mechanismProven
+        findingCount     = @($findings.findings).Count
+        worstSeverity    = $(if (@($findings.findings).Count -gt 0) { @($findings.findings)[0].severity } else { 'none' })
     }) | Out-Null
 }
 
-$status = switch ($findings.verdict) {
-    'Steady state held'      { 'success' }
-    'Degraded but recovered' { 'warning' }
-    'Steady state breached'  { 'error' }
-    default                  { 'info' }
+# Status colour follows the study verdict, because that is what the operator has
+# to act on. Critical collateral is an error even when the predicate held.
+$status = switch -Wildcard ($findings.studyVerdict) {
+    'Steady state held'            { 'success' }
+    'Degraded but recovered'       { 'warning' }
+    'Steady state breached'        { 'error' }
+    'Critical collateral damage*'  { 'error' }
+    default                        { 'info' }
 }
 
 # The body states what the evidence showed. The hypothesis is what we believed
 # beforehand, so it is labelled as such rather than printed as a conclusion --
 # an "Inconclusive" verdict above a confident-sounding hypothesis reads as a pass.
-$conclusion = switch ($findings.verdict) {
-    'Steady state held' {
-        'The action was proven to have landed and the steady-state objective survived it.'
+# The predicate sentence and the study sentence are written separately: a study
+# may have done damage without the declared objective ever moving, and saying
+# "steady state breached" in that case would be false.
+$predicateSentence = switch ($findings.predicateVerdict) {
+    'Held' {
+        'The steady-state objective held while the action was live.'
     }
-    'Degraded but recovered' {
-        'The steady-state objective was breached while the action was live, and recovered within the recovery window.'
+    'Breached' {
+        'The steady-state objective was breached while the action was live.'
     }
-    'Steady state breached' {
-        'The steady-state objective was breached and had not recovered by the end of the recovery window.'
+    'Not exercised' {
+        'The steady-state objective did not move, but too little work reached the vulnerable path for that to mean anything. Treat this as untested rather than passed.'
     }
     default {
-        'The action could not be proven to have reached the scoped resources, so this study cannot support any claim about resilience to it. Treat the result as untested rather than passed.'
+        'The signal behind the steady-state objective could not be read for the action window, so no predicate outcome can be stated.'
+    }
+}
+
+$conclusion = switch -Wildcard ($findings.studyVerdict) {
+    'Steady state held' {
+        "$predicateSentence The action was also proven to have landed, so the result can be read as resilience to it."
+    }
+    'Degraded but recovered' {
+        "$predicateSentence Other signals degraded during the action and returned to their objectives afterwards."
+    }
+    'Steady state breached' {
+        "$predicateSentence It had not recovered by the end of the recovery window."
+    }
+    'Critical collateral damage*' {
+        "$predicateSentence The study nonetheless caused critical damage outside the predicate, which is why the study verdict is worse than the predicate verdict."
+    }
+    'Not exercised' {
+        $predicateSentence
+    }
+    default {
+        "$predicateSentence The action could not be proven to have reached the scoped resources, so this study cannot support any claim about resilience to it."
     }
 }
 
@@ -165,13 +195,15 @@ $conclusion
 Hypothesis stated before injection: $($plan.question.hypothesis)
 "@
 
-Write-Card -Title $findings.verdict -Status $status -Body $cardBody -Properties ([ordered]@{
-    'Study'            = $study.studyId
-    'Mechanism proven' = $findings.mechanismProven
-    'Findings'         = @($findings.findings).Count
-    'Limitations'      = (@($findings.limitations | ForEach-Object { $_.code }) -join ', ')
-    'Report'           = $reportPath
-    'Sealed'           = (-not $NoSeal)
+Write-Card -Title $findings.studyVerdict -Status $status -Body $cardBody -Properties ([ordered]@{
+    'Study'             = $study.studyId
+    'Predicate verdict' = $findings.predicateVerdict
+    'Study verdict'     = $findings.studyVerdict
+    'Mechanism proven'  = $findings.mechanismProven
+    'Findings'          = @($findings.findings).Count
+    'Limitations'       = (@($findings.limitations | ForEach-Object { $_.code }) -join ', ')
+    'Report'            = $reportPath
+    'Sealed'            = (-not $NoSeal)
 })
 
 if (@($findings.findings).Count -gt 0) {
@@ -179,6 +211,7 @@ if (@($findings.findings).Count -gt 0) {
         foreach ($finding in $findings.findings) {
             [pscustomobject]@{
                 Severity   = $finding.severity
+                Kind       = $finding.kind
                 Confidence = $finding.confidence
                 Finding    = $finding.title
             }

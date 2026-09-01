@@ -63,9 +63,18 @@ function Get-ChaosVerdictVisual {
         'Steady state held'     = @{ class = 'held'; color = '#1a7f37'; path = 'M5 10.5l3.2 3.2L15 7' }
         'Degraded but recovered' = @{ class = 'degraded'; color = '#9a6700'; path = 'M10 5v6M10 14h.01' }
         'Steady state breached' = @{ class = 'breached'; color = '#b3261e'; path = 'M6 6l8 8M14 6l-8 8' }
+        'Not exercised'         = @{ class = 'inconclusive'; color = '#6639ba'; path = 'M5 10h10' }
+        'Not evaluated'         = @{ class = 'inconclusive'; color = '#6639ba'; path = 'M5 10h10' }
+        'Held'                  = @{ class = 'held'; color = '#1a7f37'; path = 'M5 10.5l3.2 3.2L15 7' }
+        'Breached'              = @{ class = 'breached'; color = '#b3261e'; path = 'M6 6l8 8M14 6l-8 8' }
         'Inconclusive'          = @{ class = 'inconclusive'; color = '#6639ba'; path = 'M7.5 7.5a2.5 2.5 0 113.4 2.3c-.6.3-.9.8-.9 1.4M10 14h.01' }
     }
-    $shape = if ($shapes.ContainsKey($Verdict)) { $shapes[$Verdict] } else { $shapes['Inconclusive'] }
+    # Critical collateral carries the breach styling because it is real damage,
+    # while the wording itself keeps saying what happened to the predicate.
+    $shape =
+    if ($shapes.ContainsKey($Verdict)) { $shapes[$Verdict] }
+    elseif ($Verdict -like 'Critical collateral damage*') { $shapes['Steady state breached'] }
+    else { $shapes['Inconclusive'] }
     $svg = @"
 <svg width="28" height="28" viewBox="0 0 20 20" role="img" aria-label="$(ConvertTo-ChaosHtmlText -Text $Verdict)" focusable="false"><circle cx="10" cy="10" r="9" fill="none" stroke="$($shape.color)" stroke-width="1.5"/><path d="$($shape.path)" fill="none" stroke="$($shape.color)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
 "@
@@ -124,9 +133,13 @@ function New-ChaosFindingsHtml {
         $remediation = if (@($finding.remediation).Count -gt 0) {
             "<dt>Remediation</dt><dd>$(New-ChaosReportList -Items $finding.remediation)</dd>"
         } else { '' }
+        # The kind says which question the finding answers. Without it a critical
+        # collateral finding reads as a predicate failure, which is the exact
+        # confusion this contract exists to remove.
+        $kind = if ($finding.PSObject.Properties.Name -contains 'kind') { [string]$finding.kind } else { 'operational' }
         @"
 <article class="finding">
-  <h3><span class="pill $(ConvertTo-ChaosHtmlText -Text $finding.severity)">$(ConvertTo-ChaosHtmlText -Text $finding.severity)</span> $(ConvertTo-ChaosHtmlText -Text $finding.title) <span class="pill ghost">$(ConvertTo-ChaosHtmlText -Text $finding.confidence) confidence</span></h3>
+  <h3><span class="pill $(ConvertTo-ChaosHtmlText -Text $finding.severity)">$(ConvertTo-ChaosHtmlText -Text $finding.severity)</span> $(ConvertTo-ChaosHtmlText -Text $finding.title) <span class="pill ghost">$(ConvertTo-ChaosHtmlText -Text $kind)</span> <span class="pill ghost">$(ConvertTo-ChaosHtmlText -Text $finding.confidence) confidence</span></h3>
   <dl>
     <dt>Observation</dt><dd>$(ConvertTo-ChaosHtmlText -Text $finding.observation)</dd>
     <dt>Interpretation</dt><dd>$(ConvertTo-ChaosHtmlText -Text $finding.interpretation)</dd>
@@ -154,14 +167,21 @@ function New-ChaosStudyReportHtml {
     )
 
     $template = [System.IO.File]::ReadAllText((Get-ChaosReportTemplatePath))
-    $visual = Get-ChaosVerdictVisual -Verdict $Findings.verdict
+
+    # The headline is the study verdict, because that is the one a reader acts
+    # on. The predicate verdict is stated immediately beside it so the headline
+    # can never be mistaken for a statement about the declared objective.
+    $studyVerdict = if ($Findings.PSObject.Properties.Name -contains 'studyVerdict') { [string]$Findings.studyVerdict } else { [string]$Findings.verdict }
+    $predicateVerdict = if ($Findings.PSObject.Properties.Name -contains 'predicateVerdict') { [string]$Findings.predicateVerdict } else { 'Not evaluated' }
+    $verdictRationale = if ($Findings.PSObject.Properties.Name -contains 'verdictRationale') { [string]$Findings.verdictRationale } else { '' }
+    $visual = Get-ChaosVerdictVisual -Verdict $studyVerdict
     $systemUnderStudy = [string]$Plan.workspace.name
 
-    $verdictDetail = switch ($Findings.verdict) {
-        'Steady state held'      { "$($Plan.question.steadyState.raw) held throughout injection and recovery." }
-        'Degraded but recovered' { 'The service degraded during injection and returned to its objective afterwards.' }
-        'Steady state breached'  { 'The service breached its objective and did not recover within the study window.' }
-        default                  { 'This study cannot support a pass or a fail. Read the limitations before drawing a conclusion.' }
+    $verdictDetail = switch ($predicateVerdict) {
+        'Held' { "$($Plan.question.steadyState.raw) held throughout the action window and recovery." }
+        'Breached' { 'The service breached its objective and did not recover within the study window.' }
+        'Not exercised' { 'The predicate did not move, but too little work reached the vulnerable path for that to count as resilience.' }
+        default { 'The signal behind the predicate was not readable for the action window, so no predicate outcome can be stated.' }
     }
 
     # A discovery-skipped study has no verified count. Leaving it blank would put
@@ -188,6 +208,8 @@ function New-ChaosStudyReportHtml {
         New-ChaosReportRow -Label 'Scoped resources' -Value $scopedCountText
         New-ChaosReportRow -Label 'Action' -Value ([string]$Plan.action.displayName)
         New-ChaosReportRow -Label 'Steady state' -Value ([string]$Plan.question.steadyState.raw)
+        New-ChaosReportRow -Label 'Predicate verdict' -Value $predicateVerdict
+        New-ChaosReportRow -Label 'Study verdict' -Value $studyVerdict
         New-ChaosReportRow -Label 'Observation window' -Value $observationWindowText
         New-ChaosReportRow -Label 'Action window' -Value $actionWindowText
         New-ChaosReportRow -Label 'Run started' -Value ([string]$RunRecord.startedAt)
@@ -202,8 +224,9 @@ function New-ChaosStudyReportHtml {
 
     $summary = @"
 <p>$(ConvertTo-ChaosHtmlText -Text $Plan.question.hypothesis)</p>
-<p><strong>$(ConvertTo-ChaosHtmlText -Text $Findings.verdict).</strong> $(ConvertTo-ChaosHtmlText -Text $verdictDetail)
+<p><strong>$(ConvertTo-ChaosHtmlText -Text $studyVerdict).</strong> Predicate verdict: <strong>$(ConvertTo-ChaosHtmlText -Text $predicateVerdict)</strong>. $(ConvertTo-ChaosHtmlText -Text $verdictDetail)
 $(ConvertTo-ChaosHtmlText -Text $mechanismSentence)</p>
+$(if ($verdictRationale) { "<p>$(ConvertTo-ChaosHtmlText -Text $verdictRationale)</p>" })
 <p>$(ConvertTo-ChaosHtmlText -Text "Evidence covers $($RunRecord.coverage.measured) of $($RunRecord.coverage.total) signal readings across the baseline, injection and recovery windows.") $(
     if (@($Findings.findings).Count -eq 0) { 'No findings were raised.' }
     else { ConvertTo-ChaosHtmlText -Text "$(@($Findings.findings).Count) finding(s) were raised; the most severe is $(@($Findings.findings)[0].severity)." }
@@ -347,7 +370,7 @@ $(if (@($trailRows).Count -gt 0) { "<h3>Command trail</h3>`n<table><thead><tr><t
     $tokens = [ordered]@{
         '{{TITLE}}'          = ConvertTo-ChaosHtmlText -Text "Chaos study: $($Plan.action.displayName) on $systemUnderStudy"
         '{{STUDY_ID}}'       = ConvertTo-ChaosHtmlText -Text ([string]$RunRecord.studyId)
-        '{{VERDICT}}'        = ConvertTo-ChaosHtmlText -Text ([string]$Findings.verdict)
+        '{{VERDICT}}'        = ConvertTo-ChaosHtmlText -Text $studyVerdict
         '{{VERDICT_CLASS}}'  = $visual.class
         '{{VERDICT_ICON}}'   = $visual.svg
         '{{VERDICT_DETAIL}}' = ConvertTo-ChaosHtmlText -Text $verdictDetail

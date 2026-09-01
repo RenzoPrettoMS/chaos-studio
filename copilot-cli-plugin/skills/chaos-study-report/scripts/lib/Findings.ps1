@@ -23,6 +23,42 @@
 
 Set-StrictMode -Version Latest
 
+# The findings contract version. v2 split the single verdict into a predicate
+# verdict and a study verdict and gave every finding a kind, so a v1 findings
+# file cannot be read as if it were a v2 one: its `verdict` conflates two
+# questions and its findings have no kind at all. Comparisons across the
+# boundary are refused rather than silently coerced.
+$script:ChaosFindingsContractVersion = 'findings.v2'
+$script:ChaosFindingsLegacyVersions = @('findings.v1')
+
+function Get-ChaosFindingsContractVersion {
+    <#
+    .SYNOPSIS
+        The version this library writes.
+    #>
+    return $script:ChaosFindingsContractVersion
+}
+
+function Test-ChaosFindingsComparable {
+    <#
+    .SYNOPSIS
+        Whether two findings documents can be compared without lying.
+
+    .DESCRIPTION
+        Same contract version compares cleanly. A v1 document has no predicate
+        verdict and no finding kinds, so a v1-to-v2 delta would either invent
+        the missing half or quietly compare a study verdict against a predicate
+        verdict. Both are worse than refusing.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()][string]$Left,
+        [Parameter(Mandatory)][AllowNull()][string]$Right
+    )
+    $l = if ([string]::IsNullOrWhiteSpace($Left)) { 'findings.v1' } else { $Left }
+    $r = if ([string]::IsNullOrWhiteSpace($Right)) { 'findings.v1' } else { $Right }
+    return ($l -eq $r)
+}
+
 $script:ChaosLimitationText = [ordered]@{
     L1 = 'Scope - this study covers one action, one workspace scope and one window'
     L2 = 'Observability coverage - at least one signal source was unavailable'
@@ -413,6 +449,7 @@ function New-ChaosFinding {
         [Parameter(Mandatory)][string]$Observation,
         [Parameter(Mandatory)][string]$Interpretation,
         [Parameter(Mandatory)][object[]]$Evidence,
+        [ValidateSet('predicate', 'collateral', 'operational', 'residue')][string]$Kind = 'operational',
         [string[]]$Remediation = @()
     )
     if (@($Evidence).Count -eq 0) {
@@ -420,6 +457,7 @@ function New-ChaosFinding {
     }
     return [ordered]@{
         findingKey     = $Key
+        kind           = $Kind
         title          = $Title
         severity       = $Severity
         confidence     = $Confidence
@@ -454,10 +492,149 @@ function Get-ChaosFindingKey {
     return Get-ChaosDigest -InputObject @($identity, $Signal, $Predicate)
 }
 
+function Get-ChaosPredicateVerdict {
+    <#
+    .SYNOPSIS
+        What happened to the one thing the study said it was testing.
+
+    .DESCRIPTION
+        This verdict is deliberately narrow. It answers exactly one question -
+        did the declared steady-state predicate hold while the action was live -
+        and it answers it from the measurement, not from how the study felt.
+
+        Keeping it separate from the study verdict is the whole point. A study
+        can do real damage while the predicate holds, and a study can leave the
+        predicate untouched while everything else went fine. Collapsing both
+        into one sentence is how a report ends up claiming "steady state
+        breached" about a predicate that was never breached, or claiming a pass
+        for a run that flattened something else.
+
+        The ordering is by strength of statement about the predicate itself:
+        an observed breach outranks everything; a missing measurement means we
+        cannot speak; a predicate that held while nothing exercised it is not
+        evidence of resilience.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$PredicateDuring,
+        [AllowNull()][object]$Exercise = $null
+    )
+    if ($PredicateDuring -eq $false) { return 'Breached' }
+    if ($null -eq $PredicateDuring) { return 'Not evaluated' }
+    if ($null -ne $Exercise -and $Exercise.exercised -eq $false) { return 'Not exercised' }
+    return 'Held'
+}
+
+function Get-ChaosCriticalCollateral {
+    <#
+    .SYNOPSIS
+        Critical findings that are not about the predicate.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Findings
+    )
+    return ConvertTo-ChaosList -InputObject @($Findings | Where-Object {
+            $_.severity -eq 'critical' -and
+            ($_.PSObject.Properties.Name -contains 'kind' -or $_ -is [System.Collections.IDictionary]) -and
+            (Get-ChaosFindingKind -Finding $_) -eq 'collateral'
+        })
+}
+
+function Get-ChaosFindingKind {
+    <#
+    .SYNOPSIS
+        A finding's kind, tolerating findings.v1 objects that have none.
+    #>
+    param([Parameter(Mandatory)][object]$Finding)
+    if ($Finding -is [System.Collections.IDictionary]) {
+        if ($Finding.Contains('kind')) { return [string]$Finding['kind'] }
+        return 'operational'
+    }
+    if ($Finding.PSObject.Properties.Name -contains 'kind') { return [string]$Finding.kind }
+    return 'operational'
+}
+
+function Get-ChaosStudyVerdict {
+    <#
+    .SYNOPSIS
+        What the study as a whole concluded, which is not the same question.
+
+    .DESCRIPTION
+        The study verdict may be worse than the predicate verdict - critical
+        collateral damage matters even when the declared objective survived -
+        but it may never misdescribe the predicate. If the predicate was not
+        breached, no wording produced here is allowed to say it was. That is
+        enforced below rather than left to whoever edits the strings next.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Findings,
+        [Parameter(Mandatory)][string]$PredicateVerdict,
+        [Parameter(Mandatory)][AllowNull()][object]$MechanismProven
+    )
+
+    $collateral = ConvertTo-ChaosList -InputObject (Get-ChaosCriticalCollateral -Findings $Findings)
+    $severities = @($Findings | ForEach-Object { $_.severity })
+
+    $verdict =
+    if ($PredicateVerdict -eq 'Breached') { 'Steady state breached' }
+    elseif ($collateral.Count -gt 0) {
+        switch ($PredicateVerdict) {
+            'Held' { 'Critical collateral damage (steady state held)' }
+            'Not exercised' { 'Critical collateral damage (predicate not exercised)' }
+            default { 'Critical collateral damage (predicate not evaluated)' }
+        }
+    }
+    elseif ($PredicateVerdict -eq 'Not exercised') { 'Not exercised' }
+    elseif ($PredicateVerdict -eq 'Not evaluated') { 'Inconclusive' }
+    elseif ($MechanismProven -ne $true) { 'Inconclusive' }
+    elseif ($severities -contains 'high' -or $severities -contains 'medium') { 'Degraded but recovered' }
+    else { 'Steady state held' }
+
+    # The wording guard. A reader quotes the headline; it must never assert a
+    # breach the measurement does not support.
+    if ($PredicateVerdict -ne 'Breached' -and $verdict -eq 'Steady state breached') {
+        throw "Verdict wording guard: the study verdict claims a steady-state breach while the predicate verdict is '$PredicateVerdict'."
+    }
+
+    return $verdict
+}
+
+function Get-ChaosVerdictRationale {
+    <#
+    .SYNOPSIS
+        One sentence saying why the two verdicts differ, or that they agree.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$PredicateVerdict,
+        [Parameter(Mandatory)][string]$StudyVerdict,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Findings
+    )
+    $collateral = ConvertTo-ChaosList -InputObject (Get-ChaosCriticalCollateral -Findings $Findings)
+    if ($collateral.Count -gt 0) {
+        $titles = (@($collateral | ForEach-Object { $_.title }) -join '; ')
+        return "The declared predicate verdict is '$PredicateVerdict', but the study caused critical damage outside the predicate, so the study verdict is elevated: $titles."
+    }
+    if ($PredicateVerdict -eq 'Not exercised') {
+        return 'The predicate was measured and did not move, but the run did not produce enough eligible work for that to mean anything. This is not a pass.'
+    }
+    if ($PredicateVerdict -eq 'Not evaluated') {
+        return 'The signal that defines the predicate was not available for the action window, so the study cannot state a predicate outcome.'
+    }
+    if ($StudyVerdict -eq 'Inconclusive') {
+        return 'The predicate held, but the action was not proven to have reached the scoped resources, so the result cannot be read as resilience.'
+    }
+    return "The study verdict follows the predicate verdict: $PredicateVerdict."
+}
+
 function Get-ChaosVerdict {
     <#
     .SYNOPSIS
         One sentence a reader can quote.
+
+    .DESCRIPTION
+        Retained as the single-verdict entry point for callers that have not
+        moved to the dual-verdict contract. It composes the two verdicts rather
+        than duplicating their rules, so there is one place where the wording
+        can change.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Findings,
@@ -465,17 +642,15 @@ function Get-ChaosVerdict {
         [AllowNull()][object]$Exercise = $null
     )
     $severities = @($Findings | ForEach-Object { $_.severity })
-    if ($severities -contains 'critical') { return 'Steady state breached' }
 
-    # Not exercised is not a weaker form of inconclusive - it is a stronger
-    # statement. Inconclusive means the evidence is ambiguous; not exercised
-    # means we know the vulnerable path never carried work, so the absence of
-    # failures says nothing at all and must not be reported as resilience.
-    if ($null -ne $Exercise -and $Exercise.exercised -eq $false) { return 'Not exercised' }
+    # Without a predicate outcome to work from, a critical finding of any kind
+    # is the strongest thing this function knows.
+    $predicateVerdict =
+    if ($severities -contains 'critical') { 'Breached' }
+    elseif ($null -ne $Exercise -and $Exercise.exercised -eq $false) { 'Not exercised' }
+    else { 'Held' }
 
-    if ($MechanismProven -ne $true) { return 'Inconclusive' }
-    if ($severities -contains 'high' -or $severities -contains 'medium') { return 'Degraded but recovered' }
-    return 'Steady state held'
+    return Get-ChaosStudyVerdict -Findings $Findings -PredicateVerdict $predicateVerdict -MechanismProven $MechanismProven
 }
 
 function Build-StudyFindings {
@@ -577,6 +752,7 @@ function Build-StudyFindings {
             default { 'Recovery could not be confirmed because the signal was unavailable after injection.' }
         }
         $findings += New-ChaosFinding -Key $predicateKey `
+            -Kind 'predicate' `
             -Title "Steady state breached: $($predicate.raw)" `
             -Severity $severity -Confidence $(if ($mechanismProven) { 'high' } else { 'medium' }) `
             -Observation "During injection, $signalName violated '$($predicate.raw)'." `
@@ -592,6 +768,7 @@ function Build-StudyFindings {
     } elseif ($null -eq $predicateDuring) {
         $limitations += 'L2'
         $findings += New-ChaosFinding -Key $predicateKey `
+            -Kind 'predicate' `
             -Title "Steady state could not be evaluated: $($predicate.raw)" `
             -Severity 'medium' -Confidence 'low' `
             -Observation "No measurement of $signalName was available for the injection window." `
@@ -606,6 +783,7 @@ function Build-StudyFindings {
         $limitations += 'L3'
         $evidenceRef = @([ordered]@{ signal = 'all-sources'; window = 'during'; kind = 'mechanism' })
         $findings += New-ChaosFinding -Key (Get-ChaosFindingKey -ActionUrn $actionIdentity -Signal 'mechanism' -Predicate 'impact-proof') `
+            -Kind 'operational' `
             -Title 'Injection was not proven to reach the system' `
             -Severity 'low' -Confidence $(if ($null -eq $mechanismMoved) { 'low' } else { 'medium' }) `
             -Observation $mechanismDetail `
@@ -618,6 +796,36 @@ function Build-StudyFindings {
             )
     }
 
+    # Collateral: the run reached further than the study said it would. The
+    # count the service reports is compared against the resource count the
+    # operator consented to, because "we only touch these N" is the promise the
+    # blast radius bound is supposed to keep. Exceeding it is not a predicate
+    # result at all - it is damage the study did on its way to asking the
+    # question, and it stays visible even when the predicate held.
+    $touchedCount = $null
+    if (($RunRecord.PSObject.Properties.Name -contains 'scenarioRun') -and $null -ne $RunRecord.scenarioRun -and
+        ($RunRecord.scenarioRun.PSObject.Properties.Name -contains 'observation') -and $null -ne $RunRecord.scenarioRun.observation -and
+        ($RunRecord.scenarioRun.observation.PSObject.Properties.Name -contains 'resourcesTouched')) {
+        $touchedCount = $RunRecord.scenarioRun.observation.resourcesTouched
+    }
+    $declaredCount = $null
+    if (($Plan.scope.PSObject.Properties.Name -contains 'projectedResourceCount')) {
+        $declaredCount = $Plan.scope.projectedResourceCount
+    }
+    if ($null -ne $touchedCount -and $null -ne $declaredCount -and [int]$touchedCount -gt [int]$declaredCount) {
+        $findings += New-ChaosFinding -Key (Get-ChaosFindingKey -ActionUrn $actionIdentity -Signal 'blast-radius' -Predicate 'declared-scope') `
+            -Kind 'collateral' `
+            -Title 'The run touched more resources than the study declared' `
+            -Severity 'critical' -Confidence 'high' `
+            -Observation "The scenario run reported $touchedCount resource(s) touched against a declared scope of $declaredCount." `
+            -Interpretation 'Consent was given for a bounded blast radius and the run exceeded it. Whatever the predicate did, this study affected resources nobody agreed to expose, and that has to be treated as damage rather than as a footnote.' `
+            -Evidence @([ordered]@{ signal = 'scenarioRun.resourcesTouched'; window = 'during'; kind = 'collateral' }) `
+            -Remediation @(
+                'Reconcile the scenario configuration filters and selectors against the declared scope before repeating this study.'
+                'Confirm nothing outside the declared scope was left degraded by this run.'
+            )
+    }
+
     $missing = @(@($pre + $during + $post) | Where-Object { $null -eq $_.values })
     if ($missing.Count -gt 0 -and $limitations -notcontains 'L2') { $limitations += 'L2' }
     if ([int]$Plan.windows.injectMinutes -le 3) { $limitations += 'L7' }
@@ -626,9 +834,6 @@ function Build-StudyFindings {
     foreach ($code in @($Plan.readiness.limitationCodes)) {
         if ($code -and $limitations -notcontains $code) { $limitations += $code }
     }
-
-    $order = @{ critical = 0; high = 1; medium = 2; low = 3 }
-    $sorted = @($findings | Sort-Object -Property @{ Expression = { $order[$_.severity] } }, @{ Expression = { $_.title } })
 
     $exercise = $null
     if ($RunRecord.PSObject.Properties.Name -contains 'exercise') { $exercise = $RunRecord.exercise }
@@ -657,28 +862,62 @@ function Build-StudyFindings {
     $residue = $null
     if ($RunRecord.PSObject.Properties.Name -contains 'residue') { $residue = $RunRecord.residue }
     if ($null -ne $residue -and $residue.PSObject.Properties.Name -contains 'unresolved' -and
-        [int]$residue.unresolved -gt 0 -and $limitations -notcontains 'L14') {
-        $limitations += 'L14'
+        [int]$residue.unresolved -gt 0) {
+        if ($limitations -notcontains 'L14') { $limitations += 'L14' }
+
+        # Severity follows what was left behind, not how the cleanup failed. A
+        # stranded role assignment is a standing grant on someone's
+        # subscription; a stranded configuration is clutter. Both belong in the
+        # report, but they are not the same problem.
+        $unresolvedKinds = @(@($residue.entries) |
+            Where-Object { $_ -and $_.status -ne 'succeeded' } |
+            ForEach-Object { [string]$_.kind })
+        $residueSeverity = if (($unresolvedKinds -contains 'roleAssignment') -or ($unresolvedKinds -contains 'workspace')) { 'high' } else { 'medium' }
+        $residueList = (@(@($residue.entries) |
+                Where-Object { $_ -and $_.status -ne 'succeeded' } |
+                ForEach-Object { "$($_.kind) $($_.id) ($($_.status))" }) -join '; ')
+        $findings += New-ChaosFinding -Key (Get-ChaosFindingKey -ActionUrn $actionIdentity -Signal 'residue' -Predicate 'cleanup-confirmed') `
+            -Kind 'residue' `
+            -Title "This study left $([int]$residue.unresolved) resource(s) it could not confirm removed" `
+            -Severity $residueSeverity -Confidence 'high' `
+            -Observation "Unresolved residue: $residueList." `
+            -Interpretation 'These were created by this study and their removal was not observed to succeed. Until each one is removed by hand, the subscription still carries the cost, the access, or both.' `
+            -Evidence @([ordered]@{ signal = 'residue-ledger'; window = 'post'; kind = 'residue' }) `
+            -Remediation @(
+                'Run the exact removal command recorded against each unresolved entry in the residue ledger appendix.'
+                'Re-check the ledger after removal; the study will not retry on its own.'
+            )
     }
 
+    $order = @{ critical = 0; high = 1; medium = 2; low = 3 }
+    $sorted = @($findings | Sort-Object -Property @{ Expression = { $order[$_.severity] } }, @{ Expression = { $_.title } })
+
+    $predicateVerdict = Get-ChaosPredicateVerdict -PredicateDuring $predicateDuring -Exercise $exercise
+    $studyVerdict = Get-ChaosStudyVerdict -Findings $sorted -PredicateVerdict $predicateVerdict -MechanismProven $mechanismProven
+
     return [ordered]@{
-        findingsVersion = 'findings.v1'
-        studyId         = $RunRecord.studyId
-        scopeHash       = $RunRecord.scopeHash
-        planHash        = $Plan.frozenConfigHash
-        verdict         = Get-ChaosVerdict -Findings $sorted -MechanismProven $mechanismProven -Exercise $exercise
-        exercise        = $exercise
-        actionWindow    = $actionWindow
-        residue         = $residue
-        mechanismProven = $mechanismProven
-        mechanismDetail = $mechanismDetail
-        predicate       = [ordered]@{
+        findingsVersion  = $script:ChaosFindingsContractVersion
+        studyId          = $RunRecord.studyId
+        scopeHash        = $RunRecord.scopeHash
+        planHash         = $Plan.frozenConfigHash
+        predicateVerdict = $predicateVerdict
+        studyVerdict     = $studyVerdict
+        verdictRationale = Get-ChaosVerdictRationale -PredicateVerdict $predicateVerdict -StudyVerdict $studyVerdict -Findings $sorted
+        # Retained so a reader, a card, or an older consumer that asks for
+        # "the verdict" gets the study-level one rather than nothing.
+        verdict          = $studyVerdict
+        exercise         = $exercise
+        actionWindow     = $actionWindow
+        residue          = $residue
+        mechanismProven  = $mechanismProven
+        mechanismDetail  = $mechanismDetail
+        predicate        = [ordered]@{
             raw    = $predicate.raw
             during = $predicateDuring
             post   = $predicatePost
         }
-        findings        = @($sorted)
-        limitations     = @(
+        findings         = @($sorted)
+        limitations      = @(
             foreach ($code in ($limitations | Select-Object -Unique | Sort-Object)) {
                 [ordered]@{ code = $code; text = Get-ChaosLimitationText -Code $code }
             }
