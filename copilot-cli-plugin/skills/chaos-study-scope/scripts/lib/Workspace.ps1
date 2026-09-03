@@ -292,6 +292,34 @@ function ConvertTo-ChaosScopedResourceRecord {
     <#
     .SYNOPSIS
         Project one discovered resource into the shape the plan records.
+
+    .DESCRIPTION
+        The V2 discoveredResources payload nests the TARGET's identity under
+        `properties`, while the envelope's own `id`/`name` identify the Chaos
+        bookkeeping record - `.../workspaces/{ws}/discoveredResources/{guid}`
+        and a bare GUID. Reading the envelope therefore yields an ARM id that
+        looks plausible and is not the resource, which silently broke every
+        consumer that matches on it: blast-radius exclusions never matched, and
+        metric queries pointed at the Chaos record instead of the target.
+
+        Authoritative field names (Microsoft.Chaos DiscoveredResourceProperties,
+        identical in 2026-05-01-preview and 2026-08-01-preview):
+
+            namespace                 e.g. "Microsoft.Compute"
+            resourceName              e.g. "myVirtualMachine"
+            resourceType              UNQUALIFIED, e.g. "virtualMachines"
+            fullyQualifiedIdentifier  the target's real ARM id
+            scope, discoveredAt
+
+        Two consequences are load-bearing. `resourceType` is unqualified, so it
+        is composed with `namespace` to match the fully qualified form the
+        actions inventory publishes in `appliesTo[].resourceType`. And the
+        payload carries NO location and NO zones, so those stay null rather than
+        being invented; region resolution falls through to the workspace's own
+        location, which is a fact the service did return.
+
+        Every read is tolerant of a flattened or already-qualified projection
+        (the CLI may reshape what ARM returns), and every unknown stays null.
     #>
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Resource)
@@ -303,24 +331,90 @@ function ConvertTo-ChaosScopedResourceRecord {
         return $container.$name
     }
 
-    $properties = & $read $Resource 'properties'
-
-    $zones = @()
-    foreach ($zone in @(& $read $properties 'zones')) {
-        if ($null -eq $zone) { continue }
-        $zones += [string]$zone
+    $firstNonEmpty = {
+        param([object[]]$values)
+        foreach ($value in @($values)) {
+            $text = [string]$value
+            if (-not [string]::IsNullOrWhiteSpace($text)) { return $text }
+        }
+        return $null
     }
 
-    $resourceId = [string](& $read $properties 'resourceId')
-    if ([string]::IsNullOrWhiteSpace($resourceId)) {
-        $resourceId = [string](& $read $Resource 'id')
+    $properties = & $read $Resource 'properties'
+
+    # The target's ARM id. There is deliberately no fall back to $Resource.id:
+    # that is the Chaos record, and a wrong id is worse than a missing one.
+    $resourceId = & $firstNonEmpty @(
+        (& $read $properties 'fullyQualifiedIdentifier')
+        (& $read $Resource 'fullyQualifiedIdentifier')
+        (& $read $properties 'resourceId')
+        (& $read $Resource 'resourceId')
+    )
+
+    # Anything still unknown can often be recovered from the id itself, which is
+    # a reading of what the service returned rather than an invention.
+    $idNamespace = $null
+    $idType = $null
+    $idName = $null
+    if (-not [string]::IsNullOrWhiteSpace($resourceId) -and
+        $resourceId -match '/providers/(?<ns>[^/]+)/(?<rest>.+)$') {
+        $idNamespace = $Matches['ns']
+        $segments = @($Matches['rest'] -split '/' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($segments.Count -ge 2) {
+            $typeParts = @()
+            for ($i = 0; $i -lt $segments.Count - 1; $i += 2) { $typeParts += $segments[$i] }
+            $idType = "$idNamespace/$($typeParts -join '/')"
+            $idName = $segments[$segments.Count - 1]
+        }
+    }
+
+    $name = & $firstNonEmpty @(
+        (& $read $properties 'resourceName')
+        (& $read $Resource 'resourceName')
+        $idName
+    )
+
+    $namespace = & $firstNonEmpty @(
+        (& $read $properties 'namespace')
+        (& $read $properties 'resourceNamespace')
+        (& $read $Resource 'namespace')
+        $idNamespace
+    )
+
+    # `resourceType` arrives unqualified and must be qualified to match the
+    # actions inventory; an already-qualified value is passed through untouched.
+    $rawType = & $firstNonEmpty @(
+        (& $read $properties 'resourceType')
+        (& $read $Resource 'resourceType')
+        (& $read $properties 'type')
+    )
+    $resourceType = $null
+    if (-not [string]::IsNullOrWhiteSpace($rawType)) {
+        if ($rawType -like '*/*') { $resourceType = $rawType }
+        elseif (-not [string]::IsNullOrWhiteSpace($namespace)) { $resourceType = "$namespace/$rawType" }
+        else { $resourceType = $rawType }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($idType)) { $resourceType = $idType }
+
+    # Not published by discoveredResources. Read it if some projection supplies
+    # it; otherwise it stays unknown and callers must not pretend otherwise.
+    $location = & $firstNonEmpty @(
+        (& $read $properties 'location')
+        (& $read $Resource 'location')
+    )
+
+    $zones = @()
+    foreach ($zone in @((& $read $properties 'zones'))) {
+        if ($null -eq $zone) { continue }
+        $text = [string]$zone
+        if (-not [string]::IsNullOrWhiteSpace($text)) { $zones += $text }
     }
 
     return [pscustomobject]@{
-        name         = [string](& $read $Resource 'name')
+        name         = $name
         resourceId   = $resourceId
-        resourceType = [string](& $read $properties 'type')
-        location     = [string](& $read $properties 'location')
+        resourceType = $resourceType
+        location     = $location
         zones        = @($zones)
     }
 }

@@ -198,10 +198,14 @@ function Invoke-ChaosDesignDiscovery {
         if ([string]::IsNullOrWhiteSpace($region)) { $region = [string](Get-ChaosMember -InputObject $workspace -Name 'location') }
         if ([string]::IsNullOrWhiteSpace($region)) { throw 'The workspace did not report a location and none was supplied with -Location.' }
 
-        $actions = @(Get-ChaosAvailableAction -SubscriptionId $SubscriptionId -Region $region -Adapter $Adapter -StudyPath $Root)
+        # ConvertTo-ChaosList, never @(...): these producers return a
+        # comma-wrapped array, and @() around one turns an EMPTY result into a
+        # single phantom element - which would advertise an action and a
+        # scenario that the service never returned.
+        $actions = ConvertTo-ChaosList (Get-ChaosAvailableAction -SubscriptionId $SubscriptionId -Region $region -Adapter $Adapter -StudyPath $Root)
         $scenarios = $null
         try {
-            $scenarios = @(Get-ChaosStudyScenario -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName -Adapter $Adapter -StudyPath $Root -RecommendedOnly)
+            $scenarios = ConvertTo-ChaosList (Get-ChaosStudyScenario -SubscriptionId $SubscriptionId -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName -Adapter $Adapter -StudyPath $Root -RecommendedOnly)
         } catch {
             # Recommendations are advisory context. Losing them narrows what can
             # be shown; it does not invalidate the live action list, which is

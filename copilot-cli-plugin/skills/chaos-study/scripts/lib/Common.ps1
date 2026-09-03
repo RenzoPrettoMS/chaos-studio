@@ -15,9 +15,12 @@
 
     This file owns four things and nothing else:
 
-      1. Locating the plugin root and read-only dot-sourcing the SHIPPED
-         plugin scripts (Render.ps1, Invoke-AzChaos.ps1, Invoke-AzRest.ps1,
-         Ensure-AzLogin.ps1). The study suite never modifies them.
+      1. Locating the skill roots, and OPTIONALLY dot-sourcing the plugin's
+         `Ensure-AzLogin.ps1` when the suite happens to sit inside the full
+         plugin. Nothing required is loaded this way: the suite owns its Azure
+         transport in chaos-study/scripts/lib/AzCli.ps1, because the published
+         packages ship `skills/` alone and a reach outside it resolves to
+         nothing.
       2. Deterministic serialisation - canonical JSON and SHA-256 - so a study
          can be hashed, sealed and byte-compared.
       3. Crash-safe writes - temp file plus rename, never a partial artifact.
@@ -41,20 +44,22 @@ function Get-ChaosStudyPluginRoot { return $ChaosStudyPluginRoot }
 function Get-ChaosStudyReferenceRoot { return $ChaosStudyReferenceRoot }
 function Get-ChaosStudyLibDir { return $ChaosStudyLibDir }
 
-# -- Read-only reuse of the shipped plugin scripts --------
-# These are dot-sourced, never edited. If one is missing (a trimmed install),
-# the study suite still loads; the callers degrade explicitly rather than
-# failing at import time.
+# -- Optional reuse of the plugin's interactive login helper ----------------
+# The suite is self-contained: its Azure transport lives in AzCli.ps1 inside
+# these skill directories. The one thing worth borrowing when it happens to be
+# there is Ensure-AzLogin, an interactive sign-in helper that would be wrong to
+# reimplement. It is dot-sourced read-only, never edited, and its absence is
+# entirely normal - the sole caller guards on Get-Command before using it.
 $ChaosStudySharedScriptDir = Join-Path $ChaosStudyPluginRoot 'scripts'
 $ChaosStudyLoadedSharedScripts = @()
-foreach ($sharedName in @('Render.ps1', 'Invoke-AzRest.ps1', 'Invoke-AzChaos.ps1', 'Ensure-AzLogin.ps1')) {
+foreach ($sharedName in @('Ensure-AzLogin.ps1')) {
     $sharedPath = Join-Path $ChaosStudySharedScriptDir $sharedName
     if (Test-Path -LiteralPath $sharedPath) {
         try {
             . $sharedPath
             $ChaosStudyLoadedSharedScripts += $sharedName
         } catch {
-            [Console]::Error.WriteLine("[chaos-study] WARNING: could not load shared script '$sharedName': $($_.Exception.Message)")
+            [Console]::Error.WriteLine("[chaos-study] WARNING: could not load optional script '$sharedName': $($_.Exception.Message)")
         }
     }
 }
@@ -62,7 +67,11 @@ foreach ($sharedName in @('Render.ps1', 'Invoke-AzRest.ps1', 'Invoke-AzChaos.ps1
 function Get-ChaosSharedScriptStatus {
     <#
     .SYNOPSIS
-        Which shipped plugin scripts were available at load time.
+        Which optional plugin scripts were available at load time.
+
+    .DESCRIPTION
+        Reported for provenance only. An empty list is not a degraded state -
+        no study operation depends on anything found here.
     #>
     return [pscustomobject]@{
         directory = $ChaosStudySharedScriptDir

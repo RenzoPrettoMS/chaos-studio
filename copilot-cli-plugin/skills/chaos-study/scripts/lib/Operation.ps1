@@ -200,7 +200,7 @@ function Assert-ChaosAdapterAvailable {
         }
         $missing = @(Test-ChaosLocalAzAdapterReady)
         if ($missing.Count -gt 0) {
-            $remediation = "Install the Azure CLI and ensure the shipped plugin scripts are present, or select the 'external' adapter so a host can broker Azure access."
+            $remediation = "Install the Azure CLI and sign in with az login, or select the 'external' adapter so a host can broker Azure access."
             Write-ChaosStudyFailure -Title 'Adapter unavailable' -Message "The 'local-az' adapter cannot initialise: missing $($missing -join ', ')." -Remediation $remediation
             throw "AdapterUnavailable: local-az missing $($missing -join ', '). $remediation"
         }

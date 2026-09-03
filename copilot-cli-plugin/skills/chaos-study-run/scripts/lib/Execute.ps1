@@ -300,7 +300,7 @@ function New-ChaosStudyConfiguration {
         filters and exclusions. Creating it changes nothing in the target
         system - execution is a separate, separately-consented step.
 
-        Structured arguments go through Invoke-AzChaos -JsonArg, which writes
+        Structured arguments go through Invoke-ChaosStudyAzChaos -JsonArg, which writes
         them to a temp file. On Windows `az` is a .cmd shim that mangles
         unquoted JSON braces, so passing them inline is not reliable.
     #>

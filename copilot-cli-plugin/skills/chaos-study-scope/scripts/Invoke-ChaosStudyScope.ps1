@@ -478,7 +478,10 @@ else {
     $evaluation = Assert-ChaosWorkspaceEvaluation -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName `
         -SubscriptionId $SubscriptionId -Adapter $Adapter -StudyPath $stagingPath
 
-    $region = Get-ChaosScopeRegion -Workspace $workspace -ScopedResources $scopedResources
+    # The location is passed as an explicit string. Passing -Workspace here bound
+    # by prefix to -WorkspaceLocation and stringified the whole record into
+    # "@{name=...; location=...}", which then travelled into the actions URI.
+    $region = Get-ChaosScopeRegion -WorkspaceLocation ([string]$workspace.location) -ScopedResources $scopedResources
     if (-not $region) {
         Assert-ChaosActionDiscovery -Reason 'The workspace scope spans more than one region, so there is no single region whose action inventory applies to it.' `
             -Remediation 'Narrow the workspace scopes to one region, or pass -FilterLocation to bound the run and re-scope against that region.'
@@ -639,8 +642,8 @@ $predicate = ConvertFrom-ChaosSteadyState -Text $SteadyState
 
 $mechanismProbe = ConvertFrom-ChaosMechanismProbe -Table $MechanismProbe
 
-$blastRadius = New-ChaosBlastRadius -Location $FilterLocation -Zone $FilterZone -PhysicalZone $FilterPhysicalZone `
-    -ExcludeResource $ExcludeResource -ExcludeType $ExcludeType -ExcludeTag $ExcludeTag
+$blastRadius = New-ChaosBlastRadius -Locations $FilterLocation -Zones $FilterZone -PhysicalZones $FilterPhysicalZone `
+    -ExcludeResources $ExcludeResource -ExcludeTypes $ExcludeType -ExcludeTags $ExcludeTag
 
 $projected = ConvertTo-ChaosList (Resolve-ChaosBlastRadiusResource -ScopedResources $scopedResources -BlastRadius $blastRadius)
 

@@ -28,7 +28,7 @@ function Resolve-ChaosSignalAdapter {
     .DESCRIPTION
         Evidence collection - including the mechanism probe - must reach Azure
         through the same operation seam as everything else, never a direct
-        Invoke-AzRest. The adapter is taken from an explicit override, then the
+        Invoke-ChaosStudyAzRest. The adapter is taken from an explicit override, then the
         adapter frozen on the plan, and only then the in-process 'local-az' path
         that preserves how this suite has always collected signals. This is a
         read-only collection default, not a control-plane fallback.
@@ -178,7 +178,7 @@ function Get-ChaosMetricSignal {
     }
 
     # Probe-signal collection is routed through the operation seam - never a
-    # direct Invoke-AzRest - so the mechanism probe reaches Azure the same way
+    # direct Invoke-ChaosStudyAzRest - so the mechanism probe reaches Azure the same way
     # every other operation does and can be brokered or stubbed as one.
     $uri = "$metricTarget/providers/Microsoft.Insights/metrics?timespan=$timespan&interval=PT1M&metricnames=$($Spec.metricName)&aggregation=$($Spec.aggregation)"
     try {
@@ -315,8 +315,17 @@ function Invoke-ChaosSignalCollection {
     # A study can span many scoped resources. Only an unambiguous scope - exactly
     # one resource - implies a metric target; anything else must be pinned per
     # signal, so a number is never attributed to the wrong resource.
-    $scopedResources = @($Plan.scope.projectedResources | Where-Object { $_ -and $_.resourceId })
-    $implicitResourceId = if ($scopedResources.Count -eq 1) { [string]$scopedResources[0].resourceId } else { $null }
+    #
+    # `projectedResources` is persisted as a list of id STRINGS. Reading
+    # `.resourceId` off them threw under StrictMode on every non-empty scope,
+    # which is the normal case, so this reads both shapes exactly as the
+    # readiness gates do.
+    $scopedResourceIds = @(@($Plan.scope.projectedResources) | Where-Object { $_ } | ForEach-Object {
+            if ($_ -is [string]) { $_ }
+            elseif ($_.PSObject.Properties.Name -contains 'resourceId') { [string]$_.resourceId }
+            else { [string]$_ }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $implicitResourceId = if ($scopedResourceIds.Count -eq 1) { $scopedResourceIds[0] } else { $null }
 
     foreach ($spec in $specs) {
         if ($DryRun) {
