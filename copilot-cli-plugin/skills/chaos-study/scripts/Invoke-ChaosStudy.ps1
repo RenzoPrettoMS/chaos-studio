@@ -88,12 +88,29 @@ param(
     [Parameter(ParameterSetName = 'ListActions')]
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$Location,
 
-    [Parameter(ParameterSetName = 'Study', Mandatory)]
+    [Parameter(ParameterSetName = 'Study')]
     [Parameter(ParameterSetName = 'Brief')][string]$Scenario,
-    [Parameter(ParameterSetName = 'Study', Mandatory)]
+    [Parameter(ParameterSetName = 'Study')]
     [Parameter(ParameterSetName = 'Brief')][string]$Action,
-    [Parameter(ParameterSetName = 'Study', Mandatory)]
+    [Parameter(ParameterSetName = 'Study')]
     [Parameter(ParameterSetName = 'Brief')][string]$SteadyState,
+
+    # The system under study. chaos-study always opens with the design phase:
+    # the code is read first, then the customer is asked - one question at a
+    # time - what they want to learn. -Scenario/-Action/-SteadyState are
+    # overrides applied after that conversation, never a way to skip it.
+    [Parameter(ParameterSetName = 'Study', Mandatory)][string]$System,
+
+    # Design-conversation passthrough. The front door decides which design step
+    # is due from the brief's state; the caller only supplies the answer.
+    [Parameter(ParameterSetName = 'Study')][string]$BriefId,
+    [Parameter(ParameterSetName = 'Study')][string]$ObservationFile,
+    [Parameter(ParameterSetName = 'Study')][string]$CandidateFile,
+    [Parameter(ParameterSetName = 'Study')][string]$QuestionId,
+    [Parameter(ParameterSetName = 'Study')][string]$Answer,
+    [Parameter(ParameterSetName = 'Study')][string]$Select,
+    [Parameter(ParameterSetName = 'Study')][string]$ConfirmPhrase,
+    [Parameter(ParameterSetName = 'Study')][switch]$NoDiscovery,
 
     # A confirmed brief from chaos-study-design. Supplies every study input the
     # customer already agreed, so the decision reached in the design phase is
@@ -152,7 +169,7 @@ $reportScript = Join-Path $skillsRoot 'chaos-study-report' 'scripts' 'Invoke-Cha
 
 foreach ($required in @($designScript, $scopeScript, $runScript, $reportScript)) {
     if (-not (Test-Path -LiteralPath $required)) {
-        Write-Error-Card -Title 'Skill suite incomplete' -Body @"
+        Write-ChaosStudyFailure -Title 'Skill suite incomplete' -Message @"
 Expected phase script not found:
 
   $required
@@ -262,7 +279,7 @@ function Stop-OnPhaseFailure {
         [Parameter(Mandatory)][string]$Guidance
     )
     if ($ExitCode -eq 0) { return }
-    Write-Error-Card -Title "Study stopped in phase: $Name" -Body @"
+    Write-ChaosStudyFailure -Title "Study stopped in phase: $Name" -Message @"
 $Name exited with code $ExitCode.
 
 $Guidance
@@ -297,6 +314,245 @@ if ($PSCmdlet.ParameterSetName -in @('ListActions', 'ListScenarios')) {
     Stop-OnResumableOperation -Name $phaseName -ExitCode $code
     exit $code
 }
+
+# ---------------------------------------------------------------------------
+# Phase 0 - the design gate
+#
+# chaos-study is the opinionated front door, and the opinion is this: a study
+# nobody can state the purpose of is not worth running. So every study starts
+# here. The system is read first, the customer is then interviewed one question
+# at a time, and only a CONFIRMED brief unlocks scope, run and report.
+#
+# This is enforced in code and not only in prose, because a model that is told
+# to ask the customer will sometimes decide it already knows the answer. There
+# is deliberately no flag that skips it. -Scenario/-Action/-SteadyState are
+# overrides applied on top of the confirmed decision, never a way around it.
+# Experts who genuinely want a single phase call chaos-study-scope directly.
+# ---------------------------------------------------------------------------
+
+. (Join-Path $skillsRoot 'chaos-study-design' 'scripts' 'lib' 'Brief.ps1')
+. (Join-Path $skillsRoot 'chaos-study-design' 'scripts' 'lib' 'Interview.ps1')
+
+function Get-ChaosStudyBriefEntry {
+    <#
+        The brief this invocation is continuing: the one named by -BriefId, else
+        the newest for this system. Returns $null when the system has no brief,
+        which is the signal to open one.
+    #>
+    param([string]$Root, [string]$WantId, [string]$WantSystem)
+    $index = @(Get-ChaosBriefIndex -StudyRoot $Root)
+    if (-not [string]::IsNullOrWhiteSpace($WantId)) {
+        $found = @($index | Where-Object { $_.briefId -eq $WantId })
+        if ($found.Count -eq 0) { throw "No design brief '$WantId' exists. Run without -BriefId to open one for '$WantSystem'." }
+        return $found[0]
+    }
+    $match = @($index | Where-Object { $_.system -eq $WantSystem })
+    if ($match.Count -eq 0) { return $null }
+    return $match[0]
+}
+
+function Stop-AwaitingCustomer {
+    <#
+        Exit 26. The study is open and waiting on a person - it has not failed.
+        The card names the single next thing, so an agent has nothing to batch
+        and no reason to invent a default.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Step,
+        [Parameter(Mandatory)][string]$Body
+    )
+    Write-ChaosStudyCard -Title "Study paused - waiting ($Step)" -Body $Body
+    exit (Get-ChaosStudyExitCode -Name 'AwaitingCustomerInput')
+}
+
+function Invoke-ChaosDesignStep {
+    <#
+        Run one design step. A surfaced question (26) or a refused answer (24)
+        is a pause: it is passed straight back to the caller with instructions
+        to ask the customer, never converted into a failure or swallowed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Step,
+        [Parameter(Mandatory)][hashtable]$Arguments,
+        [string]$ResumeId
+    )
+    $stepArgs = @{} + $Arguments
+    $stepArgs['Action'] = $Step
+    $name = "chaos-study-design ($Step)"
+    $code = Invoke-ChaosPhase -Name $name -Script $designScript -Arguments $stepArgs
+
+    $awaiting = Get-ChaosStudyExitCode -Name 'AwaitingCustomerInput'
+    $incomplete = Get-ChaosStudyExitCode -Name 'DesignIncomplete'
+    if ($code -eq $awaiting -or $code -eq $incomplete) {
+        $resume = if ($ResumeId) { " -BriefId $ResumeId" } else { '' }
+        Write-ChaosStudyCard -Title 'Study paused - one question is open' -Body @"
+The design phase is holding this study open at exactly one question, printed
+above and repeated in the CHAOS-QUESTION block for machine reading.
+
+Put that question to the customer now, using your host's interactive question
+mechanism - ask_user where one exists. Ask only this question, wait for the
+reply, then resume this same brief with their own words:
+
+  -System $System$resume -QuestionId <id> -Answer '<what they actually said>'
+
+Do not batch the remaining questions. Do not answer on the customer's behalf.
+Do not fall through to scoping. Exit $code means waiting, not failing.
+"@
+        exit $code
+    }
+    Stop-OnPhaseFailure -Name $name -ExitCode $code -Guidance 'The design phase could not complete this step. Nothing has been scoped.'
+}
+
+$briefFile = $null
+if ($PSCmdlet.ParameterSetName -eq 'Brief') { $briefFile = $Brief }
+
+if ($PSCmdlet.ParameterSetName -eq 'Study') {
+    $designArgs = @{ System = $System }
+    foreach ($pass in @('StudyRoot', 'SubscriptionId', 'ResourceGroup', 'WorkspaceName', 'Location', 'Adapter')) {
+        $value = Get-Variable -Name $pass -ValueOnly -ErrorAction SilentlyContinue
+        if ($value) { $designArgs[$pass] = $value }
+    }
+    if ($NoDiscovery) { $designArgs['NoDiscovery'] = [switch]::Present }
+
+    # Each pass advances the brief by one state or stops on the customer. The
+    # bound is a guard against a state that never advances, not a policy.
+    for ($pass = 0; $pass -lt 12; $pass++) {
+        $entry = Get-ChaosStudyBriefEntry -Root $StudyRoot -WantId $BriefId -WantSystem $System
+        $state = if ($null -eq $entry) { 'NONE' } else { [string]$entry.state }
+        $here = @{} + $designArgs
+        if ($null -ne $entry) { $here['BriefId'] = $entry.briefId }
+        $resumeId = if ($null -ne $entry) { [string]$entry.briefId } else { '' }
+
+        if ($state -eq 'NONE') {
+            Invoke-ChaosDesignStep -Step 'start' -Arguments $designArgs
+            continue
+        }
+
+        if ($state -eq 'DRAFT') {
+            if ($ObservationFile) {
+                $here['ObservationFile'] = $ObservationFile
+                Invoke-ChaosDesignStep -Step 'analyze' -Arguments $here -ResumeId $resumeId
+                continue
+            }
+            Stop-AwaitingCustomer -Step 'analyze the system' -Body @"
+Brief $($entry.briefId) is open for '$System' and nothing has been read yet.
+
+Read the system before you ask the customer anything. Questions grounded in
+their code are the difference between an interview and a form. Cover what you
+can actually open, and record nothing you did not read:
+
+  application code, deployment/IaC/config, dependency graph, retry and
+  fallback and circuit-breaker behaviour, persistence paths, workload and
+  event-rate characteristics, existing telemetry and SLIs, build identity
+
+Write the findings to JSON and continue:
+
+  -System $System -BriefId $($entry.briefId) -ObservationFile <analysis.json>
+
+The interview cannot open until this is done - that ordering is the point.
+"@
+        }
+
+        if ($state -eq 'ANALYZED') {
+            if ($CandidateFile) {
+                $here['CandidateFile'] = $CandidateFile
+                Invoke-ChaosDesignStep -Step 'candidates' -Arguments $here -ResumeId $resumeId
+                continue
+            }
+            Stop-AwaitingCustomer -Step 'propose candidates' -Body @"
+Brief $($entry.briefId) has the analysis. Turn it into ranked candidate
+hypotheses - each one tied to a dependency edge and a code path you actually
+read, with its failure mechanism, probe, steady-state predicate and risks.
+
+  -System $System -BriefId $($entry.briefId) -CandidateFile <candidates.json>
+
+See chaos-study-design/SKILL.md for the candidate shape.
+"@
+        }
+
+        if ($state -eq 'CANDIDATES') {
+            Invoke-ChaosDesignStep -Step 'interview' -Arguments $here -ResumeId $resumeId
+            continue
+        }
+
+        if ($state -eq 'INTERVIEWING') {
+            # Not $brief: this script takes a [string]$Brief parameter, and
+            # PowerShell variable names are case-insensitive, so assigning the
+            # brief object to $brief would silently stringify it and every
+            # member read below would come back empty.
+            $designBrief = Get-ChaosBrief -StudyRoot $StudyRoot -BriefId $entry.briefId
+            if ($null -eq $designBrief) {
+                throw "Design brief $($entry.briefId) is indexed but could not be read from $StudyRoot."
+            }
+            # A brief with no answers yet has no interview member at all, and
+            # reading one under StrictMode throws rather than returning null.
+            $recorded = Get-ChaosMember -InputObject $designBrief -Name 'interview'
+            $interviewDone = ($null -ne $recorded) -and (Test-ChaosInterviewComplete -Interview $recorded)
+            if ($interviewDone) {
+                Invoke-ChaosDesignStep -Step 'recommend' -Arguments $here -ResumeId $resumeId
+                continue
+            }
+            if ($QuestionId -and $Answer) {
+                $here['QuestionId'] = $QuestionId
+                $here['Answer'] = $Answer
+                # An answer is consumed once. Without this the next pass would
+                # replay the same one, and a completed interview would spin here
+                # instead of moving on to the recommendation.
+                $QuestionId = ''
+                $Answer = ''
+                Invoke-ChaosDesignStep -Step 'answer' -Arguments $here -ResumeId $resumeId
+                continue
+            }
+            Invoke-ChaosDesignStep -Step 'interview' -Arguments $here -ResumeId $resumeId
+            continue
+        }
+
+        if ($state -eq 'RECOMMENDED') {
+            if ($Select -and $ConfirmPhrase) {
+                $here['Select'] = $Select
+                $here['ConfirmPhrase'] = $ConfirmPhrase
+                Invoke-ChaosDesignStep -Step 'confirm' -Arguments $here -ResumeId $resumeId
+                continue
+            }
+            Invoke-ChaosDesignStep -Step 'show' -Arguments $here -ResumeId $resumeId
+            Stop-AwaitingCustomer -Step 'customer confirmation' -Body @"
+A shortlist exists for brief $($entry.briefId), and that is all it is. The
+customer has not chosen yet, so nothing may be scoped.
+
+Show them the candidates, ask which one answers the question they care about,
+and have them confirm the purpose and the risk envelope in their own words.
+Then pass their choice with the exact phrase printed alongside it:
+
+  -System $System -BriefId $($entry.briefId) -Select <candidateId> ``
+      -ConfirmPhrase '<the exact phrase for that candidate>'
+
+Do not confirm a candidate that is merely close, and do not confirm on the
+customer's behalf.
+"@
+        }
+
+        if ($state -eq 'CONFIRMED') {
+            $file = Get-ChaosBriefFile -BriefPath $entry.path
+            if (-not $file.found) { throw "Brief $($entry.briefId) is CONFIRMED but its file is missing under $($entry.path)." }
+            $briefFile = $file.path
+            Write-ChaosStudyNote -Message "Design confirmed. Study proceeds from brief $($entry.briefId)." -Level Info
+            break
+        }
+
+        throw "Design brief $($entry.briefId) is in unrecognised state '$state'."
+    }
+
+    if (-not $briefFile) {
+        Write-ChaosStudyFailure -Title 'Design did not reach a confirmed study' -Message @"
+The design conversation for '$System' did not converge on a confirmed brief.
+
+Continue it with chaos-study-design directly, or start again. Nothing has been
+scoped, armed or injected.
+"@
+        exit (Get-ChaosStudyExitCode -Name 'DesignIncomplete')
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Phase 1 - scope
 # ---------------------------------------------------------------------------
@@ -309,13 +565,13 @@ $scopeArgs = @{
     BaselineMinutes = $BaselineMinutes
     RecoveryMinutes = $RecoveryMinutes
 }
-# In Brief mode these three may be absent here and supplied by the brief, so
-# only forward what was actually stated. Passing an empty string would look
-# explicit to the hydrator and suppress the brief's value.
+# Scenario/action/steady state may be absent here and supplied by the confirmed
+# brief, so only forward what was actually stated. Passing an empty string would
+# look explicit to the hydrator and suppress the decision the customer made.
 if ($Scenario) { $scopeArgs['Scenario'] = $Scenario }
 if ($Action) { $scopeArgs['Action'] = $Action }
 if ($SteadyState) { $scopeArgs['SteadyState'] = $SteadyState }
-if ($PSCmdlet.ParameterSetName -eq 'Brief') { $scopeArgs['Brief'] = $Brief }
+if ($briefFile) { $scopeArgs['Brief'] = $briefFile }
 if ($CreateWorkspace) { $scopeArgs['CreateWorkspace'] = [switch]::Present }
 if ($Scope.Count -gt 0) { $scopeArgs['Scope'] = $Scope }
 if ($Location) { $scopeArgs['Location'] = $Location }
@@ -338,7 +594,7 @@ if ($AcceptPartialScenario) { $scopeArgs['AcceptPartialScenario'] = $AcceptParti
 if ($Parameters -and $Parameters.Count -gt 0) {
     # Hashtables cannot cross the pwsh -File boundary, so parameterised scenarios
     # are planned by calling the scope skill directly rather than through this chain.
-    Write-Error-Card -Title 'Use the scope skill for parameterised scenarios' -Body @"
+    Write-ChaosStudyFailure -Title 'Use the scope skill for parameterised scenarios' -Message @"
 -Parameters cannot be forwarded through the chained entry point.
 
 Plan the study with the scope skill directly, then continue here or with the run
@@ -404,7 +660,7 @@ those resources. A failure here is a real answer, not an obstacle to work around
 $store = if ($StudyRoot) { $StudyRoot } else { (Get-ChaosStudyRoot).path }
 $latest = Find-ChaosStudy -StudyId 'latest' -StudyRoot $store
 if (-not $latest) {
-    Write-Error-Card -Title 'Plan not found' -Body 'Scoping reported success but no study was recorded. Refusing to continue.'
+    Write-ChaosStudyFailure -Title 'Plan not found' -Message 'Scoping reported success but no study was recorded. Refusing to continue.'
     exit (Get-ChaosStudyExitCode -Name 'Error')
 }
 $studyId = $latest.studyId

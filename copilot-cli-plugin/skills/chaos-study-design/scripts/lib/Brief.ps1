@@ -175,6 +175,25 @@ function Save-ChaosBrief {
     return $Brief
 }
 
+function Get-ChaosBriefFilePath {
+    <#
+    .SYNOPSIS
+        The file a brief was written to.
+
+    .DESCRIPTION
+        Save-ChaosBrief returns the brief itself, so callers that want to tell the
+        operator where it landed need this rather than the save result. Printing
+        the object instead would put the whole brief - including its hash and
+        every nested record - into an operator-facing card.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Brief,
+        [string]$StudyRoot
+    )
+    $dir = Get-ChaosBriefPath -BriefId ([string]$Brief.briefId) -StudyRoot $StudyRoot
+    return (Join-Path $dir $ChaosBriefFileName)
+}
+
 function Get-ChaosBrief {
     <#
     .SYNOPSIS

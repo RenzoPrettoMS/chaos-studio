@@ -53,11 +53,19 @@ brief seals: the phrase keeps referring to what they actually saw.
 
 ## Usage
 
-Design is the first phase. It is normally reached through the front door:
+Design is the first phase, and the front door drives it for you — that is the
+recommended path, because it also enforces the ordering:
 
 ```powershell
-../chaos-study/scripts/Invoke-ChaosStudy.ps1 -Phase design -System "orders-api"
+../chaos-study/scripts/Invoke-ChaosStudy.ps1 -System "orders-api"
 ```
+
+The actions below are the same machine, exposed for expert use. Whichever route
+you take, exit `26` means **the study is waiting on a person**: one question is
+open. Ask the customer that single question with the host's interactive
+mechanism (`ask_user` where available), wait for their reply, pass it back with
+`-Answer`, and repeat. Never batch the questions into one message, never answer
+on the customer's behalf, and never treat `26` as a failure.
 
 ### 1. Start a brief
 
@@ -93,22 +101,28 @@ computable. Pass `-Region`/`-Workspace` to intersect with live discovery.
 
 ```powershell
 ./scripts/Invoke-ChaosStudyDesign.ps1 -Action interview -BriefId <id>
-./scripts/Invoke-ChaosStudyDesign.ps1 -Action answer -BriefId <id> -Question purpose -Answer "..."
+./scripts/Invoke-ChaosStudyDesign.ps1 -Action answer -BriefId <id> -QuestionId purpose -Answer "..."
 ```
 
-`interview` prints the single next open question. `answer` accepts or refuses it.
-A refusal leaves the question open and exits `24` — it is not an error, it is the
-skill doing its job.
+`interview` prints the single next open question and exits `26`. The question is
+also emitted between `CHAOS-QUESTION-BEGIN` / `CHAOS-QUESTION-END` as JSON —
+`questionId`, `prompt`, `why`, `choices`, `grounded` — so an orchestrator can
+ask exactly one question without parsing prose. When `choices` is present the
+answer must be one of them verbatim. `answer` accepts or refuses; a refusal
+leaves the question open and exits `24` — it is not an error, it is the skill
+doing its job.
 
 ### 5. Recommend, then confirm
 
 ```powershell
 ./scripts/Invoke-ChaosStudyDesign.ps1 -Action recommend -BriefId <id>
-./scripts/Invoke-ChaosStudyDesign.ps1 -Action confirm -BriefId <id> -Confirm "study <candidateId> on <system> <hash8>"
+./scripts/Invoke-ChaosStudyDesign.ps1 -Action confirm -BriefId <id> `
+  -Select <candidateId> -ConfirmPhrase "study <candidateId> on <system> <hash8>"
 ```
 
-`recommend` requires every question answered. `confirm` requires the exact
-case-sensitive phrase printed by `recommend`.
+`recommend` requires every question answered, and exits `26` because the choice
+is the customer's to make. `confirm` requires the exact case-sensitive phrase
+printed by `recommend`.
 
 ### 6. Hand off
 
@@ -141,6 +155,7 @@ A confirmed brief is immutable; further writes exit `13`.
 | `1`  | Unexpected failure |
 | `13` | Brief already confirmed — start a new one |
 | `24` | Design incomplete — unaccounted area, vague answer, or missing field |
+| `26` | Awaiting customer input — a question is on the table. Not a failure. Ask it, then resume. |
 
 ## What this skill does not do
 

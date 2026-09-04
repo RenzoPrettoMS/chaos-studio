@@ -640,7 +640,10 @@ else {
 
 $predicate = ConvertFrom-ChaosSteadyState -Text $SteadyState
 
-$mechanismProbe = ConvertFrom-ChaosMechanismProbe -Table $MechanismProbe
+# Not $mechanismProbe: the [hashtable]$MechanismProbe parameter shares that
+# name case-insensitively, and the assignment would coerce this object
+# into a hashtable, losing its declared field order.
+$probeSpec = ConvertFrom-ChaosMechanismProbe -Table $MechanismProbe
 
 $blastRadius = New-ChaosBlastRadius -Locations $FilterLocation -Zones $FilterZone -PhysicalZones $FilterPhysicalZone `
     -ExcludeResources $ExcludeResource -ExcludeTypes $ExcludeType -ExcludeTags $ExcludeTag
@@ -685,7 +688,7 @@ $readiness = Invoke-ChaosReadinessGates -Action $selectedAction `
     -AvailableSources $SignalSource `
     -FailureMechanism $FailureMechanism `
     -MechanismEvidence $MechanismEvidence `
-    -MechanismProbe $mechanismProbe `
+    -MechanismProbe $probeSpec `
     -ExerciseModel $exerciseModel `
     -AcceptWeakExercise:$AcceptWeakExercise `
     -DiscoverySkipped:$SkipDiscovery
@@ -828,7 +831,7 @@ $plan = [ordered]@{
         # accepts unrelated signal movement as proof.
         failureMechanism    = if ([string]::IsNullOrWhiteSpace($FailureMechanism)) { $null } else { $FailureMechanism.Trim() }
         mechanismEvidence   = if ([string]::IsNullOrWhiteSpace($MechanismEvidence)) { $null } else { $MechanismEvidence.Trim() }
-        mechanismProbe      = $mechanismProbe
+        mechanismProbe      = $probeSpec
     }
 
     exercise    = [ordered]@{

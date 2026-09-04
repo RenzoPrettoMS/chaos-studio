@@ -100,6 +100,7 @@ $ChaosStudyExit = @{
     StudyIncompatibleVersion   = 23
     DesignIncomplete           = 24
     RerunNotReproducible       = 25
+    AwaitingCustomerInput      = 26
 }
 
 function Get-ChaosStudyExitCode {

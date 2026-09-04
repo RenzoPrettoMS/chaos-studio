@@ -240,6 +240,44 @@ function Show-ChaosDesignQuestion {
     }
     $lines += @('', "Answer with:  -Action answer -BriefId $($Brief.briefId) -QuestionId $($Question.id) -Answer '<your answer>'")
     Write-ChaosStudyCard -Title 'Study design interview' -Body ($lines -join "`n")
+    Write-ChaosDesignPrompt -Question $Question -Brief $Brief
+}
+
+function Write-ChaosDesignPrompt {
+    <#
+    .SYNOPSIS
+        Emit the open question in a machine-readable form.
+
+    .DESCRIPTION
+        The card above is for a human reading a terminal. This block is for the
+        agent driving the conversation: it names exactly one question, so there
+        is nothing to batch and nothing to guess a default for. An agent should
+        put `prompt` to the customer through its own interactive question
+        mechanism - `ask_user` where the host provides one - wait for the reply,
+        and send it back with `resume`.
+
+        Printed on stdout between stable fences so it can be extracted without
+        parsing the human card.
+    #>
+    param([Parameter(Mandatory)][object]$Question, [Parameter(Mandatory)][object]$Brief)
+
+    $context = Get-ChaosMember -InputObject $Question -Name 'context'
+    $payload = [ordered]@{
+        awaiting   = 'customer-answer'
+        briefId    = $Brief.briefId
+        system     = $Brief.system
+        questionId = $Question.id
+        prompt     = $Question.prompt
+        why        = $Question.why
+        choices    = @(Get-ChaosItems -InputObject $Question.choices | Where-Object { $_ })
+        grounded   = [bool]$Question.grounded
+        context    = if ($null -ne $context) { "$($context.statement) (read from $($context.citation))" } else { $null }
+        rejections = @(Get-ChaosItems -InputObject (Get-ChaosMember -InputObject $Question -Name 'rejections')).Count
+        resume     = "-Action answer -BriefId $($Brief.briefId) -QuestionId $($Question.id) -Answer '<the customer's exact words>'"
+    }
+    Write-Output 'CHAOS-QUESTION-BEGIN'
+    Write-Output (Protect-ChaosObject -InputObject ([pscustomobject]$payload) | ConvertTo-Json -Depth 6)
+    Write-Output 'CHAOS-QUESTION-END'
 }
 
 function Show-ChaosDesignShortlist {
@@ -355,7 +393,8 @@ try {
         'start' {
             if ([string]::IsNullOrWhiteSpace($System)) { throw 'Starting a brief needs -System, a short name for the system under study.' }
             $brief = New-ChaosBrief -System $System -StudyRoot $root
-            $path = Save-ChaosBrief -Brief $brief -StudyRoot $root
+            $brief = Save-ChaosBrief -Brief $brief -StudyRoot $root
+            $path = Get-ChaosBriefFilePath -Brief $brief -StudyRoot $root
             Write-ChaosStudyCard -Title 'Study brief started' -Body @"
 Brief    $($brief.briefId)
 System   $($brief.system)
@@ -385,7 +424,8 @@ is read are generic questions, and generic questions produce generic studies.
                 Add-ChaosBriefLimitation -Brief $brief -Code "Analysis area '$($gap.area)' could not be read: $($gap.reason)" | Out-Null
             }
             Set-ChaosBriefState -Brief $brief -State 'ANALYZED' | Out-Null
-            $path = Save-ChaosBrief -Brief $brief -StudyRoot $root
+            $brief = Save-ChaosBrief -Brief $brief -StudyRoot $root
+            $path = Get-ChaosBriefFilePath -Brief $brief -StudyRoot $root
 
             $unavailable = @(Get-ChaosItems -InputObject $brief.analysis.unavailable)
             Write-ChaosStudyCard -Title 'System analysis recorded' -Body @"
@@ -416,7 +456,8 @@ breached:
             }
             $brief.candidates = @(Set-ChaosCandidateRank -Candidates @($candidates))
             Set-ChaosBriefState -Brief $brief -State 'CANDIDATES' | Out-Null
-            $path = Save-ChaosBrief -Brief $brief -StudyRoot $root
+            $brief = Save-ChaosBrief -Brief $brief -StudyRoot $root
+            $path = Get-ChaosBriefFilePath -Brief $brief -StudyRoot $root
 
             Write-ChaosStudyCard -Title 'Candidates recorded' -Body @"
 Candidates  $(@($brief.candidates).Count), each with a citable mechanism and a falsifiable predicate
@@ -447,6 +488,9 @@ Every question is answered or was established by reading the system.
 "@
             } else {
                 Show-ChaosDesignQuestion -Question $question -Brief $brief
+                # A surfaced question is a pause, not success. Exiting 0 here is
+                # what let orchestrators walk straight past the interview.
+                $exitCode = Get-ChaosStudyExitCode -Name 'AwaitingCustomerInput'
             }
         }
 
@@ -487,6 +531,7 @@ can actually do here:
                 } else {
                     Write-ChaosStudyNote -Message "Recorded '$QuestionId'." -Level Info
                     Show-ChaosDesignQuestion -Question $next -Brief $brief
+                    $exitCode = Get-ChaosStudyExitCode -Name 'AwaitingCustomerInput'
                 }
             }
         }
@@ -518,6 +563,9 @@ can actually do here:
             Set-ChaosBriefState -Brief $brief -State 'RECOMMENDED' | Out-Null
             Save-ChaosBrief -Brief $brief -StudyRoot $root | Out-Null
             Show-ChaosDesignShortlist -Brief $brief
+            # Still a pause: a shortlist is not a decision. Nothing may be scoped
+            # until the customer picks one and types the phrase back.
+            $exitCode = Get-ChaosStudyExitCode -Name 'AwaitingCustomerInput'
         }
 
         'confirm' {
@@ -544,7 +592,8 @@ can actually do here:
             }
             $brief.handoff = Get-ChaosDesignHandoff -Brief $brief -Candidate $candidate
             Set-ChaosBriefState -Brief $brief -State 'CONFIRMED' | Out-Null
-            $path = Save-ChaosBrief -Brief $brief -StudyRoot $root -AllowConfirmed
+            $brief = Save-ChaosBrief -Brief $brief -StudyRoot $root -AllowConfirmed
+            $path = Get-ChaosBriefFilePath -Brief $brief -StudyRoot $root
 
             $availability = Get-ChaosMember -InputObject $candidate -Name 'availability'
             $note = if ([string]$availability.state -eq 'provisional') {
