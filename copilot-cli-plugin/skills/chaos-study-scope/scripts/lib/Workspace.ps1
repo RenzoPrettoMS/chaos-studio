@@ -651,10 +651,9 @@ function Resolve-ChaosBlastRadiusResource {
         see the resource list a run would touch *before* consenting, instead
         of discovering it from the run summary afterwards.
 
-        It is explicitly advisory. The service resolves physical zones and tag
-        exclusions at execution time, so this cannot be exact when those are
-        used; callers surface that as a limitation rather than presenting the
-        projection as the final set.
+        It is explicitly advisory. Missing zone or location data is not a
+        mismatch: retain those candidates for service-side filtering. Physical
+        zones and tag exclusions are also resolved by the service, not locally.
     #>
     [CmdletBinding()]
     param(
@@ -665,43 +664,23 @@ function Resolve-ChaosBlastRadiusResource {
     $candidates = @(@($ScopedResources) | Where-Object { $null -ne $_ })
     if ($null -eq $BlastRadius) { return , @($candidates) }
 
-    # A filter on metadata the discovery API does not return would quietly
-    # match nothing, and an empty scope reads exactly like a workspace with no
-    # resources - so the study would report "no resources" when what actually
-    # happened is that the filter could not be evaluated at all. Refuse instead.
-    $assertFilterable = {
-        param([string]$Axis, [scriptblock]$Present)
-        if ($candidates.Count -eq 0) { return }
-        $known = @($candidates | Where-Object { & $Present $_ })
-        if ($known.Count -gt 0) { return }
-        throw ("Cannot filter by $Axis`: the Chaos Studio discovery API does not return $Axis for any of the $($candidates.Count) discovered resource(s), so the filter could not be evaluated and would silently select nothing. " +
-            "Drop -Filter$($Axis.Substring(0,1).ToUpperInvariant())$($Axis.Substring(1)) and narrow the scope with -ExcludeResource or -ExcludeType, which compare fields discovery does return.")
-    }
-
     $filters = Get-ChaosBlastRadiusMember -Container $BlastRadius -Name 'filters'
     if ($null -ne $filters) {
         $wantedLocations = Get-ChaosBlastRadiusMember -Container $filters -Name 'locations'
         if ($null -ne $wantedLocations) {
-            & $assertFilterable 'location' {
-                param($r)
-                ($r.PSObject.Properties.Name -contains 'location') -and -not [string]::IsNullOrWhiteSpace([string]$r.location)
-            }
             $locationSet = @(@($wantedLocations) | ForEach-Object { ([string]$_).ToLowerInvariant() })
             $candidates = @($candidates | Where-Object {
-                    -not [string]::IsNullOrWhiteSpace($_.location) -and $locationSet -contains $_.location.ToLowerInvariant()
+                    $location = [string](Get-ChaosBlastRadiusMember -Container $_ -Name 'location')
+                    [string]::IsNullOrWhiteSpace($location) -or $locationSet -contains $location.ToLowerInvariant()
                 })
         }
 
         $wantedZones = Get-ChaosBlastRadiusMember -Container $filters -Name 'zones'
         if ($null -ne $wantedZones) {
-            & $assertFilterable 'zone' {
-                param($r)
-                ($r.PSObject.Properties.Name -contains 'zones') -and @(@($r.zones) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -gt 0
-            }
             $zoneSet = @(@($wantedZones) | ForEach-Object { [string]$_ })
             $candidates = @($candidates | Where-Object {
-                    $owned = @(@($_.zones) | ForEach-Object { [string]$_ })
-                    @($owned | Where-Object { $zoneSet -contains $_ }).Count -gt 0
+                    $owned = @(Get-ChaosBlastRadiusMember -Container $_ -Name 'zones' | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+                    $owned.Count -eq 0 -or @($owned | Where-Object { $zoneSet -contains [string]$_ }).Count -gt 0
                 })
         }
     }
@@ -726,6 +705,37 @@ function Resolve-ChaosBlastRadiusResource {
     }
 
     return , @($candidates)
+}
+
+function Get-ChaosBlastRadiusSummary {
+    <#
+    .SYNOPSIS
+        Describe declared filters and uncertainty in the retained projection.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyCollection()][object[]]$ProjectedResources,
+        [AllowNull()][object]$BlastRadius
+    )
+
+    $filters = Get-ChaosBlastRadiusMember -Container $BlastRadius -Name 'filters'
+    foreach ($axis in @(
+        @{ name = 'zone'; filter = 'zones'; property = 'zones' }
+        @{ name = 'location'; filter = 'locations'; property = 'location' }
+    )) {
+        $declared = @(Get-ChaosBlastRadiusMember -Container $filters -Name $axis.filter | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+        if ($declared.Count -eq 0) {
+            "Declared $($axis.name) filter: none - no $($axis.name) claim."
+            continue
+        }
+        "Declared $($axis.name) filter: $(ConvertTo-Json -InputObject @($declared) -Compress). $($axis.name) confinement is enforced by the service from filters.$($axis.filter)."
+        $unknown = @($ProjectedResources | Where-Object {
+            $null -ne $_ -and @(Get-ChaosBlastRadiusMember -Container $_ -Name $axis.property | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count -eq 0
+        })
+        if ($unknown.Count -gt 0) {
+            "Discovery did not report per-resource $($axis.filter) for $($unknown.Count) resource(s); these are retained with $($axis.name) unverified. This preview does not verify any specific instance's $($axis.name)."
+        }
+    }
 }
 
 # -- 4. Scenarios ----------------------------------------------------------

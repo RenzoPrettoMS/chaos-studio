@@ -112,6 +112,10 @@ function Get-ChaosBlastRadiusProjection {
                 continue
             }
             $projected[$name] = $value
+            if ($side -eq 'filters' -and $name -in @('zones', 'locations')) {
+                # PowerShell unwraps singleton arrays returned by the accessor.
+                $projected[$name] = @($value)
+            }
         }
 
         if ($projected.Count -gt 0) { $result[$side] = [pscustomobject]$projected }

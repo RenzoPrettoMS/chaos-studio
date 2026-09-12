@@ -156,6 +156,8 @@ $($plan.question.hypothesis)
     }
 
     Write-ChaosStudyPanel -Title 'To run it' -Status 'info' -Body @"
+$(if ($plan.scope.PSObject.Properties.Name -contains 'projectionSummary') { @($plan.scope.projectionSummary) -join "`n" })
+
 Injection requires a consent phrase that names the blast radius and pins this
 exact plan. Type it exactly:
 

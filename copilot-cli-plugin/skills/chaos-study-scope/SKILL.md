@@ -35,6 +35,13 @@ The two diverge constantly — a scope grows a resource nobody remembered, or a
 resource the plan names was never onboarded and would have been silently
 skipped.
 
+**A declared filter is not verified discovery metadata.** Zone and location
+filters remain in the configuration as `filters.zones` and `filters.locations`;
+the service enforces those bounds. Local projection excludes known mismatches
+but retains resources with missing zone or location data. The scope preview
+states the declared filters and how many retained resources remain unverified.
+It does not infer a zone from a scenario version or verify a specific instance.
+
 **A steady state must be falsifiable.** `successRate >= 99.5` can be violated.
 "the service is healthy" cannot. Scoping rejects the second kind.
 

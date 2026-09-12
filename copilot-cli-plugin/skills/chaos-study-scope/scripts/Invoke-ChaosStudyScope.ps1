@@ -708,17 +708,10 @@ $probeSpec = ConvertFrom-ChaosMechanismProbe -Table $MechanismProbe
 $blastRadius = New-ChaosBlastRadius -Locations $FilterLocation -Zones $FilterZone -PhysicalZones $FilterPhysicalZone `
     -ExcludeResources $ExcludeResource -ExcludeTypes $ExcludeType -ExcludeTags $ExcludeTag
 
-# A blast-radius filter that cannot be evaluated is a hard stop, not an empty
-# scope: silently producing zero targets is indistinguishable from a workspace
-# with nothing in it, and the operator would go looking for the wrong problem.
-try {
-    $projected = ConvertTo-ChaosList (Resolve-ChaosBlastRadiusResource -ScopedResources $scopedResources -BlastRadius $blastRadius)
-}
-catch {
-    Write-ChaosStudyFailure -Title 'Blast-radius filter cannot be evaluated' `
-        -Message ([string]$_.Exception.Message) `
-        -Remediation 'Chaos Studio''s discoveredResources payload does not publish every attribute. Narrow the study with a selector the payload does carry - -ExcludeResource or -ExcludeType - rather than one the service never returns.'
-    exit (Get-ChaosStudyExitCode -Name 'Error')
+$projected = ConvertTo-ChaosList (Resolve-ChaosBlastRadiusResource -ScopedResources $scopedResources -BlastRadius $blastRadius)
+$projectionSummary = @(Get-ChaosBlastRadiusSummary -ProjectedResources $projected -BlastRadius $blastRadius)
+foreach ($statement in $projectionSummary) {
+    Write-ChaosStudyNote -Level 'warn' -Message $statement
 }
 
 # -- Readiness -------------------------------------------------------------
@@ -957,6 +950,7 @@ $plan = [ordered]@{
         }
         projectedResourceCount = $(if ($SkipDiscovery) { $null } else { @($projected).Count })
         projectedResources     = @(@($projected) | ForEach-Object { [string]$_.resourceId })
+        projectionSummary      = @($projectionSummary)
     }
 
     scenario    = [ordered]@{
@@ -1076,6 +1070,7 @@ $summary = @(
     "Scope       $scopeHash"
     "Workspace   $WorkspaceName ($ResourceGroup) in $regionText"
     "Resources   $resourceText"
+    $projectionSummary
     "Scenario    $($selectedScenario.name)"
     "Action      $($selectedAction.displayName)  [$actionTypeText]"
     "URN         $urnText"
