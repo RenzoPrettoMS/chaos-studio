@@ -135,6 +135,12 @@ on the system under study. Two forms:
   scope holding several resources has no implied metric target, so pin it.
 - `logs:<workspaceId>#<kql>` — a Log Analytics query
 
+For metrics, the signal name is the bare metric, not its resource or aggregation.
+Readiness accepts that name or `name@resourceId` / `name@resourceId|aggregation`
+and prints the matched source. A bare name shared by metric sources on different
+resources is ambiguous and blocks readiness; pin the probe name or choose an
+unambiguous objective source. Resource correlation alone does not select a source.
+
 Name at least one signal expected to *move* under the action. That is what
 separates "resilient" from "the action never landed". Scoping checks readiness
 first: a study whose objective cannot be measured, or whose parameters do not

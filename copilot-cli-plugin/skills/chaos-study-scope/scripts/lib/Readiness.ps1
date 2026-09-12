@@ -348,12 +348,13 @@ function Test-ChaosObservabilityCoverage {
     # id, which is what previously refused every valid log objective.
     if ($null -ne $SteadyState) {
         $signal = [string]$SteadyState.signal
-        $matched = @()
-        $undecidable = @()
-        foreach ($source in @($AvailableSources)) {
-            $test = Test-ChaosSourceProducesSignal -Spec $source -SignalName $signal
-            if ($test.matched -eq $true) { $matched += $source }
-            elseif ($null -eq $test.matched) { $undecidable += $test.reason }
+        $match = Resolve-ChaosSignalSourceMatch -Sources $AvailableSources -SignalName $signal
+        $matched = @($match.matched)
+        $undecidable = @($match.undecidable)
+        if ($match.ambiguous) {
+            return New-ChaosReadinessGate -Id 'observability' -Title 'A signal can prove the fault landed' `
+                -Status 'fail' -Severity 'blocking' -Detail $match.reason `
+                -Remediation 'Choose an unambiguous signal source for the objective.' -LimitationCode 'L2'
         }
 
         if ($matched.Count -eq 0 -and $undecidable.Count -gt 0) {
@@ -373,6 +374,10 @@ function Test-ChaosObservabilityCoverage {
                 -Remediation "Name the source after the signal the objective uses, for example -SignalSource 'metrics:$signal', or project that column from the log query (``| summarize $signal = ...``)." `
                 -LimitationCode 'L2'
         }
+
+        return New-ChaosReadinessGate -Id 'observability' -Title 'A signal can prove the fault landed' `
+            -Status 'pass' -Severity 'advisory' `
+            -Detail "Objective '$signal' matches source(s): $($matched -join ', ')."
     }
 
     return New-ChaosReadinessGate -Id 'observability' -Title 'A signal can prove the fault landed' `
@@ -455,6 +460,7 @@ function Test-ChaosMechanismTraceable {
     )
 
     $problems = @()
+    $matched = @()
 
     if ([string]::IsNullOrWhiteSpace($FailureMechanism)) {
         $problems += 'no failureMechanism was stated, so the study cannot say how the action would breach the steady state'
@@ -484,15 +490,14 @@ function Test-ChaosMechanismTraceable {
             # `logs:<workspaceId>#<kql>` the signal is a column the query
             # projects, never the workspace id, so comparing the two directly
             # refused every valid log-backed probe.
-            $matched = @()
-            $undecidable = @()
-            foreach ($source in @($AvailableSources)) {
-                $test = Test-ChaosSourceProducesSignal -Spec $source -SignalName $signal
-                if ($test.matched -eq $true) { $matched += $source }
-                elseif ($null -eq $test.matched) { $undecidable += $test.reason }
-            }
+            $match = Resolve-ChaosSignalSourceMatch -Sources $AvailableSources -SignalName $signal
+            $matched = @($match.matched)
+            $undecidable = @($match.undecidable)
 
-            if ($matched.Count -eq 0) {
+            if ($match.ambiguous) {
+                $problems += $match.reason
+            }
+            elseif ($matched.Count -eq 0) {
                 $sourceList = if (@($AvailableSources).Count -gt 0) { $AvailableSources -join ', ' } else { 'none' }
                 if ($undecidable.Count -gt 0) {
                     $problems += "the mechanismProbe signal '$signal' cannot be shown to come from any configured source ($($undecidable -join ' ')); give the query's output column an explicit alias, for example ``| summarize $signal = ...``"
@@ -563,7 +568,7 @@ function Test-ChaosMechanismTraceable {
 
     return New-ChaosReadinessGate -Id 'mechanism-traceable' -Title 'The failure mechanism is stated and traceable' `
         -Status 'pass' -Severity 'blocking' `
-        -Detail "Mechanism stated and its probe ($(if ($MechanismProbe.signal) { $MechanismProbe.signal } else { 'query' }), expected to $($MechanismProbe.expectedDirection)) traces to a configured signal and a scoped resource. Truthfulness of the mechanism remains the agent's and reviewer's responsibility."
+        -Detail "Mechanism stated and its probe ($(if ($MechanismProbe.signal) { $MechanismProbe.signal } else { 'query' }), expected to $($MechanismProbe.expectedDirection)) traces to a configured signal and a scoped resource.$(if ($matched.Count -gt 0) { " Matched source(s): $($matched -join ', ')." }) Truthfulness of the mechanism remains the agent's and reviewer's responsibility."
 }
 
 function Test-ChaosInjectionWindow {

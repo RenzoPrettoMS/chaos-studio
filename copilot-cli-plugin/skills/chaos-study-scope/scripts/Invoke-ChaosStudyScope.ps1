@@ -765,7 +765,7 @@ if ($SkipDiscovery -and $limitationCodes -notcontains 'L10') { $limitationCodes 
 
 foreach ($gate in $readiness.gates) {
     $marker = switch ($gate.status) { 'pass' { 'ok' } 'fail' { 'FAIL' } default { '??' } }
-    Write-ChaosStudyNote -Message "[$marker] $($gate.title)$(if ($gate.status -ne 'pass') { " - $($gate.detail)" })"
+    Write-ChaosStudyNote -Message "[$marker] $($gate.title)$(if ($gate.status -ne 'pass' -or $gate.id -in @('observability', 'mechanism-traceable')) { " - $($gate.detail)" })"
 }
 
 Assert-ChaosReadiness -Readiness $readiness

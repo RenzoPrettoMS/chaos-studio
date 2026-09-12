@@ -32,6 +32,7 @@
 #>
 
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'SignalSource.ps1')
 
 # Clauses whose output columns become signal names. `summarize` and `project`
 # replace the row shape; `extend` adds to it. All three can introduce aliases.
@@ -216,36 +217,24 @@ function Get-ChaosSignalSourceIdentity {
     }
 
     if ($trimmed.StartsWith('metrics:', [System.StringComparison]::OrdinalIgnoreCase)) {
-        $name = $trimmed.Substring('metrics:'.Length).Trim()
-
-        # A metric source may be resource-scoped: `metrics:<resourceId>#<MetricName>`.
-        # The resource id is the *scope*, not the signal name - the name is the
-        # metric. Treating the whole remainder as the name made every
-        # resource-scoped probe untraceable, because nobody writes (or collects)
-        # a signal called '/subscriptions/../r#Availability'. Both the metric
-        # name and the fully qualified form are accepted so artifacts written
-        # either way keep matching.
-        $metricName = $name
-        $resourceId = $null
-        $hash = $name.LastIndexOf('#')
-        if ($hash -gt 0 -and $hash -lt ($name.Length - 1)) {
-            $resourceId = $name.Substring(0, $hash).Trim()
-            $metricName = $name.Substring($hash + 1).Trim()
-        }
-
-        $names = @($metricName, $name) |
+        $parsed = ConvertFrom-ChaosSignalSourceSpec -Spec $trimmed
+        $qualified = $parsed.metricName
+        if ($parsed.resourceId) { $qualified += "@$($parsed.resourceId)" }
+        $names = @($parsed.metricName, $qualified, "$qualified|$($parsed.aggregation)") |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             Select-Object -Unique
 
         return [pscustomobject]@{
             raw          = $raw
             kind         = 'metrics'
-            id           = "metrics:$name"
-            resourceId   = $resourceId
+            id           = $parsed.id
+            metricName   = $parsed.metricName
+            resourceId   = $parsed.resourceId
+            aggregation  = $parsed.aggregation
             workspaceId  = $null
             query        = $null
             names        = @($names)
-            resolved     = -not [string]::IsNullOrWhiteSpace($metricName)
+            resolved     = $true
             unnamedTerms = @()
         }
     }
@@ -340,6 +329,39 @@ function Test-ChaosSourceProducesSignal {
     }
 }
 
+function Resolve-ChaosSignalSourceMatch {
+    <#
+    .SYNOPSIS
+        Match across sources without silently choosing between resource pins.
+    #>
+    param(
+        [AllowEmptyCollection()][string[]]$Sources = @(),
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SignalName
+    )
+
+    $matched = @()
+    $undecidable = @()
+    $metricPins = @()
+    foreach ($source in $Sources) {
+        if ([string]::IsNullOrWhiteSpace($source)) { continue }
+        $test = Test-ChaosSourceProducesSignal -Spec $source -SignalName $SignalName
+        if ($test.matched -eq $true) {
+            $matched += $source
+            if ($test.identity.kind -eq 'metrics') {
+                $metricPins += ([string]$test.identity.resourceId).ToLowerInvariant()
+            }
+        }
+        elseif ($null -eq $test.matched) { $undecidable += $test.reason }
+    }
+    $ambiguous = @($metricPins | Select-Object -Unique).Count -gt 1
+    return [pscustomobject]@{
+        matched     = @($matched)
+        undecidable = @($undecidable)
+        ambiguous   = $ambiguous
+        reason      = if ($ambiguous) { "Signal '$SignalName' is ambiguous across configured sources: $($matched -join ', '). Qualify the signal with its @resourceId (and |aggregation when specified)." } else { $null }
+    }
+}
+
 function Select-ChaosSignalByName {
     <#
     .SYNOPSIS
@@ -363,6 +385,36 @@ function Select-ChaosSignalByName {
     $candidates = @(@($Signals) | Where-Object { $null -ne $_ -and $null -ne $_.values })
     if ($candidates.Count -eq 0 -or [string]::IsNullOrWhiteSpace($SignalName)) { return $null }
 
+    $configured = Resolve-ChaosSignalSourceMatch -Sources $Sources -SignalName $SignalName
+    if ($configured.ambiguous) { throw $configured.reason }
+
+    # Metric result IDs are bare names. The recorded query, not array order,
+    # identifies which resource and aggregation were actually measured.
+    $metrics = @(
+        foreach ($signal in $candidates) {
+            if ([string]$signal.source -notlike 'metrics:*') { continue }
+            $parsed = ConvertFrom-ChaosSignalSourceSpec -Spec $signal.source
+            $resource = $parsed.resourceId
+            $aggregation = $parsed.aggregation
+            if ($signal.PSObject.Properties.Name -contains 'query' -and $null -ne $signal.query) {
+                $query = $signal.query
+                if ($query -is [System.Collections.IDictionary]) {
+                    if ($query.Contains('resourceId')) { $resource = [string]$query['resourceId'] }
+                    if ($query.Contains('aggregation')) { $aggregation = [string]$query['aggregation'] }
+                } else {
+                    if ($query.PSObject.Properties.Name -contains 'resourceId') { $resource = [string]$query.resourceId }
+                    if ($query.PSObject.Properties.Name -contains 'aggregation') { $aggregation = [string]$query.aggregation }
+                }
+            }
+            $spec = "metrics:$($parsed.metricName)"
+            if ($resource) { $spec += "@$resource" }
+            $spec += "|$aggregation"
+            [pscustomobject]@{ spec = $spec; signal = $signal }
+        }
+    )
+    $measured = Resolve-ChaosSignalSourceMatch -Sources @($metrics | ForEach-Object { $_.spec }) -SignalName $SignalName
+    if ($measured.ambiguous) { throw $measured.reason }
+
     # 1. The name is a column the result actually carries.
     foreach ($signal in $candidates) {
         $map = Get-ChaosSignalValueMap -Signal $signal
@@ -371,9 +423,14 @@ function Select-ChaosSignalByName {
         }
     }
 
-    # 2. The result's own id names the signal (a metric series).
+    foreach ($metric in $metrics) {
+        if ($measured.matched -contains $metric.spec) { return $metric.signal }
+    }
+
+    # 2. The result's own id names a non-metric signal.
     foreach ($signal in $candidates) {
         $source = [string]$signal.source
+        if ($source -like 'metrics:*') { continue }
         if ($source -ceq $SignalName -or $source -ceq "metrics:$SignalName") { return $signal }
         if ($source -ieq $SignalName -or $source -ieq "metrics:$SignalName") { return $signal }
     }
@@ -384,6 +441,7 @@ function Select-ChaosSignalByName {
         if ([string]::IsNullOrWhiteSpace($spec)) { continue }
         $test = Test-ChaosSourceProducesSignal -Spec $spec -SignalName $SignalName
         if ($test.matched -ne $true) { continue }
+        if ($test.identity.kind -eq 'metrics') { continue }
         $id = [string]$test.identity.id
         foreach ($signal in $candidates) {
             if ([string]$signal.source -ieq $id) { return $signal }

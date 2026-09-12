@@ -1,0 +1,22 @@
+{
+  "sources": [
+    "metrics:VipAvailability@/subscriptions/018bf144-3a6d-4c13-b1d3-d100a03adc6b/resourceGroups/mc_chaos-demo-rg_chaos-demo-aks_eastus2/providers/Microsoft.Network/publicIPAddresses/kubernetes-a5b4c151ae9af4a2b98eda1b20307309|Average",
+    "metrics:VmAvailabilityMetric@/subscriptions/018bf144-3a6d-4c13-b1d3-d100a03adc6b/resourceGroups/MC_chaos-demo-rg_chaos-demo-aks_eastus2/providers/Microsoft.Compute/virtualMachineScaleSets/aks-nodepool1-10969888-vmss|Average"
+  ],
+  "steadyState": {
+    "raw": "VipAvailability >= 100",
+    "signal": "VipAvailability",
+    "comparison": ">=",
+    "threshold": 100,
+    "unit": null
+  },
+  "mechanismProbe": {
+    "signal": "VmAvailabilityMetric",
+    "query": "",
+    "expectedDirection": "down",
+    "condition": "VmAvailabilityMetric < 1",
+    "resourceCorrelation": "/subscriptions/018bf144-3a6d-4c13-b1d3-d100a03adc6b/resourceGroups/MC_chaos-demo-rg_chaos-demo-aks_eastus2/providers/Microsoft.Compute/virtualMachineScaleSets/aks-nodepool1-10969888-vmss"
+  },
+  "failureMechanism": "Reversible shutdown of only the zone-1 node in aks-nodepool1-10969888-vmss should reduce VMSS VmAvailabilityMetric and interrupt its two current store-front pods. The topology spread constraint is the control under test: replicas outside zone 1 are expected to keep the store-front public IP reachable. VIP availability measures the public IP network path; separate approved synthetic HTTP GET evidence is required to establish actual page reachability.",
+  "mechanismEvidence": "pre-vmss-instances.stdout; pre-k8s-nodes.stdout; pre-k8s-workloads.stdout; pre-k8s-pods.stdout; storefront-network-map.json; candidate-signals.stdout"
+}
