@@ -824,8 +824,8 @@ if (-not $SkipDiscovery) {
     # (Get-ChaosEffectivePlanHash), so equality means "the same legs execute"
     # rather than "two similar projections happened to agree".
     # Computed before the residue entry so the ledger records the real hash, not null.
-    $effectivePlanProjection = @(Get-ChaosEffectivePlanProjection -EffectiveLegs $effectiveLegs)
-    $effectivePlanHash = Get-ChaosDigest -InputObject $effectivePlanProjection
+    $effectivePlanProjection = Get-ChaosEffectivePlanProjection -EffectiveLegs $effectiveLegs
+    $effectivePlanHash = Get-ChaosEffectivePlanHash -ExecutionPlan $preflight.executionPlan
 
     Add-ChaosPreflightResidueEntry -StudyPath $study.path -ConfigurationName $preflight.name `
         -Workspace ([pscustomobject]@{ resourceGroup = $ResourceGroup; name = $WorkspaceName; scenario = $selectedScenario.name }) `

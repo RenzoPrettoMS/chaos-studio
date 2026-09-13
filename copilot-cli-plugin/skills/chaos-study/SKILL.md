@@ -46,6 +46,12 @@ There is no flag that skips this.
 exclusions, action, parameters and duration are frozen into the plan and hashed.
 If the plan changed after you approved it, the run refuses.
 
+**Re-scope plans frozen with the former array-shaped effective-plan hash.**
+Scope and run now share the object-shaped effective-plan hash. An existing plan
+with the old array hash will not match, even when the service returns the same
+execution plan. Re-run `chaos-study-scope` and consent to the new plan; do not edit
+the frozen hash. The run does not accept the legacy hash as a fallback.
+
 ## The six skills
 
 This is a suite, not a monolith. Use the front door — it is the only path that

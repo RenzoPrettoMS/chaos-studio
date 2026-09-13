@@ -415,6 +415,15 @@ function Get-ChaosEffectivePlanHash {
     #>
     param([AllowNull()][object]$ExecutionPlan)
 
+    # A singleton pipeline container is not another execution plan. Normalize
+    # only the outer container; skipped/undetermined selector lists stay arrays.
+    if ($ExecutionPlan -is [array] -and $ExecutionPlan.Count -eq 1) {
+        $ExecutionPlan = $ExecutionPlan[0]
+    }
     $legs = Resolve-ChaosEffectiveLeg -ExecutionPlan $ExecutionPlan
-    return Get-ChaosDigest -InputObject (Get-ChaosEffectivePlanProjection -EffectiveLegs $legs)
+    $projection = Get-ChaosEffectivePlanProjection -EffectiveLegs $legs
+    if ($projection -is [array] -and $projection.Count -eq 1) {
+        $projection = $projection[0]
+    }
+    return Get-ChaosDigest -InputObject $projection
 }

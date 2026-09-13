@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)][string]$Skills,
     [Parameter(Mandatory)][string]$StudyRoot,
-    [string]$FilterLocation = 'westus2'
+    [string]$FilterLocation = 'westus2',
+    [string]$ValidationFixture
 )
 $ErrorActionPreference = 'Stop'
 if (Get-Command az -CommandType Application -ErrorAction SilentlyContinue) { throw 'Real Azure CLI must be OFF PATH.' }
@@ -11,6 +12,21 @@ New-Item -ItemType Directory $StudyRoot -Force | Out-Null
 $global:FixtureWorkspace = '/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Chaos/workspaces/ws'
 $global:FixtureResources = Get-Content "$PSScriptRoot/live-discovered-resources.json" -Raw
 $global:FixtureTarget = ($global:FixtureResources | ConvertFrom-Json)[0].properties.fullyQualifiedIdentifier
+$global:FixtureValidation = if ($ValidationFixture) { Get-Content $ValidationFixture -Raw } else {
+    '{"status":"Succeeded","legs":[{"legSelector":"vm","action":"fixture-action","executable":true}]}'
+}
+$partialAcceptance = $null
+if ($ValidationFixture) {
+    $partialAcceptance = & {
+        . "$Skills/chaos-study-scope/scripts/lib/Readiness.ps1"
+        . "$Skills/chaos-study/scripts/lib/Study.ps1"
+        $legs = Resolve-ChaosEffectiveLegs -ExecutionPlan ($global:FixtureValidation | ConvertFrom-Json)
+        $scopeHash = Get-ChaosScopeHash -SubscriptionId sub -ResourceGroup rg -WorkspaceName ws `
+            -Scope @('/subscriptions/sub/resourceGroups/rg') -Region westus2
+        $binding = Get-ChaosEffectiveLegsBindingHash -ScopeHash $scopeHash -ScenarioName 'ZoneDown-1.0' -EffectiveLegs $legs
+        Get-ChaosPartialScenarioPhrase -EffectiveLegs $legs -BindingHash $binding
+    }
+}
 
 function global:az {
     $command = $args -join ' '
@@ -52,7 +68,7 @@ function global:az {
         return '{"name":"fixture-config"}'
     }
     if ($command -like 'chaos scenario config validate *') {
-        return '{"status":"Succeeded","legs":[{"legSelector":"vm","action":"fixture-action","executable":true}]}'
+        return $global:FixtureValidation
     }
     throw "Unexpected offline fixture operation: $command"
 }
@@ -64,5 +80,5 @@ function global:az {
     -MechanismEvidence 'Offline fixture VM' `
     -MechanismProbe @{ signal = 'Availability'; expectedDirection = 'down'; resourceCorrelation = $global:FixtureTarget } `
     -EventRatePerSecond 1 -EligibleFraction 1 -AcceptUnknownFaultDuration `
-    -FilterZone 1 -FilterLocation $FilterLocation
+    -FilterZone 1 -FilterLocation $FilterLocation -AcceptPartialScenario $partialAcceptance
 exit $LASTEXITCODE
