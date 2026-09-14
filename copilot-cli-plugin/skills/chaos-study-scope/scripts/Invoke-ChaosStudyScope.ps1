@@ -384,6 +384,7 @@ function New-ChaosPreflightConfiguration {
     #>
     param(
         [Parameter(Mandatory)][string]$StudyId,
+        [Parameter(Mandatory)][string]$SubscriptionId,
         [Parameter(Mandatory)][string]$ResourceGroup,
         [Parameter(Mandatory)][string]$WorkspaceName,
         [Parameter(Mandatory)][string]$ScenarioName,
@@ -394,7 +395,13 @@ function New-ChaosPreflightConfiguration {
     )
 
     $name = Get-ChaosPreflightConfigurationName -StudyId $StudyId
-    $scoping = @('-n', $name, '-g', $ResourceGroup, '--workspace-name', $WorkspaceName, '--scenario-name', $ScenarioName)
+    # --subscription is not optional here. Without it the CLI resolves the
+    # configuration against whatever subscription happens to be active in the
+    # ambient az context, so a preflight can create and validate a configuration
+    # in a different subscription than the one being studied - and then report
+    # its execution plan as though it described the intended workspace.
+    $scoping = @('-n', $name, '-g', $ResourceGroup, '--subscription', $SubscriptionId,
+        '--workspace-name', $WorkspaceName, '--scenario-name', $ScenarioName)
 
     # The SAME builder the run uses. Preflight exists to predict execution, and a
     # payload that omitted the blast radius would validate a configuration nobody
@@ -817,6 +824,7 @@ if (-not $SkipDiscovery) {
     Write-ChaosStudyNote -Message "Validating a preflight configuration for scenario '$($selectedScenario.name)' to see which legs would actually run."
 
     $preflight = New-ChaosPreflightConfiguration -StudyId $study.studyId `
+        -SubscriptionId $SubscriptionId `
         -ResourceGroup $ResourceGroup -WorkspaceName $WorkspaceName -ScenarioName $selectedScenario.name `
         -Parameters $scenarioParameterList -BlastRadius $blastRadius -Adapter $Adapter -StudyPath $study.path
 
