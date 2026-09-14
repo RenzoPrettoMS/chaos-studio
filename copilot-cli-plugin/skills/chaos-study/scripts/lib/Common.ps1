@@ -102,6 +102,10 @@ function Get-ChaosSharedScriptStatus {
 $ChaosStudyExit = @{
     Success                    = 0
     Error                      = 1
+    # Reserved, not emitted here: the shipped chaos skills own 0-4 and use 4 for
+    # an unconsented broad fix. It is declared so nothing in this suite ever
+    # reuses the number for a different meaning, which would make two skills
+    # disagree about what a 4 means.
     BroadFixUnconsented        = 4
     ReadinessFailed            = 10
     ConsentDeclined            = 11

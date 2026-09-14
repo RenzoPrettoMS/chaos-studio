@@ -40,17 +40,24 @@ function Get-ChaosPayloadMemberName {
 function Get-ChaosPayloadMemberValue {
     <#
     .SYNOPSIS
-        Read one member from either shape.
+        Read one member from either shape, preserving its cardinality.
+
+    .DESCRIPTION
+        Returned with the comma operator. A bare `return $value` pushes the
+        value through the output stream, which unrolls a collection and then
+        re-collects it - so a single-element `zones` array came back as a bare
+        string and serialised as `"zones": "1"` instead of `"zones": ["1"]`.
+        A one-zone blast radius is exactly the case a careful operator picks.
     #>
     param([AllowNull()][object]$InputObject, [Parameter(Mandatory)][string]$Name)
 
     if ($null -eq $InputObject) { return $null }
     if ($InputObject -is [System.Collections.IDictionary]) {
         if (-not $InputObject.Contains($Name)) { return $null }
-        return $InputObject[$Name]
+        return , $InputObject[$Name]
     }
     if (@($InputObject.PSObject.Properties.Name) -notcontains $Name) { return $null }
-    return $InputObject.$Name
+    return , $InputObject.$Name
 }
 
 function Test-ChaosPayloadValueEmpty {

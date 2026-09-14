@@ -336,6 +336,10 @@ function Resolve-ChaosEffectiveLeg {
         listed so the caller refuses to proceed on a plan it cannot honestly
         describe. `executable` is therefore total minus skipped minus
         undetermined, and never includes a leg nobody could classify.
+
+        `executableLegs` carries the same legs as `executableSelectors` but
+        keeps the action identity alongside the target, so a projection built
+        from this model can distinguish which action runs where.
     #>
     param([AllowNull()][object]$ExecutionPlan)
 
@@ -345,6 +349,7 @@ function Resolve-ChaosEffectiveLeg {
     $skipped = @()
     $undetermined = @()
     $executableSelectors = @()
+    $executableLegs = @()
 
     foreach ($leg in $legs) {
         $selector = [string]$leg.selector
@@ -368,7 +373,18 @@ function Resolve-ChaosEffectiveLeg {
                     reason           = 'the plan did not state whether this leg runs in a form this tool can read'
                 }
             }
-            default { $executableSelectors += $selector }
+            default {
+                $executableSelectors += $selector
+                # The legs that actually execute carry their action identity too.
+                # A projection that recorded only which legs were SKIPPED could
+                # not tell "action A runs against target T" apart from "action B
+                # runs against target T" when the counts happened to agree.
+                $executableLegs += [pscustomobject]@{
+                    legSelector      = $selector
+                    action           = $action
+                    resourceSelector = $selector
+                }
+            }
         }
     }
 
@@ -382,8 +398,35 @@ function Resolve-ChaosEffectiveLeg {
         undetermined        = @($undetermined)
         errors              = @($read.errors)
         executableSelectors = @($executableSelectors)
+        executableLegs      = @($executableLegs)
     }
 }
+
+function Get-ChaosLegIdentity {
+    <#
+    .SYNOPSIS
+        One leg's identity: which action, against which service-resolved target.
+
+    .DESCRIPTION
+        Counts alone cannot distinguish "action A runs against target T" from
+        "action B runs against target T". The hash is a consent gate, so the
+        identity it covers has to name both halves.
+    #>
+    param([AllowNull()][object]$Leg)
+
+    if ($null -eq $Leg) { return '(unnamed action)::(unnamed leg)' }
+
+    $action = [string](Get-ChaosPlanField -Node $Leg -Names @('action'))
+    $selector = [string](Get-ChaosPlanField -Node $Leg -Names @('legSelector', 'resourceSelector', 'selector'))
+    if ([string]::IsNullOrWhiteSpace($action)) { $action = '(unnamed action)' }
+    if ([string]::IsNullOrWhiteSpace($selector)) { $selector = '(unnamed leg)' }
+    return "$action::$selector"
+}
+
+# Bumped whenever the projection's meaning changes. The hash carries it as a
+# prefix so a plan frozen by an older suite is REFUSED rather than silently
+# reinterpreted against different semantics.
+$script:ChaosEffectivePlanHashVersion = 2
 
 function Get-ChaosEffectivePlanProjection {
     <#
@@ -391,20 +434,49 @@ function Get-ChaosEffectivePlanProjection {
         The stable projection both scope and run hash.
 
     .DESCRIPTION
-        Deliberately over counts and sorted selectors, not the platform's
-        free-text skip reasons, which vary run to run for the same effective
-        plan. Equality therefore means "the same legs execute". Undetermined
-        selectors are part of the projection: a plan that became readable, or
-        stopped being readable, is not the same plan.
+        Deliberately counts, sorted leg identities and the configuration body -
+        not the platform's free-text skip reasons, which vary run to run for the
+        same effective plan. Equality therefore means "the same actions execute
+        against the same service-resolved targets, with the same fault
+        parameters and the same configured duration".
+
+        Undetermined legs are part of the projection: a plan that became
+        readable, or stopped being readable, is not the same plan. The
+        configuration body carries the action URN, the fault parameters and the
+        actual configured duration, so a plan re-frozen with a longer duration
+        or a different parameter no longer matches.
     #>
-    param([Parameter(Mandatory)][object]$EffectiveLegs)
+    param(
+        [Parameter(Mandatory)][object]$EffectiveLegs,
+        [AllowNull()][object]$ConfigurationBody
+    )
 
     return [ordered]@{
-        total        = $EffectiveLegs.total
-        executable   = $EffectiveLegs.executable
-        skipped      = @(@($EffectiveLegs.skipped) | ForEach-Object { [string]$_.legSelector } | Sort-Object)
-        undetermined = @(@($EffectiveLegs.undetermined) | ForEach-Object { [string]$_.legSelector } | Sort-Object)
+        version       = $script:ChaosEffectivePlanHashVersion
+        total         = $EffectiveLegs.total
+        executable    = $EffectiveLegs.executable
+        executing     = @(@($EffectiveLegs.executableLegs) | ForEach-Object { Get-ChaosLegIdentity -Leg $_ } | Sort-Object)
+        skipped       = @(@($EffectiveLegs.skipped) | ForEach-Object { Get-ChaosLegIdentity -Leg $_ } | Sort-Object)
+        undetermined  = @(@($EffectiveLegs.undetermined) | ForEach-Object { Get-ChaosLegIdentity -Leg $_ } | Sort-Object)
+        configuration = $(if ($null -eq $ConfigurationBody) { '(no configuration body)' } else { $ConfigurationBody })
     }
+}
+
+function Test-ChaosEffectivePlanHashCurrent {
+    <#
+    .SYNOPSIS
+        Whether a frozen hash was produced by the current projection version.
+
+    .DESCRIPTION
+        A legacy hash is not "wrong", it is unreadable: nobody can say what a
+        pre-version digest covered. Callers refuse it and ask for a re-scope
+        rather than migrating it, because a silent migration would re-use consent
+        that was given for a different, narrower description of the plan.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Hash)
+
+    if ([string]::IsNullOrWhiteSpace($Hash)) { return $false }
+    return $Hash.StartsWith("v$($script:ChaosEffectivePlanHashVersion):", [System.StringComparison]::Ordinal)
 }
 
 function Get-ChaosEffectivePlanHash {
@@ -412,9 +484,29 @@ function Get-ChaosEffectivePlanHash {
     .SYNOPSIS
         The one effective-plan hash. Scope freezes it; run recomputes it from
         the SAME code path and refuses to start when they differ.
+
+    .DESCRIPTION
+        Covers the service-resolved target identities, the action identities,
+        the fault parameters and the actual configured duration - the last two
+        via the configuration body, which is the same payload the run sends.
+        The returned value is version-prefixed so a hash frozen under older
+        semantics is refused rather than compared.
     #>
-    param([AllowNull()][object]$ExecutionPlan)
+    param(
+        [AllowNull()][object]$ExecutionPlan,
+        [AllowNull()][object]$ConfigurationBody
+    )
+
+    # A singleton pipeline container is not another execution plan. Normalize
+    # only the outer container; the projection's own lists stay arrays.
+    if ($ExecutionPlan -is [array] -and $ExecutionPlan.Count -eq 1) {
+        $ExecutionPlan = $ExecutionPlan[0]
+    }
 
     $legs = Resolve-ChaosEffectiveLeg -ExecutionPlan $ExecutionPlan
-    return Get-ChaosDigest -InputObject (Get-ChaosEffectivePlanProjection -EffectiveLegs $legs)
+    $projection = Get-ChaosEffectivePlanProjection -EffectiveLegs $legs -ConfigurationBody $ConfigurationBody
+    if ($projection -is [array] -and $projection.Count -eq 1) {
+        $projection = $projection[0]
+    }
+    return "v$($script:ChaosEffectivePlanHashVersion):$(Get-ChaosDigest -InputObject $projection)"
 }

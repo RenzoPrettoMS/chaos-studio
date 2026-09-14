@@ -708,17 +708,15 @@ $probeSpec = ConvertFrom-ChaosMechanismProbe -Table $MechanismProbe
 $blastRadius = New-ChaosBlastRadius -Locations $FilterLocation -Zones $FilterZone -PhysicalZones $FilterPhysicalZone `
     -ExcludeResources $ExcludeResource -ExcludeTypes $ExcludeType -ExcludeTags $ExcludeTag
 
-# A blast-radius filter that cannot be evaluated is a hard stop, not an empty
-# scope: silently producing zero targets is indistinguishable from a workspace
-# with nothing in it, and the operator would go looking for the wrong problem.
-try {
-    $projected = ConvertTo-ChaosList (Resolve-ChaosBlastRadiusResource -ScopedResources $scopedResources -BlastRadius $blastRadius)
-}
-catch {
-    Write-ChaosStudyFailure -Title 'Blast-radius filter cannot be evaluated' `
-        -Message ([string]$_.Exception.Message) `
-        -Remediation 'Chaos Studio''s discoveredResources payload does not publish every attribute. Narrow the study with a selector the payload does carry - -ExcludeResource or -ExcludeType - rather than one the service never returns.'
-    exit (Get-ChaosStudyExitCode -Name 'Error')
+# A declared filter is a constraint the service enforces, not verified discovery
+# metadata. Resources whose zone/location discovery omits are RETAINED as
+# candidates and the uncertainty is disclosed, because dropping them would show
+# a narrower preview than the run and recommending -ExcludeResource in its place
+# would widen the actual blast radius.
+$projected = ConvertTo-ChaosList (Resolve-ChaosBlastRadiusResource -ScopedResources $scopedResources -BlastRadius $blastRadius)
+$projectionSummary = ConvertTo-ChaosList (Get-ChaosBlastRadiusSummary -ScopedResources $scopedResources -BlastRadius $blastRadius)
+foreach ($statement in $projectionSummary) {
+    Write-ChaosStudyNote -Message ([string]$statement) -Level 'warn'
 }
 
 # -- Readiness -------------------------------------------------------------
@@ -771,8 +769,16 @@ $limitationCodes = @($readiness.limitationCodes)
 if ($SkipDiscovery -and $limitationCodes -notcontains 'L10') { $limitationCodes += 'L10' }
 
 foreach ($gate in $readiness.gates) {
-    $marker = switch ($gate.status) { 'pass' { 'ok' } 'fail' { 'FAIL' } default { '??' } }
-    Write-ChaosStudyNote -Message "[$marker] $($gate.title)$(if ($gate.status -ne 'pass') { " - $($gate.detail)" })"
+    # An advisory gate that did not pass is a caveat, not a stop. Printing it as
+    # [FAIL] next to the blocking gates tells the operator the study is blocked
+    # when it is not, so the marker has to read the severity too.
+    $marker = switch ($gate.status) {
+        'pass' { 'ok' }
+        'fail' { if ($gate.severity -eq 'advisory') { 'warn' } else { 'FAIL' } }
+        default { if ($gate.severity -eq 'advisory') { 'warn' } else { '??' } }
+    }
+    Write-ChaosStudyNote -Message "[$marker] $($gate.title)$(if ($gate.status -ne 'pass') { " - $($gate.detail)" })" `
+        -Level $(if ($gate.status -eq 'pass') { 'info' } else { 'warn' })
 }
 
 Assert-ChaosReadiness -Readiness $readiness
@@ -827,12 +833,12 @@ if (-not $SkipDiscovery) {
     }
 
     # The effective plan is what a run must reproduce exactly before it may
-    # start. Scope and run now compute this from the SAME code path
-    # (Get-ChaosEffectivePlanHash), so equality means "the same legs execute"
-    # rather than "two similar projections happened to agree".
+    # start. Scope and run compute it from the SAME function so equality means
+    # "the same legs execute" rather than "two similar projections agreed".
+    # The @() wrapper is gone deliberately: it digested a singleton array while
+    # the run digested a bare object, so a single-leg plan could never match.
     # Computed before the residue entry so the ledger records the real hash, not null.
-    $effectivePlanProjection = @(Get-ChaosEffectivePlanProjection -EffectiveLegs $effectiveLegs)
-    $effectivePlanHash = Get-ChaosDigest -InputObject $effectivePlanProjection
+    $effectivePlanHash = Get-ChaosEffectivePlanHash -ExecutionPlan $preflight.executionPlan -ConfigurationBody $preflight.body
 
     Add-ChaosPreflightResidueEntry -StudyPath $study.path -ConfigurationName $preflight.name `
         -Workspace ([pscustomobject]@{ resourceGroup = $ResourceGroup; name = $WorkspaceName; scenario = $selectedScenario.name }) `
@@ -878,7 +884,7 @@ if (-not $SkipDiscovery) {
     # refuses on a hash mismatch can then say WHICH leg changed instead of
     # only that something did - and a reader can audit the frozen plan
     # without re-deriving it from the service.
-    $declaredVsEffective['effectivePlan'] = @($effectivePlanProjection)
+    $declaredVsEffective['effectivePlan'] = Get-ChaosEffectivePlanProjection -EffectiveLegs $effectiveLegs -ConfigurationBody $preflight.body
 
     if ($null -ne $preflight.permissionPreview) {
         Add-ChaosCommandTrailEntry -StudyPath $study.path -Command 'az chaos scenario config fix-permissions --what-if' -Phase 'scope' `
@@ -957,6 +963,8 @@ $plan = [ordered]@{
         }
         projectedResourceCount = $(if ($SkipDiscovery) { $null } else { @($projected).Count })
         projectedResources     = @(@($projected) | ForEach-Object { [string]$_.resourceId })
+        # What the local projection could not decide, in the operator's words.
+        projectionSummary      = @($projectionSummary)
     }
 
     scenario    = [ordered]@{
@@ -1084,7 +1092,7 @@ $summary = @(
     "Fault runs  $($faultDuration.statement)"
     "Frozen at   $($plan['frozenConfigHash'])"
     "Plan        $planPath"
-) -join "`n"
+) + @($projectionSummary | ForEach-Object { "Note        $_" }) -join "`n"
 
 Write-ChaosStudyCard -Title 'Study planned - nothing has been injected' -Body $summary
 

@@ -374,7 +374,13 @@ function Get-ChaosDesignHandoff {
         failureMechanism     = [string]$Candidate.failureMechanism
         mechanismEvidence    = [string]$Candidate.mechanismEvidence
         mechanismProbe       = $probe
+        # The candidate's predicate is the measurable steady state; the interview's
+        # `impact` answer is the operator's prose description of what users would
+        # feel. They are not interchangeable, so the prose is never promoted into
+        # a predicate - but a blank predicate must not cross the seam silently
+        # either, because scope would then plan a study with nothing to falsify.
         steadyState          = [string]$Candidate.steadyStatePredicate
+        steadyStateSource    = if ([string]::IsNullOrWhiteSpace([string]$Candidate.steadyStatePredicate)) { 'none' } else { 'candidate' }
         signals              = @(Get-ChaosItems -InputObject $Candidate.signals | Where-Object { $_ })
         exposure             = $exposure
         actionRequirements   = Get-ChaosMember -InputObject $Candidate -Name 'actionRequirements'
@@ -396,7 +402,13 @@ function Get-ChaosDesignHandoff {
         }
         telemetryGaps        = @(Get-ChaosItems -InputObject $Candidate.telemetryGaps | Where-Object { $_ })
         collateralRisks      = @(Get-ChaosItems -InputObject $Candidate.collateralRisks | Where-Object { $_ })
-        unresolvedQuestions  = @(Get-ChaosItems -InputObject $Brief.limitations | Where-Object { $_ })
+        unresolvedQuestions  = @(
+            @(Get-ChaosItems -InputObject $Brief.limitations | Where-Object { $_ }) + @(
+                if ([string]::IsNullOrWhiteSpace([string]$Candidate.steadyStatePredicate)) {
+                    "No measurable steady-state predicate was agreed. The stated user impact was '$([string]$answers['impact'])', but prose is not a predicate - scope cannot falsify it. State the steady state as a measurable condition before running."
+                }
+            ) | Where-Object { $_ }
+        )
     }
 }
 

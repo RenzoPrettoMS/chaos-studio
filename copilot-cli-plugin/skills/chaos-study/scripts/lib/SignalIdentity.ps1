@@ -207,6 +207,8 @@ function Get-ChaosSignalSourceIdentity {
             kind         = 'logs'
             id           = "logs:$workspaceId"
             resourceId   = $null
+            metricName   = $null
+            aggregation  = $null
             workspaceId  = $workspaceId
             query        = $query
             names        = @($projected.names)
@@ -218,22 +220,48 @@ function Get-ChaosSignalSourceIdentity {
     if ($trimmed.StartsWith('metrics:', [System.StringComparison]::OrdinalIgnoreCase)) {
         $name = $trimmed.Substring('metrics:'.Length).Trim()
 
-        # A metric source may be resource-scoped: `metrics:<resourceId>#<MetricName>`.
-        # The resource id is the *scope*, not the signal name - the name is the
-        # metric. Treating the whole remainder as the name made every
-        # resource-scoped probe untraceable, because nobody writes (or collects)
-        # a signal called '/subscriptions/../r#Availability'. Both the metric
-        # name and the fully qualified form are accepted so artifacts written
-        # either way keep matching.
+        # The collector's grammar is `metrics:<name>[@<resourceId>][|<aggregation>]`
+        # (see ConvertFrom-ChaosSignalSourceSpec). Identity used to parse a
+        # different grammar - `metrics:<resourceId>#<name>` - so any source
+        # written the documented way produced a "name" of
+        # 'VmAvailabilityMetric@/subscriptions/...' that no collected signal could
+        # ever match, and the traceability gates failed on a correct source.
+        # Split on '|' first, then '@', exactly as the collector does. The old
+        # '#' form is still accepted so artifacts already on disk keep resolving.
         $metricName = $name
         $resourceId = $null
-        $hash = $name.LastIndexOf('#')
-        if ($hash -gt 0 -and $hash -lt ($name.Length - 1)) {
-            $resourceId = $name.Substring(0, $hash).Trim()
-            $metricName = $name.Substring($hash + 1).Trim()
+        $aggregation = $null
+
+        if ($metricName.Contains('|')) {
+            $parts = $metricName.Split('|', 2)
+            $metricName = $parts[0].Trim()
+            $aggregation = $parts[1].Trim()
+        }
+        if ($metricName.Contains('@')) {
+            $parts = $metricName.Split('@', 2)
+            $metricName = $parts[0].Trim()
+            $resourceId = $parts[1].Trim()
+        }
+        elseif ($metricName.Contains('#')) {
+            $hash = $metricName.LastIndexOf('#')
+            if ($hash -gt 0 -and $hash -lt ($metricName.Length - 1)) {
+                $resourceId = $metricName.Substring(0, $hash).Trim()
+                $metricName = $metricName.Substring($hash + 1).Trim()
+            }
         }
 
-        $names = @($metricName, $name) |
+        # Every form the same signal can legitimately be written as, so an
+        # artifact recorded under any of them still matches the planned probe.
+        $candidateNames = [System.Collections.Generic.List[string]]::new()
+        $candidateNames.Add($metricName)
+        if ($resourceId) {
+            $candidateNames.Add("$metricName@$resourceId")
+            if ($aggregation) { $candidateNames.Add("$metricName@$resourceId|$aggregation") }
+        }
+        if ($aggregation) { $candidateNames.Add("$metricName|$aggregation") }
+        $candidateNames.Add($name)
+
+        $names = @($candidateNames) |
             Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
             Select-Object -Unique
 
@@ -242,6 +270,8 @@ function Get-ChaosSignalSourceIdentity {
             kind         = 'metrics'
             id           = "metrics:$name"
             resourceId   = $resourceId
+            metricName   = $metricName
+            aggregation  = $aggregation
             workspaceId  = $null
             query        = $null
             names        = @($names)
@@ -256,6 +286,8 @@ function Get-ChaosSignalSourceIdentity {
         kind         = 'unknown'
         id           = $trimmed
         resourceId   = $null
+        metricName   = $null
+        aggregation  = $null
         workspaceId  = $null
         query        = $null
         names        = @($trimmed | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })

@@ -179,7 +179,12 @@ $conclusion = switch -Wildcard ($findings.studyVerdict) {
         "$predicateSentence The action was also proven to have landed, so the result can be read as resilience to it."
     }
     'Degraded but recovered' {
-        "$predicateSentence Other signals degraded during the action and returned to their objectives afterwards."
+        if ($findings.predicateVerdict -eq 'Breached') {
+            "$predicateSentence It returned to its objective within the measured windows, so the system degraded under the fault and then recovered."
+        }
+        else {
+            "$predicateSentence Other signals degraded during the action and returned to their objectives afterwards."
+        }
     }
     'Steady state breached' {
         "$predicateSentence It had not recovered by the end of the recovery window."

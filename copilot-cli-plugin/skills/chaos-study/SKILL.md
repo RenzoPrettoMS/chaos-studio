@@ -157,6 +157,7 @@ those actions appear there. What lives here is the method:
 | --- | --- |
 | `0` | Success |
 | `1` | Error |
+| `4` | Reserved by the shipped chaos skills (broad fix unconsented) — this suite never emits it |
 | `10` | Readiness gates failed |
 | `11` | Consent declined or phrase mismatch |
 | `12` | Plan changed after it was frozen |
@@ -195,4 +196,4 @@ into the study's provenance; resuming is idempotent.
   selection flows through workspace scopes. There is no V1 path or fallback.
 - Core is `az` / Azure Resource Manager: no SRE Agent or MCP dependency.
 - Sealed studies are immutable — re-testing scopes a **new** study.
-- Parameterised scenarios (`-Parameters`) are planned via `chaos-study-scope` directly.
+- `-Parameters` (scenario), `-ActionParameters` (action) and `-AcknowledgeFaultDurationSeconds` all cross the front door.

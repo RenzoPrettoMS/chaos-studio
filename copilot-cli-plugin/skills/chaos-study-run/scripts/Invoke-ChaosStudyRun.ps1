@@ -87,11 +87,32 @@ immutable so that a report always describes the run it was generated from.
 }
 
 if ($study.state -eq 'EXECUTED' -and -not $Force -and -not $DryRun) {
-    Write-ChaosStudyFailure -Title 'Study has already been executed' -Message @"
-Study $($study.studyId) already holds a run record. Running it again would
+    # A run record exists - but a record is written even when the run never
+    # started (configuration refused, consent withdrawn, permissions denied).
+    # Blocking on the record alone strands a study that holds no evidence and
+    # forces -Force, which is the flag that DOES overwrite real evidence.
+    # Only a recorded runId means something actually ran.
+    $priorRunId = $null
+    $priorReader = Get-ChaosArtifactReader -StudyPath $studyPath -Artifact 'runRecord'
+    if ($priorReader.found) {
+        $priorRecord = Read-ChaosJsonFile -Path $priorReader.path
+        if ($priorRecord -and $priorRecord.PSObject.Properties['scenarioRun'] -and $priorRecord.scenarioRun) {
+            $priorRunId = [string]$priorRecord.scenarioRun.runId
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($priorRunId)) {
+        Write-ChaosStudyFailure -Title 'Study has already been executed' -Message @"
+Study $($study.studyId) already holds run $priorRunId. Running it again would
 overwrite evidence from the first execution.
 "@ -Remediation 'Plan a new study, or pass -Force if you intend to overwrite this one.'
-    exit (Get-ChaosStudyExitCode -Name 'Error')
+        exit (Get-ChaosStudyExitCode -Name 'Error')
+    }
+
+    Write-ChaosStudyNote -Level 'warn' -Message @"
+A run record exists for study $($study.studyId) but it names no scenario run, so
+nothing was ever injected and there is no evidence to lose. Re-arming it.
+"@
 }
 
 Assert-ChaosPlanIntegrity -Plan $plan | Out-Null
@@ -104,6 +125,24 @@ if ($sources.Count -eq 0 -and $plan.signals.configuredSources) {
 
 $projectedCount = $plan.scope.projectedResourceCount
 $projectedText = if ($null -eq $projectedCount) { '(not resolved)' } else { "$projectedCount of $($plan.scope.discoveredResourceCount) discovered" }
+
+# The observation budget and the fault's actual length are different numbers.
+# Labelling the budget "Injection" is what let a "5-minute study" configure a
+# 15-minute fault, so both are shown, named for what they are.
+$faultDurationText = '(not recorded by this plan)'
+if ($plan.PSObject.Properties['faultDuration'] -and $plan.faultDuration) {
+    if (-not [string]::IsNullOrWhiteSpace([string]$plan.faultDuration.statement)) {
+        $faultDurationText = [string]$plan.faultDuration.statement
+    }
+}
+
+# Anything the local projection could not verify - a declared filter the
+# service will enforce, a resource whose zone discovery never reported. The
+# operator sees it before consenting, not afterwards in the report.
+$projectionSummary = @()
+if ($plan.scope.PSObject.Properties['projectionSummary']) {
+    $projectionSummary = @($plan.scope.projectionSummary | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+}
 
 # -- Dry run ---------------------------------------------------------------
 
@@ -134,11 +173,16 @@ $($plan.question.hypothesis)
         'Scenario'           = $plan.scenario.name
         'Action'             = $plan.action.displayName
         'Action URN'         = $(if ([string]::IsNullOrWhiteSpace($plan.action.canonicalId)) { '(not resolved - discovery skipped)' } else { [string]$plan.action.canonicalId })
-        'Injection'          = "$($plan.windows.injectMinutes) minutes"
+        'Fault runs for'     = $faultDurationText
+        'Observation budget' = "$($plan.windows.injectMinutes) minutes (how long evidence is collected, NOT the fault's length)"
         'Baseline'           = "$($plan.windows.baselineMinutes) minutes before injection"
         'Recovery'           = "$($plan.windows.recoveryMinutes) minutes after injection"
         'Configuration'      = $configurationName
     })
+
+    foreach ($statement in $projectionSummary) {
+        Write-ChaosStudyNote -Message ([string]$statement) -Level 'warn'
+    }
 
     Write-ChaosStudyTable -Title 'Evidence that would be collected' -Data @(
         foreach ($signal in $preview) {
@@ -328,17 +372,51 @@ and you will be asked again.
     # pipeline. Nothing in this block throws; the study may already be unwinding
     # from a real failure and masking it would be worse than any of this.
     if ($runId) {
-        Write-ChaosStudyNote -Message "Cancelling scenario run $runId."
-        $cancelResidue = Invoke-ChaosResidueRemoval -StudyPath $studyPath -Kind 'scenarioRun' -Id $runId -Removal {
-            Stop-ChaosStudyScenarioRun -Plan $plan -RunId $runId -Adapter $Adapter -StudyPath $studyPath
-        } -VerifyAbsent {
-            Test-ChaosStudyScenarioRunAbsent -Plan $plan -RunId $runId -Adapter $Adapter -StudyPath $studyPath
-        } -VerifyAttempts 6 -VerifyDelaySeconds 5
-        if (-not $cancelResidue.removed) {
-            Write-ChaosStudyNote -Message "Scenario run $runId is not confirmed stopped (state: $($cancelResidue.status)). $($cancelResidue.error)" -Level 'warn'
+        # Cancelling a run that already reached a terminal state is not cleanup:
+        # the service rejects it, and that rejection would then be written down
+        # as unresolved residue for a run that is not running. Verify instead.
+        $alreadyTerminal = $false
+        try { $alreadyTerminal = [bool](Test-ChaosScenarioRunTerminal -Status ([string]$outcome)) } catch { $alreadyTerminal = $false }
+
+        if ($alreadyTerminal) {
+            Write-ChaosStudyNote -Message "Scenario run $runId already ended as '$outcome'; confirming it is no longer executing rather than cancelling it."
+            $observedAbsent = $null
+            $observeError = $null
+            try {
+                $observedAbsent = Test-ChaosStudyScenarioRunAbsent -Plan $plan -RunId $runId -Adapter $Adapter -StudyPath $studyPath
+            } catch {
+                $observeError = $_.Exception.Message
+            }
+
+            $terminalStatus = if ($observedAbsent -eq $true) { 'verified-absent' }
+            elseif ($observedAbsent -eq $false) { 'still-present' }
+            else { 'verification-unavailable' }
+
+            $terminalError = if ($terminalStatus -eq 'verified-absent') { $null }
+            elseif ($observeError) { $observeError }
+            else { "Run reported '$outcome' but a read-back could not confirm it stopped." }
+
+            Set-ChaosResidueCleanup -StudyPath $studyPath -Kind 'scenarioRun' -Id $runId `
+                -Status $terminalStatus -ErrorText $terminalError `
+                -Command "az chaos scenario run show --run-id $runId" | Out-Null
+
+            if ($terminalStatus -ne 'verified-absent') {
+                Write-ChaosStudyNote -Message "Scenario run $runId is not confirmed stopped (state: $terminalStatus). $terminalError" -Level 'warn'
+            }
         }
-        Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario run cancel' `
-            -Arguments @($runId, "cleanup=$($cancelResidue.status)") -ExitCode $(if ($cancelResidue.removed) { 0 } else { 1 }) | Out-Null
+        else {
+            Write-ChaosStudyNote -Message "Cancelling scenario run $runId."
+            $cancelResidue = Invoke-ChaosResidueRemoval -StudyPath $studyPath -Kind 'scenarioRun' -Id $runId -Removal {
+                Stop-ChaosStudyScenarioRun -Plan $plan -RunId $runId -Adapter $Adapter -StudyPath $studyPath
+            } -VerifyAbsent {
+                Test-ChaosStudyScenarioRunAbsent -Plan $plan -RunId $runId -Adapter $Adapter -StudyPath $studyPath
+            } -VerifyAttempts 6 -VerifyDelaySeconds 5
+            if (-not $cancelResidue.removed) {
+                Write-ChaosStudyNote -Message "Scenario run $runId is not confirmed stopped (state: $($cancelResidue.status)). $($cancelResidue.error)" -Level 'warn'
+            }
+            Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario run cancel' `
+                -Arguments @($runId, "cleanup=$($cancelResidue.status)") -ExitCode $(if ($cancelResidue.removed) { 0 } else { 1 }) | Out-Null
+        }
     }
     if ($configurationResidueKind) {
         if ($KeepConfiguration) {

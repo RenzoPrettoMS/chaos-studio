@@ -305,14 +305,20 @@ function Get-ChaosOperationRegistry {
         'run.start' = @{
             localAz  = {
                 param($Arguments, $Body)
+                # --no-wait returns as soon as the run is created. Without it the
+                # CLI blocks until the whole fault finishes, so the run id - the
+                # only handle for polling, abort conditions and cancellation -
+                # does not exist while the fault is actually injecting. A study
+                # that cannot be cancelled mid-fault is not a bounded study.
                 Invoke-ChaosStudyAzChaos -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'run', 'start') -Composed @(
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName'),
                     '--scenario-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'scenarioName'),
-                    '--config-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'configName')
+                    '--config-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'configName'),
+                    '--no-wait'
                 ))
             }
-            external = @{ tool = 'az-chaos'; methodHint = 'scenario run start' }
+            external = @{ tool = 'az-chaos'; methodHint = 'scenario run start (--no-wait)' }
         }
         'run.show' = @{
             localAz  = {

@@ -406,6 +406,40 @@ function Set-ChaosResidueCleanup {
     return $true
 }
 
+function Test-ChaosResidueNotFoundError {
+    <#
+    .SYNOPSIS
+        Does this removal error say the object was already gone?
+
+    .DESCRIPTION
+        A delete that fails with "not found" is not a failed cleanup - it is a
+        cleanup that had nothing left to do, usually because a previous attempt
+        (or the service itself) already removed the object. Recording that as
+        'failed' leaves unresolved residue for something that does not exist and
+        prints an exact removal command that will fail the same way forever.
+
+        This only decides whether the read-back is worth performing. The status
+        still comes from what the verifier actually observes, so a misleading
+        error can never by itself produce 'verified-absent'.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+
+    foreach ($pattern in @(
+            'ResourceNotFound',
+            'NotFound',
+            'was\s+not\s+found',
+            'could\s+not\s+be\s+found',
+            'does\s+not\s+exist',
+            '\b404\b'
+        )) {
+        if ($Text -match "(?i)$pattern") { return $true }
+    }
+
+    return $false
+}
+
 function Invoke-ChaosResidueRemoval {
     <#
     .SYNOPSIS
@@ -487,10 +521,14 @@ function Invoke-ChaosResidueRemoval {
                 reissued    = ($r -gt 1)
             }) | Out-Null
 
-        # A removal that raised is already terminal - polling for absence would
+        # A removal that raised is normally terminal - polling for absence would
         # at best confirm what the error said, and at worst turn a real failure
-        # into a softer-looking status.
-        if ($status -eq 'failed' -or $null -eq $VerifyAbsent) { break }
+        # into a softer-looking status. The exception is "not found": that error
+        # means the object is already gone, and refusing to look would leave
+        # unresolved residue (and an exact removal command) for something that
+        # does not exist. The verifier still decides the status.
+        if ($null -eq $VerifyAbsent) { break }
+        if ($status -eq 'failed' -and -not (Test-ChaosResidueNotFoundError -Text $removalError)) { break }
 
         # Evidence accumulates across removal passes: a later pass that finally
         # sees the object gone must not erase the earlier pass that saw it

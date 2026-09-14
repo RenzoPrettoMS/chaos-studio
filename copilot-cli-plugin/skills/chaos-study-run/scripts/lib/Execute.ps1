@@ -43,6 +43,11 @@ Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Operation.ps1')
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'Residue.ps1')
 . (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'ConfigurationPayload.ps1')
+# The run recomputes the effective-plan hash before arming, so it needs the same
+# plan model scope froze it with. Omitting this made Get-ChaosEffectivePlanHash
+# an undefined command AFTER config create and validate had already run, leaking
+# the configuration the study had just built.
+. (Join-Path $PSScriptRoot '..' '..' '..' 'chaos-study' 'scripts' 'lib' 'ExecutionPlan.ps1')
 
 # -- Adapter resolution ----------------------------------------------------
 
@@ -74,18 +79,51 @@ function Get-ChaosExecutionAdapter {
 function Get-ChaosConfigurationScopingArgument {
     <#
     .SYNOPSIS
-        The four arguments that identify a scenario configuration.
+        The arguments that identify a scenario configuration.
+
+    .DESCRIPTION
+        The subscription is part of the identity, not ambient context. Without
+        it every configuration call lands in whatever subscription `az` happens
+        to have selected, so a study scoped to one subscription could create,
+        validate, execute and then fail to clean up a configuration in another.
     #>
     param(
         [Parameter(Mandatory)][object]$Plan,
         [Parameter(Mandatory)][string]$ConfigurationName
     )
-    return @(
+    $cliArgs = @(
         '-n', $ConfigurationName,
         '-g', $Plan.workspace.resourceGroup,
         '--workspace-name', $Plan.workspace.name,
         '--scenario-name', $Plan.scenario.name
     )
+
+    $subscriptionId = $null
+    if (@($Plan.workspace.PSObject.Properties.Name) -contains 'subscriptionId') {
+        $subscriptionId = [string]$Plan.workspace.subscriptionId
+    }
+    if (-not [string]::IsNullOrWhiteSpace($subscriptionId)) {
+        $cliArgs += @('--subscription', $subscriptionId)
+    }
+
+    return , @($cliArgs)
+}
+
+function Get-ChaosPlanConfigurationBody {
+    <#
+    .SYNOPSIS
+        The configuration payload this plan describes.
+
+    .DESCRIPTION
+        One builder for the body the run sends and the body the effective-plan
+        hash covers, so "what was consented to" and "what executes" cannot
+        diverge through a second projection.
+    #>
+    param([Parameter(Mandatory)][object]$Plan)
+
+    $blast = $null
+    if ($Plan.scope.PSObject.Properties.Name -contains 'blastRadius') { $blast = $Plan.scope.blastRadius }
+    return New-ChaosConfigurationBody -ScenarioParameters @(Get-ChaosScenarioParameterList -Plan $Plan) -BlastRadius $blast
 }
 
 # -- Plan integrity --------------------------------------------------------
@@ -296,7 +334,7 @@ function New-ChaosStudyConfiguration {
     # authorised this run described THAT payload, not a similar one.
     $blast = $null
     if ($Plan.scope.PSObject.Properties.Name -contains 'blastRadius') { $blast = $Plan.scope.blastRadius }
-    $jsonArg = New-ChaosConfigurationBody -ScenarioParameters @(Get-ChaosScenarioParameterList -Plan $Plan) -BlastRadius $blast
+    $jsonArg = Get-ChaosPlanConfigurationBody -Plan $Plan
 
     $frozenDigest = $null
     if (($Plan.PSObject.Properties.Name -contains 'declaredVsEffective') -and $null -ne $Plan.declaredVsEffective) {
@@ -1084,8 +1122,11 @@ function Get-ChaosRunEffectivePlanHash {
         Get-ChaosEffectivePlanHash in chaos-study/scripts/lib/ExecutionPlan.ps1,
         so the two hashes cannot drift by construction.
     #>
-    param([AllowNull()][object]$Validation)
-    return Get-ChaosEffectivePlanHash -ExecutionPlan $Validation
+    param(
+        [AllowNull()][object]$Validation,
+        [AllowNull()][object]$ConfigurationBody
+    )
+    return Get-ChaosEffectivePlanHash -ExecutionPlan $Validation -ConfigurationBody $ConfigurationBody
 }
 
 function Assert-ChaosEffectivePlanEquality {
@@ -1113,6 +1154,24 @@ stops rather than proceeding on an unverified plan.
     }
 
     if ($Expected -eq $Actual) { return $true }
+
+    # A hash frozen by an older suite covered a NARROWER description of the plan
+    # (leg counts and selectors, without the action identities, fault parameters
+    # or configured duration). Reinterpreting it against today's projection would
+    # re-use consent that was never given for what the hash now covers, so an
+    # out-of-version hash is refused outright rather than migrated.
+    if (-not (Test-ChaosEffectivePlanHashCurrent -Hash $Expected)) {
+        Write-ChaosStudyFailure -Title 'The frozen effective-plan hash predates this suite''s plan model' -Message @"
+The plan carries an effective-plan hash ($Expected) produced by an earlier
+version of the effective-plan projection. That older hash did not cover the
+action identities, the fault parameters or the actual configured duration, so it
+cannot prove that configuration '$ConfigurationName' is what you consented to.
+
+The hash is not migrated, because migrating it would silently re-use consent
+given for a different, narrower description of the plan.
+"@ -Remediation 'Re-run chaos-study-scope to re-scope this study, review the refreshed plan, and consent to it again before running.'
+        exit (Get-ChaosStudyExitCode -Name 'ScopeUnverified')
+    }
 
     Write-ChaosStudyFailure -Title 'The re-created configuration does not match the scoped plan' -Message @"
 Scope froze an effective plan hashing to $Expected, but the configuration
@@ -1163,12 +1222,22 @@ function Resolve-ChaosRunConfiguration {
     $frozenHash = if ($dve -and ($dve.PSObject.Properties.Name -contains 'effectivePlanHash')) { [string]$dve.effectivePlanHash } else { $null }
     $preflightName = if ($dve -and $dve.preflight -and ($dve.preflight.PSObject.Properties.Name -contains 'configurationName')) { [string]$dve.preflight.configurationName } else { $null }
 
+    # Refuse an out-of-version frozen hash BEFORE creating anything. Falling
+    # through would create a configuration only to refuse it a moment later,
+    # leaving residue behind for a plan that was never runnable.
+    if (-not [string]::IsNullOrWhiteSpace($frozenHash)) {
+        Assert-ChaosEffectivePlanEquality -Expected $frozenHash -Actual $frozenHash -ConfigurationName $ConfigurationName | Out-Null
+    }
+
+    # One body for what the run sends and what the hash covers.
+    $configurationBody = Get-ChaosPlanConfigurationBody -Plan $Plan
+
     # 1. Reuse the exact validated preflight configuration when it still holds.
     if (-not [string]::IsNullOrWhiteSpace($preflightName) -and -not [string]::IsNullOrWhiteSpace($frozenHash)) {
         $preflightValidation = Get-ChaosConfigurationValidation -Plan $Plan -ConfigurationName $preflightName -Adapter $Adapter -StudyPath $StudyPath
         $preflightStatus = Get-ChaosValidationStatus -Validation $preflightValidation
         if ($preflightStatus -eq 'Succeeded') {
-            $preflightHash = Get-ChaosRunEffectivePlanHash -Validation $preflightValidation
+            $preflightHash = Get-ChaosRunEffectivePlanHash -Validation $preflightValidation -ConfigurationBody $configurationBody
             if ($preflightHash -eq $frozenHash) {
                 Write-ChaosStudyNote -Message "Reusing the validated preflight configuration $preflightName; its effective plan still matches the scoped one."
                 return [pscustomobject]@{
@@ -1217,7 +1286,7 @@ function Resolve-ChaosRunConfiguration {
         # validate/show round-trip on every re-created run. When no plan was frozen
         # (discovery skipped at scope time) this proof is skipped and the historical
         # create + validate result is returned unchanged.
-        $actualHash = Get-ChaosRunEffectivePlanHash -Validation $resolved.validation
+        $actualHash = Get-ChaosRunEffectivePlanHash -Validation $resolved.validation -ConfigurationBody $configurationBody
         Assert-ChaosEffectivePlanEquality -Expected $frozenHash -Actual $actualHash -ConfigurationName $ConfigurationName | Out-Null
     }
 

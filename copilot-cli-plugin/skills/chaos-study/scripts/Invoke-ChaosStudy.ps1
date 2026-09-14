@@ -120,6 +120,15 @@ param(
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][ValidateRange(0, 240)][int]$BaselineMinutes = 5,
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][ValidateRange(0, 240)][int]$RecoveryMinutes = 10,
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][hashtable]$Parameters,
+    # Action parameters travel separately from scenario parameters because scope
+    # validates each against a different live schema. Routing a scenario value
+    # (duration) through the action schema is how a valid study got rejected.
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][hashtable]$ActionParameters,
+    # The actual configured fault duration the operator has read and accepted.
+    # Without it on the front door the golden path cannot clear the duration
+    # acknowledgement gate that scope raises, so a 5-minute observation budget
+    # can never be reconciled with a longer service-default fault.
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][AllowNull()][object]$AcknowledgeFaultDurationSeconds,
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$Hypothesis,
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string[]]$SignalSource = @(),
 
@@ -190,6 +199,14 @@ function Invoke-ChaosPhase {
         Runs one phase in a child pwsh so that a phase which calls `exit` cannot
         terminate this orchestrator. Output streams through to the console live;
         only the exit code is interpreted here.
+
+        Arguments cross as a JSON file that the child splats, not as a `-File`
+        command line. A command line can only carry strings, so every structured
+        parameter the phases actually take - -Parameters, -ActionParameters,
+        -MechanismProbe - arrived as the literal text "System.Collections.Hashtable"
+        or had to be refused outright, which dead-ended the front door for any
+        parameterised scenario. Splatting a round-tripped hashtable is the only
+        way the entry point can carry the same inputs the phase skills accept.
     #>
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -197,36 +214,43 @@ function Invoke-ChaosPhase {
         [Parameter(Mandatory)][hashtable]$Arguments
     )
 
-    $argv = [System.Collections.Generic.List[string]]::new()
-    $argv.Add('-NoProfile')
-    $argv.Add('-File')
-    $argv.Add($Script)
+    $payload = [ordered]@{}
     foreach ($key in ($Arguments.Keys | Sort-Object)) {
         $value = $Arguments[$key]
         if ($null -eq $value) { continue }
+        # A switch serialises as a bool so the child binds it as present/absent
+        # rather than as the object's ToString().
         if ($value -is [switch]) {
-            if ($value.IsPresent) { $argv.Add("-$key") }
+            if ($value.IsPresent) { $payload[$key] = $true }
             continue
         }
-        if ($value -is [bool]) {
-            $argv.Add("-${key}:`$$($value.ToString().ToLowerInvariant())")
-            continue
-        }
-        if ($value -is [array]) {
-            if ($value.Count -eq 0) { continue }
-            $argv.Add("-$key")
-            $argv.Add(($value -join ','))
-            continue
-        }
-        $argv.Add("-$key")
-        $argv.Add([string]$value)
+        if ($value -is [array] -and $value.Count -eq 0) { continue }
+        $payload[$key] = $value
     }
 
+    $payloadPath = Join-Path ([System.IO.Path]::GetTempPath()) ('chaos-phase-' + [guid]::NewGuid().ToString('n') + '.json')
+    # Depth 12: -MechanismProbe nests a condition object, and a silently truncated
+    # probe would be a different probe than the one the operator stated.
+    $payload | ConvertTo-Json -Depth 12 -Compress | Set-Content -LiteralPath $payloadPath -Encoding utf8 -NoNewline
+
+    # Single-quoted inside the child so nothing in the path is re-interpreted.
+    $childCommand = @"
+`$ErrorActionPreference = 'Stop'
+`$splat = Get-Content -LiteralPath '$payloadPath' -Raw | ConvertFrom-Json -AsHashtable
+& '$Script' @splat
+exit `$LASTEXITCODE
+"@
+
     Write-ChaosStudyNote -Message "phase: $Name"
-    # The child's output is written straight through rather than returned, so the
-    # function's only return value is the exit code.
-    & pwsh @argv | ForEach-Object { Write-Host $_ }
-    return $LASTEXITCODE
+    try {
+        # The child's output is written straight through rather than returned, so the
+        # function's only return value is the exit code.
+        & pwsh -NoProfile -Command $childCommand | ForEach-Object { Write-Host $_ }
+        return $LASTEXITCODE
+    }
+    finally {
+        Remove-Item -LiteralPath $payloadPath -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Stop-OnResumableOperation {
@@ -591,18 +615,10 @@ if ($ExcludeType.Count -gt 0) { $scopeArgs['ExcludeType'] = $ExcludeType }
 if ($SkipDiscovery) { $scopeArgs['SkipDiscovery'] = [switch]::Present }
 if ($Adapter) { $scopeArgs['Adapter'] = $Adapter }
 if ($AcceptPartialScenario) { $scopeArgs['AcceptPartialScenario'] = $AcceptPartialScenario }
-if ($Parameters -and $Parameters.Count -gt 0) {
-    # Hashtables cannot cross the pwsh -File boundary, so parameterised scenarios
-    # are planned by calling the scope skill directly rather than through this chain.
-    Write-ChaosStudyFailure -Title 'Use the scope skill for parameterised scenarios' -Message @"
--Parameters cannot be forwarded through the chained entry point.
-
-Plan the study with the scope skill directly, then continue here or with the run
-skill against the resulting study id:
-
-  chaos-study-scope -Scenario $Scenario -Action $Action -Parameters @{ ... }
-"@
-    exit (Get-ChaosStudyExitCode -Name 'Error')
+if ($Parameters -and $Parameters.Count -gt 0) { $scopeArgs['Parameters'] = $Parameters }
+if ($ActionParameters -and $ActionParameters.Count -gt 0) { $scopeArgs['ActionParameters'] = $ActionParameters }
+if ($PSBoundParameters.ContainsKey('AcknowledgeFaultDurationSeconds')) {
+    $scopeArgs['AcknowledgeFaultDurationSeconds'] = $AcknowledgeFaultDurationSeconds
 }
 
 $scopeExit = Invoke-ChaosPhase -Name 'chaos-study-scope' -Script $scopeScript -Arguments $scopeArgs

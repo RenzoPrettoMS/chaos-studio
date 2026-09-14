@@ -98,8 +98,12 @@ Useful switches:
   parameters only, so these are declared and frozen, never transmitted.
 - `-FilterLocation` / `-FilterZone` / `-ExcludeResource` / `-ExcludeType` /
   `-ExcludeTag` — the blast radius, frozen onto the plan as the configuration's
-  `filters` and `exclusions`. Discovery does not report a location or zone, so
-  those two filters fail loudly rather than silently emptying the scope.
+  `filters` and `exclusions`. **A declared filter is not verified discovery
+  metadata.** Discovery does not report a location or zone, so resources missing
+  those attributes are retained as candidates with the attribute unverified, the
+  uncertainty is printed, and the declared filter is still transmitted for the
+  service to enforce. The preview cannot narrow what it cannot see, and it must
+  not widen what you asked for either.
 - `-SignalSource` — the evidence to collect (`metrics:` / `logs:`); no defaults
   are invented for you
 - `-Hypothesis` — what you expect to happen, recorded for honesty at report time

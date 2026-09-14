@@ -804,6 +804,36 @@ function Get-ChaosFindingKind {
     return 'operational'
 }
 
+function Get-ChaosPredicateRecovery {
+    <#
+    .SYNOPSIS
+        Did the breached predicate come back inside the measured windows?
+
+    .DESCRIPTION
+        Returns $true when the predicate finding records recovery, $false when it
+        records a predicate still breached after the recovery window, and $null
+        when recovery could not be measured. The answer is read back off the
+        predicate finding rather than recomputed, because that finding is the only
+        place the post-injection measurement was actually evaluated: its severity
+        is assigned as a direct function of $predicatePost - 'medium' when the
+        predicate held again, 'critical' when it did not, 'high' when the signal
+        was unreadable afterwards.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Findings)
+
+    foreach ($finding in $Findings) {
+        if ($null -eq $finding) { continue }
+        if ((Get-ChaosFindingKind -Finding $finding) -ne 'predicate') { continue }
+        $severity = [string]$finding.severity
+        switch ($severity) {
+            'medium' { return $true }
+            'critical' { return $false }
+            default { return $null }
+        }
+    }
+    return $null
+}
+
 function Get-ChaosStudyVerdict {
     <#
     .SYNOPSIS
@@ -815,6 +845,15 @@ function Get-ChaosStudyVerdict {
         but it may never misdescribe the predicate. If the predicate was not
         breached, no wording produced here is allowed to say it was. That is
         enforced below rather than left to whoever edits the strings next.
+
+        A breach that recovered is not the same result as a breach that did not.
+        'Steady state breached' is read - and quoted - as "the system did not come
+        back", and the report's own conclusion sentence for that headline says so
+        outright. A system that dipped during the action and returned to its
+        objective while the fault was still running demonstrated resilience, and
+        must be headlined 'Degraded but recovered'. The distinction comes from the
+        post-injection measurement recorded on the predicate finding, never from
+        the wording.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Findings,
@@ -824,16 +863,19 @@ function Get-ChaosStudyVerdict {
 
     $collateral = ConvertTo-ChaosList -InputObject (Get-ChaosCriticalCollateral -Findings $Findings)
     $severities = @($Findings | ForEach-Object { $_.severity })
+    $predicateRecovered = Get-ChaosPredicateRecovery -Findings $Findings
 
     $verdict =
-    if ($PredicateVerdict -eq 'Breached') { 'Steady state breached' }
+    if ($PredicateVerdict -eq 'Breached' -and $predicateRecovered -ne $true) { 'Steady state breached' }
     elseif ($collateral.Count -gt 0) {
         switch ($PredicateVerdict) {
             'Held' { 'Critical collateral damage (steady state held)' }
+            'Breached' { 'Critical collateral damage (steady state breached and recovered)' }
             'Not exercised' { 'Critical collateral damage (predicate not exercised)' }
             default { 'Critical collateral damage (predicate not evaluated)' }
         }
     }
+    elseif ($PredicateVerdict -eq 'Breached') { 'Degraded but recovered' }
     elseif ($PredicateVerdict -eq 'Not exercised') { 'Not exercised' }
     elseif ($PredicateVerdict -eq 'Not evaluated') { 'Inconclusive' }
     elseif ($MechanismProven -ne $true) { 'Inconclusive' }
@@ -844,6 +886,12 @@ function Get-ChaosStudyVerdict {
     # breach the measurement does not support.
     if ($PredicateVerdict -ne 'Breached' -and $verdict -eq 'Steady state breached') {
         throw "Verdict wording guard: the study verdict claims a steady-state breach while the predicate verdict is '$PredicateVerdict'."
+    }
+
+    # The mirror guard. 'Degraded but recovered' is the only wording allowed to
+    # follow a breach, and only on evidence of recovery.
+    if ($PredicateVerdict -eq 'Breached' -and $verdict -eq 'Degraded but recovered' -and $predicateRecovered -ne $true) {
+        throw 'Verdict wording guard: the study verdict claims recovery from a breach that was never measured as recovered.'
     }
 
     return $verdict
@@ -1102,8 +1150,21 @@ function Build-StudyFindings {
     $missing = @(@($pre + $during + $post) | Where-Object { $null -eq $_.values })
     if ($missing.Count -gt 0 -and $limitations -notcontains 'L2') { $limitations += 'L2' }
     if ([int]$Plan.windows.injectMinutes -le 3) { $limitations += 'L7' }
-    if ($RunRecord.scenarioRun.outcome -in @('Failed', 'Cancelled')) { $limitations += 'L8' }
-    if ($RunRecord.planHash -ne $Plan.frozenConfigHash) { $limitations += 'L9' }
+    # A run record exists even when the run never started, in which case it has
+    # no scenarioRun member at all. Reaching through it would throw under
+    # StrictMode and take down the whole report over a run that plainly failed -
+    # which is exactly the run whose report matters most.
+    $runOutcome = $null
+    if ($RunRecord.PSObject.Properties.Name -contains 'scenarioRun' -and $null -ne $RunRecord.scenarioRun) {
+        if ($RunRecord.scenarioRun.PSObject.Properties.Name -contains 'outcome') {
+            $runOutcome = [string]$RunRecord.scenarioRun.outcome
+        }
+    }
+    if ($runOutcome -in @('Failed', 'Cancelled')) { $limitations += 'L8' }
+
+    $planHash = $null
+    if ($RunRecord.PSObject.Properties.Name -contains 'planHash') { $planHash = $RunRecord.planHash }
+    if ($planHash -ne $Plan.frozenConfigHash) { $limitations += 'L9' }
     foreach ($code in @($Plan.readiness.limitationCodes)) {
         if ($code -and $limitations -notcontains $code) { $limitations += $code }
     }
