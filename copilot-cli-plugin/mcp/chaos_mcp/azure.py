@@ -288,6 +288,33 @@ def az_get_arm_token() -> str:
     return _get_token(ARM_ENDPOINT)
 
 
+def _arm_url(path: str, api_version: str, *, with_api_version: bool = True) -> str:
+    """Resolve an ARM path while keeping bearer credentials on the ARM origin."""
+    if path.startswith(("https://", "http://")):
+        url = path
+    else:
+        if not path.startswith("/") or path.startswith("//") or "\\" in path:
+            raise AzureError("ARM request requires a relative path or trusted ARM URL.")
+        url = f"{ARM_ENDPOINT}{path}"
+        if with_api_version:
+            url += f"{'&' if '?' in path else '?'}api-version={api_version}"
+
+    try:
+        parsed = httpx.URL(url)
+    except httpx.InvalidURL as exc:
+        raise AzureError("Invalid ARM request URL.") from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.host != httpx.URL(ARM_ENDPOINT).host
+        or parsed.port not in (None, 443)
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        raise AzureError("ARM request URL must use the trusted HTTPS ARM origin.")
+    return url
+
+
 def arm_request(
     method: str,
     path: str,
@@ -301,13 +328,7 @@ def arm_request(
 
     `path` may be an absolute ARM URL or a path beginning with '/'.
     """
-    if path.startswith(("http://", "https://")):
-        url = path
-    else:
-        if not path.startswith("/"):
-            path = "/" + path
-        sep = "&" if "?" in path else "?"
-        url = f"{ARM_ENDPOINT}{path}{sep}api-version={api_version}"
+    url = _arm_url(path, api_version)
 
     headers = {
         "Authorization": f"Bearer {az_get_arm_token()}",
@@ -574,17 +595,10 @@ def arm_get_with_query(
     Returns the raw `httpx.Response` so callers can inspect status codes
     (e.g., 403) without an exception.
     """
-    if path.startswith(("http://", "https://")):
-        url = path
-        sep = "&" if "?" in url else "?"
-    else:
-        if not path.startswith("/"):
-            path = "/" + path
-        url = f"{ARM_ENDPOINT}{path}"
-        sep = "?"
+    url = _arm_url(path, api_version, with_api_version=False)
     # httpx.QueryParams handles URL encoding (spaces, OData operators, quotes).
     qp = httpx.QueryParams({"api-version": api_version, **dict(query_params)})
-    url = f"{url}{sep}{qp}"
+    url = f"{url}{'&' if '?' in url else '?'}{qp}"
 
     headers = {
         "Authorization": f"Bearer {_get_token(ARM_ENDPOINT)}",

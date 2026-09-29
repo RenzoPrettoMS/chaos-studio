@@ -66,6 +66,20 @@ ASYNC_HEADERS = {"Azure-AsyncOperation": "https://management.azure.com/op/123"}
 LOCATION_HEADERS = {"Location": "https://management.azure.com/loc/123"}
 
 
+@pytest.mark.parametrize("header", ["Azure-AsyncOperation", "Location"])
+def test_lro_rejects_off_origin_poll_before_authenticated_request(fake_clock, monkeypatch, header):
+    monkeypatch.setattr(az, "_get_token", lambda *args: "test-token")
+    monkeypatch.setattr(
+        az.httpx, "request", lambda *args, **kwargs: pytest.fail("Unexpected poll request")
+    )
+    with pytest.raises(az.AzureError, match="trusted HTTPS ARM origin"):
+        az.wait_for_lro(
+            _initial({header: "https://attacker.example/collect"}),
+            timeout_s=30,
+            interval_s=1,
+        )
+
+
 # ---------------------------------------------------------------------------
 # wait_for_lro — Azure-AsyncOperation style
 # ---------------------------------------------------------------------------
