@@ -271,8 +271,8 @@ function Get-ChaosSignalWindowPoint {
         if ($point -is [string]) { continue }
         $stamp = $null
         foreach ($name in @('timestamp', 'sampledAt', 'TimeGenerated', 'timeStamp')) {
-            if ($point.PSObject.Properties.Name -contains $name) {
-                $candidate = $point.$name
+            $candidate = Get-ChaosMember -InputObject $point -Name $name
+            if ($null -ne $candidate) {
                 if ($null -ne $candidate -and -not [string]::IsNullOrWhiteSpace([string]$candidate)) { $stamp = [string]$candidate; break }
             }
         }

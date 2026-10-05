@@ -129,6 +129,11 @@ param(
     # acknowledgement gate that scope raises, so a 5-minute observation budget
     # can never be reconciled with a longer service-default fault.
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][AllowNull()][object]$AcknowledgeFaultDurationSeconds,
+    # The customer's stop rule, forwarded to scope unchanged. Scope's abort gate
+    # tells the operator to pass -AbortCriteria, so the front door must take it:
+    # a { statement, source, signal, condition, resourceCorrelation } table, or a
+    # bare string read as a customer-stated rule.
+    [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][AllowNull()][object]$AbortCriteria,
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string]$Hypothesis,
     [Parameter(ParameterSetName = 'Study')][Parameter(ParameterSetName = 'Brief')][string[]]$SignalSource = @(),
 
@@ -620,6 +625,7 @@ if ($ActionParameters -and $ActionParameters.Count -gt 0) { $scopeArgs['ActionPa
 if ($PSBoundParameters.ContainsKey('AcknowledgeFaultDurationSeconds')) {
     $scopeArgs['AcknowledgeFaultDurationSeconds'] = $AcknowledgeFaultDurationSeconds
 }
+if ($PSBoundParameters.ContainsKey('AbortCriteria')) { $scopeArgs['AbortCriteria'] = $AbortCriteria }
 
 $scopeExit = Invoke-ChaosPhase -Name 'chaos-study-scope' -Script $scopeScript -Arguments $scopeArgs
 Stop-OnResumableOperation -Name 'chaos-study-scope' -ExitCode $scopeExit

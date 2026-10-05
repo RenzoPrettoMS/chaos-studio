@@ -525,11 +525,15 @@ and you will be asked again.
 
     Write-ChaosStudyNote -Message 'Starting the scenario run.'
     $injectStart = Get-ChaosUtcNow
-    # Enumeration may only identify the run when this execution created the
-    # configuration itself. Reusing the preflight configuration means a
-    # concurrent caller could be starting a run on it too, which no amount of
-    # list diffing can disambiguate.
-    $started = Start-ChaosStudyScenarioRun -Plan $plan -ConfigurationName $configurationName -Validation $validation -ConfigurationExclusive (-not $resolvedConfig.reused) -Adapter $Adapter -StudyPath $studyPath
+    # Enumeration may only identify the run when the configuration is exclusive
+    # to this study: created by this execution, or the study-scoped preflight
+    # configuration this study's own scope created and recorded. Anything else
+    # could be carrying a concurrent caller's run, which no amount of list
+    # diffing can disambiguate. The claim is still verified against the
+    # pre-start enumeration before a run is bound.
+    $configurationExclusive = (-not $resolvedConfig.reused) -or
+        (Test-ChaosStudyOwnsPreflightConfiguration -Plan $plan -StudyPath $studyPath -ConfigurationName $configurationName)
+    $started = Start-ChaosStudyScenarioRun -Plan $plan -ConfigurationName $configurationName -Validation $validation -ConfigurationExclusive $configurationExclusive -Adapter $Adapter -StudyPath $studyPath
     # The call returned, so Azure ACCEPTED the start. That is true whether or not
     # we managed to learn the run id, and it is the fact the rest of this block
     # has to respect: a fault is live either way.
@@ -766,6 +770,14 @@ and you will be asked again.
             Add-ChaosCommandTrailEntry -StudyPath $studyPath -Phase 'run' -Command 'az chaos scenario config delete' `
                 -Arguments @($configurationName, "cleanup=$($configResidue.status)") -ExitCode $(if ($configResidue.removed) { 0 } else { 1 }) | Out-Null
         }
+    }
+    # A fresh configuration ran, so the preflight configuration this study's
+    # scope created was never used and would otherwise leak. Scope cannot clean
+    # it up itself: only the run knows whether the preflight was reusable. It is
+    # removed only once a run was started, because before that a resumed run
+    # (e.g. after a permission approval) re-reads it to decide on reuse.
+    if ($configurationResidueKind -eq 'executionConfiguration' -and $runAccepted -and -not $KeepConfiguration) {
+        Remove-ChaosUnusedPreflightConfiguration -Plan $plan -StudyPath $studyPath -ConfigurationName $configurationName -Adapter $Adapter | Out-Null
     }
 }
 

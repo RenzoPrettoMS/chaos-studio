@@ -693,8 +693,10 @@ function Get-ChaosSignalValueMap {
     foreach ($point in @($values)) {
         if ($null -eq $point) { continue }
         $raw = $point
-        if ($point -isnot [string] -and $point.PSObject.Properties.Name -contains 'value') {
-            $raw = $point.value
+        # In-process collectors emit [ordered] points, which a
+        # PSObject.Properties guard never sees; Get-ChaosMember reads both shapes.
+        if ($point -is [System.Collections.IDictionary] -or $point -is [pscustomobject]) {
+            $raw = Get-ChaosMember -InputObject $point -Name 'value'
         }
         if ($null -eq $raw) { continue }
         $parsed = 0.0

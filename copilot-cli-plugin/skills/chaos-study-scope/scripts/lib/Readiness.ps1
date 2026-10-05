@@ -693,7 +693,7 @@ function Test-ChaosAbortCriteriaArmable {
         return New-ChaosReadinessGate -Id 'abort-armable' -Title 'The abort criteria can be armed' `
             -Status 'fail' -Severity 'blocking' `
             -Detail ('Cannot arm a stop rule: ' + ($problems -join '; ') + '.') `
-            -Remediation 'Re-run scoping with -AbortCriteria giving a measurable rule: a { statement, signal, condition, resourceCorrelation } whose signal is one of -SignalSource and whose resourceCorrelation is a resource in scope. Ask the customer for the number - do not infer one from their sentence.'
+            -Remediation 'Re-run scoping with -AbortCriteria giving a measurable rule: a { statement, source, signal, condition, resourceCorrelation } with source = ''customer'' (only a rule the customer stated can be armed), whose signal is one of -SignalSource and whose resourceCorrelation is a resource in scope. Ask the customer for the number - do not infer one from their sentence.'
     }
 
     $shownSignal = [string](Get-ChaosMember -InputObject $AbortCriteria -Name 'signal')

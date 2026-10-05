@@ -1304,6 +1304,85 @@ function Resolve-ChaosRunConfiguration {
 
 # -- Scenario run ----------------------------------------------------------
 
+function Test-ChaosStudyOwnsPreflightConfiguration {
+    <#
+    .SYNOPSIS
+        True when the named configuration is the preflight configuration this
+        study's own scope created.
+
+    .DESCRIPTION
+        Reusing the preflight configuration is the default path, and refusing
+        enumeration there left every default run accepted-untracked. A preflight
+        configuration carries a study-scoped name and is recorded by this
+        study's scope - in its residue ledger and in the frozen plan - so it is
+        as exclusive to this study as one the run created itself. This is only
+        the claim; Resolve-ChaosStartedScenarioRun still verifies it against the
+        pre-start enumeration and refuses a configuration that already had runs.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()][object]$Plan,
+        [AllowNull()][AllowEmptyString()][string]$StudyPath,
+        [Parameter(Mandatory)][string]$ConfigurationName
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($StudyPath)) {
+        foreach ($entry in @(Get-ChaosOwnedPreflightConfiguration -StudyPath $StudyPath)) {
+            if ([string](Get-ChaosMember -InputObject $entry -Name 'id') -eq $ConfigurationName) { return $true }
+        }
+    }
+    $dve = Get-ChaosMember -InputObject $Plan -Name 'declaredVsEffective'
+    $planned = [string](Get-ChaosMember -InputObject (Get-ChaosMember -InputObject $dve -Name 'preflight') -Name 'configurationName')
+    return (-not [string]::IsNullOrWhiteSpace($planned) -and $planned -eq $ConfigurationName)
+}
+
+function Remove-ChaosUnusedPreflightConfiguration {
+    <#
+    .SYNOPSIS
+        Delete the study-owned preflight configuration(s) a run did not use.
+
+    .DESCRIPTION
+        When the run re-created a fresh configuration, the preflight
+        configuration this study's scope created was never used and would
+        otherwise leak. Scope cannot remove it itself: only the run learns
+        whether the preflight was reusable. Removal uses the same delete plus
+        absence read-back as every other residue, so only an observed absence
+        resolves the ledger entry. Entries already resolved, and the
+        configuration that actually ran, are left alone. Never throws.
+
+        Returns the removal outcomes.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Plan,
+        [Parameter(Mandatory)][string]$StudyPath,
+        [Parameter(Mandatory)][string]$ConfigurationName,
+        [AllowNull()][AllowEmptyString()][string]$Adapter,
+        [ValidateRange(1, 30)][int]$VerifyAttempts = 6,
+        [ValidateRange(0, 60)][double]$VerifyDelaySeconds = 5
+    )
+
+    $outcomes = [System.Collections.Generic.List[object]]::new()
+    foreach ($owned in @(Get-ChaosOwnedPreflightConfiguration -StudyPath $StudyPath)) {
+        $preflightName = [string](Get-ChaosMember -InputObject $owned -Name 'id')
+        if ($preflightName -eq $ConfigurationName) { continue }
+        $priorCleanup = Get-ChaosMember -InputObject $owned -Name 'cleanup'
+        if ($null -ne $priorCleanup -and (Test-ChaosResidueRemoved -Status ([string](Get-ChaosMember -InputObject $priorCleanup -Name 'status')))) { continue }
+
+        Write-ChaosStudyNote -Message "Deleting unused preflight configuration $preflightName."
+        $residue = Invoke-ChaosResidueRemoval -StudyPath $StudyPath -Kind 'preflightConfiguration' -Id $preflightName -Removal {
+            Remove-ChaosStudyConfiguration -Plan $Plan -ConfigurationName $preflightName -Adapter $Adapter -StudyPath $StudyPath
+        } -VerifyAbsent {
+            Test-ChaosStudyConfigurationAbsent -Plan $Plan -ConfigurationName $preflightName -Adapter $Adapter -StudyPath $StudyPath
+        } -VerifyAttempts $VerifyAttempts -VerifyDelaySeconds $VerifyDelaySeconds -RemovalAttempts 2
+        if (-not $residue.removed) {
+            Write-ChaosStudyNote -Message "Preflight configuration $preflightName is not confirmed deleted (state: $($residue.status)). $($residue.error)" -Level 'warn'
+        }
+        Add-ChaosCommandTrailEntry -StudyPath $StudyPath -Phase 'run' -Command 'az chaos scenario config delete' `
+            -Arguments @($preflightName, "cleanup=$($residue.status)") -ExitCode $(if ($residue.removed) { 0 } else { 1 }) | Out-Null
+        $outcomes.Add($residue) | Out-Null
+    }
+    return @($outcomes)
+}
+
 function Get-ChaosStudyRunScopeArguments {
     <#
     .SYNOPSIS
@@ -1429,6 +1508,9 @@ function Get-ChaosScenarioRunInventory {
     if ($null -eq $raw) {
         return [pscustomobject]@{ available = $false; runs = @(); error = 'scenario run list returned no readable result' }
     }
+    if ($raw -is [string]) {
+        return [pscustomobject]@{ available = $false; runs = @(); error = 'scenario run list returned output that is not JSON' }
+    }
 
     $items = $null
     if ($raw -is [System.Collections.IEnumerable] -and -not ($raw -is [string])) {
@@ -1469,8 +1551,9 @@ function Resolve-ChaosStartedScenarioRun {
         own, permission to claim the run.
 
         Enumeration may therefore only bind when the configuration is
-        demonstrably exclusive to this execution - the study created it under its
-        own study-scoped name during this run (ConfigurationExclusive) and the
+        demonstrably exclusive to this study - the study created it under its
+        own study-scoped name, during this run or as its own scope preflight
+        (ConfigurationExclusive), and the
         pre-start enumeration showed no run on it. A shared or pre-existing
         configuration can never be bound this way, however clean the picture
         looks.
@@ -1488,8 +1571,8 @@ function Resolve-ChaosStartedScenarioRun {
         [Parameter(Mandatory)][AllowNull()][object]$Before,
         [Parameter(Mandatory)][AllowNull()][object]$After,
         [Parameter(Mandatory)][string]$ConfigurationName,
-        # True only when this execution created the configuration under its own
-        # study-scoped name. Defaults to false so that a caller which cannot
+        # True only when this study created the configuration under its own
+        # study-scoped name (this run, or its own scope preflight). Defaults to false so that a caller which cannot
         # establish exclusivity gets the safe answer rather than the useful one.
         [bool]$ConfigurationExclusive = $false
     )
@@ -1603,8 +1686,8 @@ function Start-ChaosStudyScenarioRun {
         [Parameter(Mandatory)][object]$Plan,
         [Parameter(Mandatory)][string]$ConfigurationName,
         [Parameter(Mandatory)][AllowNull()][object]$Validation,
-        # True only when this execution created the configuration rather than
-        # reusing one that already existed. Enumeration-based identification is
+        # True only when this study created the configuration (this run, or its
+        # own recorded scope preflight). Enumeration-based identification is
         # refused without it, because a shared configuration cannot distinguish
         # this study's run from a concurrent caller's.
         [bool]$ConfigurationExclusive = $false,
@@ -1936,8 +2019,19 @@ function Get-ChaosScenarioRunObservation {
 
     $props = if ($Run.PSObject.Properties.Name -contains 'properties' -and $null -ne $Run.properties) { $Run.properties } else { $Run }
 
-    if ($props.PSObject.Properties.Name -contains 'startTime') { $observation['startedAt'] = [string]$props.startTime }
-    if ($props.PSObject.Properties.Name -contains 'endTime') { $observation['completedAt'] = [string]$props.endTime }
+    # ConvertFrom-Json hands back ISO timestamps as local-kind [datetime]. Their
+    # [string] form drops the offset and is later re-read as UTC, shifting every
+    # time by the host's UTC offset, so instants are converted directly.
+    $toUtcText = {
+        param($Value)
+        if ($null -eq $Value) { return $null }
+        if ($Value -is [datetime]) { return (ConvertTo-ChaosUtcIso -Instant $Value) }
+        if ($Value -is [datetimeoffset]) { return (ConvertTo-ChaosUtcIso -Instant $Value.UtcDateTime) }
+        return [string]$Value
+    }
+
+    if ($props.PSObject.Properties.Name -contains 'startTime') { $observation['startedAt'] = & $toUtcText $props.startTime }
+    if ($props.PSObject.Properties.Name -contains 'endTime') { $observation['completedAt'] = & $toUtcText $props.endTime }
 
     $resourceCount = 0
     $sawResources = $false
@@ -1953,8 +2047,8 @@ function Get-ChaosScenarioRunObservation {
             $observation['actions'] += [ordered]@{
                 actionUrn   = if ($entry.PSObject.Properties.Name -contains 'actionUrn') { [string]$entry.actionUrn } else { $null }
                 state       = if ($entry.PSObject.Properties.Name -contains 'state') { [string]$entry.state } else { $null }
-                startedAt   = if ($entry.PSObject.Properties.Name -contains 'startedAt') { [string]$entry.startedAt } else { $null }
-                completedAt = if ($entry.PSObject.Properties.Name -contains 'completedAt') { [string]$entry.completedAt } else { $null }
+                startedAt   = if ($entry.PSObject.Properties.Name -contains 'startedAt') { & $toUtcText $entry.startedAt } else { $null }
+                completedAt = if ($entry.PSObject.Properties.Name -contains 'completedAt') { & $toUtcText $entry.completedAt } else { $null }
                 resources   = $resources
             }
         }

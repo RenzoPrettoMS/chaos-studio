@@ -167,7 +167,9 @@ function ConvertTo-ChaosOperationEnvelope {
             if ($obj.Contains($name)) { return @{ has = $true; value = $obj[$name] } }
             return @{ has = $false; value = $null }
         }
-        if ($obj -is [pscustomobject] -and ($obj.PSObject.Properties.Name -contains $name)) {
+        # Indexer, not .Properties.Name: on an empty {} body (a cancel's usual
+        # answer) .Name does not exist and StrictMode throws.
+        if ($obj -is [pscustomobject] -and $null -ne $obj.PSObject.Properties[$name]) {
             return @{ has = $true; value = $obj.$name }
         }
         return @{ has = $false; value = $null }
@@ -234,7 +236,7 @@ function Test-ChaosOperationResult {
             $has = $Result.Contains($field.name)
             if ($has) { $value = $Result[$field.name] }
         } elseif ($Result -is [pscustomobject]) {
-            $has = ($Result.PSObject.Properties.Name -contains $field.name)
+            $has = ($null -ne $Result.PSObject.Properties[[string]$field.name])
             if ($has) { $value = $Result.$($field.name) }
         }
 

@@ -357,17 +357,18 @@ function Get-ChaosOperationRegistry {
         'run.list' = @{
             localAz  = {
                 param($Arguments, $Body)
-                # -AllowFailure on purpose. This enumeration only ever runs to
-                # identify a run whose start was ALREADY accepted, so a read
-                # failure must degrade to "the run could not be identified" and
-                # never to "no run started". The caller distinguishes the two;
-                # collapsing them here would be the same false-negative that made
-                # an accepted run look like a run that never began.
-                Invoke-ChaosStudyAzChaos -AllowFailure -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'run', 'list') -Composed (@(
+                # No -AllowFailure. A failed read must surface as a raise so the
+                # inventory reports it as unavailable, and a successful read of an
+                # empty list must stay distinguishable from that: '[]' parses to
+                # $null, which -AllowFailure would make identical to a failure and
+                # which read as "enumeration unavailable" on every first run.
+                $listed = Invoke-ChaosStudyAzChaos -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'run', 'list') -Composed (@(
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName'),
                     '--scenario-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'scenarioName')
                 ) + (Get-ChaosOperationSubscriptionCliArgs -Arguments $Arguments)))
+                if ($null -eq $listed) { return [pscustomobject]@{ value = @() } }
+                $listed
             }
             external = @{ tool = 'az-chaos'; methodHint = 'scenario run list' }
         }

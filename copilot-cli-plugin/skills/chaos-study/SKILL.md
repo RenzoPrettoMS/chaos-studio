@@ -196,4 +196,4 @@ into the study's provenance; resuming is idempotent.
   selection flows through workspace scopes. There is no V1 path or fallback.
 - Core is `az` / Azure Resource Manager: no SRE Agent or MCP dependency.
 - Sealed studies are immutable — re-testing scopes a **new** study.
-- `-Parameters` (scenario), `-ActionParameters` (action) and `-AcknowledgeFaultDurationSeconds` all cross the front door.
+- `-Parameters` (scenario), `-ActionParameters` (action), `-AcknowledgeFaultDurationSeconds` and `-AbortCriteria` (the customer's stop rule: `@{ statement; source = 'customer'; signal; condition; resourceCorrelation }`) all cross the front door.

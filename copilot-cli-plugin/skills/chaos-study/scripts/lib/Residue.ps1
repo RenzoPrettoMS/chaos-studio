@@ -780,6 +780,29 @@ function Add-ChaosPreflightResidueEntry {
     return Add-ChaosResidueEntry -StudyPath $StudyPath -Entry $entry
 }
 
+function Get-ChaosOwnedPreflightConfiguration {
+    <#
+    .SYNOPSIS
+        The preflight configurations this study's own scope created, as its
+        ledger records them.
+
+    .DESCRIPTION
+        Ownership is read from the ledger, never inferred from a name: an entry
+        exists only because Add-ChaosPreflightResidueEntry ran in this study's
+        scope phase. Returns the entries (kind, id, cleanup) so callers can tell
+        which are still outstanding.
+    #>
+    param([Parameter(Mandatory)][string]$StudyPath)
+
+    $ledger = Get-ChaosResidueLedger -StudyPath $StudyPath
+    return @(@($ledger.entries) | Where-Object {
+            $null -ne $_ -and
+            [string](Get-ChaosMember -InputObject $_ -Name 'kind') -eq 'preflightConfiguration' -and
+            [string](Get-ChaosMember -InputObject (Get-ChaosMember -InputObject $_ -Name 'provenance') -Name 'origin') -eq 'preflight' -and
+            -not [string]::IsNullOrWhiteSpace([string](Get-ChaosMember -InputObject $_ -Name 'id'))
+        })
+}
+
 function Add-ChaosWorkspaceResidueEntry {
     <#
     .SYNOPSIS
