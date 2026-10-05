@@ -1,6 +1,6 @@
 ---
 name: chaos-study-history
-description: "List, inspect, compare, and re-run past Chaos reliability studies from the dated study store. Answers 'did we fix it?' by diffing findings between two comparable studies of the same scope, and prints the exact command to re-run a study as a new one."
+description: "List, inspect, compare, and re-run past Chaos reliability studies from the dated study store. For 'did we fix it?' questions, diffs the recorded findings between two comparable studies of the same scope, and prints the exact command to re-run a study as a new one."
 ---
 
 # chaos-study-history — did the fix actually work?

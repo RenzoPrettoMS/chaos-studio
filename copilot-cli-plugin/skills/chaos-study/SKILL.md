@@ -1,6 +1,6 @@
 ---
 name: chaos-study
-description: "Run a complete Chaos reliability study against an Azure workspace scope: frame a falsifiable steady-state question, discover the actions Chaos Studio actually offers for that region live, freeze a plan, execute a validated scenario configuration with explicit consent, collect before/during/after evidence, and produce a self-contained HTML report. Start here for 'is my service actually resilient to X?' questions."
+description: "Run a complete Chaos reliability study against an Azure workspace scope: frame a falsifiable steady-state question, discover the actions Chaos Studio actually offers for that region live, freeze a plan, execute a validated scenario configuration with explicit consent, collect the before/during/after signals you chose, and write a self-contained HTML report for your review. Start here for 'is my service actually resilient to X?' questions."
 ---
 
 # chaos-study — reliability studies, end to end

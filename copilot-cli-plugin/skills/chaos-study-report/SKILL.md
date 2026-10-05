@@ -1,12 +1,12 @@
 ---
 name: chaos-study-report
-description: "Interpret the evidence from an executed Chaos study and render a self-contained HTML report: steady-state verdict, tests run, evidence tables, prioritized findings with severity, explicit limitations, and remediation guidance. Pure read of collected evidence — executes nothing."
+description: "Render the evidence collected by an executed Chaos study as a self-contained HTML report for your review: steady-state verdict label, tests run, evidence tables, findings with severity labels, stated limitations, and remediation suggestions. Pure read of collected evidence — executes nothing."
 ---
 
-# chaos-study-report — turn evidence into a defensible conclusion
+# chaos-study-report — render collected evidence as a report
 
-The run produced numbers. This skill decides what they mean, and — just as
-importantly — what they do **not** mean.
+The run produced numbers. This skill lays them out for your review, and — just
+as importantly — states what they do **not** show.
 
 ## Principles
 

@@ -12,7 +12,7 @@ recovers.
 
 | Component | Path | What it is |
 |---|---|---|
-| **Copilot CLI plugin + MCP server** | [`copilot-cli-plugin/`](copilot-cli-plugin/) | Create workspaces, configure scenarios, run experiments, and analyze impact — from a conversation or an autonomous agent. |
+| **Copilot CLI plugin + MCP server** | [`copilot-cli-plugin/`](copilot-cli-plugin/) | Create workspaces, configure scenarios, run experiments, and analyze impact — from a conversation or an autonomous agent. Includes the **chaos-study** skills: guided, conversational help for planning and running targeted experiments without hand-authoring them. Recommended host: Azure SRE Agent; other skill-capable agents (GitHub Copilot CLI, Claude Code, Codex, …) can also load them. |
 | **Scenarios** | [`scenarios/`](scenarios/) | Shareable custom Scenario definitions (Bicep/JSON) beyond the built-in templates. |
 | **Samples** | [`samples/`](samples/) | Sample apps and infrastructure you can deploy and break to practice. |
 
