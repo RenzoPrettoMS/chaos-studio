@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Runs a complete Chaos reliability study: scope -> run -> report.
+    Runs a guided Chaos study: scope -> run -> report.
 
 .DESCRIPTION
     This is the opinionated front door. It answers one question end to end:

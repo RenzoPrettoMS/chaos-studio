@@ -3,10 +3,10 @@ name: chaos-study-run
 description: "Execute a frozen Chaos study plan against Azure using Chaos Studio V2: verify plan integrity, create and validate a scenario configuration, require an explicit typed consent phrase, collect baseline evidence, execute the scenario run, collect during and post-recovery evidence, and always clean up the configuration. Dry-run by default."
 ---
 
-# chaos-study-run — the only phase that changes production
+# chaos-study-run — the only phase that changes Azure resources
 
-Everything before this is analysis. This skill executes a real Chaos Studio
-scenario against real Azure resources, so it is deliberately the most
+Everything before this is analysis. This skill executes a Chaos Studio
+scenario against your Azure resources, so it is deliberately the most
 conservative script in the suite.
 
 ## Principles

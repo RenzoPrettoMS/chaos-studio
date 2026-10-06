@@ -5,7 +5,7 @@
     record what happened.
 
 .DESCRIPTION
-    This is the only script in the suite that changes production. It is
+    This is the only script in the suite that changes Azure resources. It is
     therefore the most conservative one:
 
       * It refuses to run a plan that changed after it was frozen.

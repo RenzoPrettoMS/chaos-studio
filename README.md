@@ -1,8 +1,8 @@
 # Azure Chaos Studio — Open Source
 
 Community tooling, samples, and scenarios for **Azure Chaos Studio**, the managed
-resilience-testing service for Azure: break things on purpose, prove your system
-recovers.
+fault-injection service for Azure: introduce faults on purpose and observe how
+your system responds.
 
 > This is the open-source companion repo. The **service** is documented at
 > [learn.microsoft.com/azure/chaos-studio](https://learn.microsoft.com/azure/chaos-studio).

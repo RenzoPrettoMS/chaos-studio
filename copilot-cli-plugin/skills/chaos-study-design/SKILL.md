@@ -1,13 +1,13 @@
 ---
 name: chaos-study-design
-description: "Decide what a Chaos reliability study should actually test. Reads the system's code, deployment and telemetry first, then interviews the customer about what they want to learn, and only then suggests a ranked set of Chaos Studio V2 scenario candidates tied to the dependency edges it found. Writes a durable study brief that feeds chaos-study-scope without retyping."
+description: "Help decide what a Chaos study could test. Reads the system's code, deployment and telemetry first, then interviews the customer about what they want to learn, and only then suggests a ranked set of Chaos Studio V2 scenario candidates tied to the dependency edges it found. Writes a durable study brief that feeds chaos-study-scope without retyping."
 ---
 
 # chaos-study-design — what should we test, and why?
 
-Most failed reliability studies fail before anything is injected. Someone picks a
-fault because it is available, runs it, sees nothing, and concludes the system is
-resilient. This skill is built to steer away from that outcome: it asks for the
+Studies often go wrong before anything is injected. Someone picks a fault
+because it is available, runs it, sees nothing, and concludes the system is
+resilient. This skill tries to steer away from that outcome: it asks for the
 question *what would we learn?* to be answered — in the customer's own words and
 against the customer's own code — before a scenario is ever chosen.
 

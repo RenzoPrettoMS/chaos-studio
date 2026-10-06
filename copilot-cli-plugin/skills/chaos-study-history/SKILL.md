@@ -1,11 +1,11 @@
 ---
 name: chaos-study-history
-description: "List, inspect, compare, and re-run past Chaos reliability studies from the dated study store. For 'did we fix it?' questions, diffs the recorded findings between two comparable studies of the same scope, and prints the exact command to re-run a study as a new one."
+description: "List, inspect, compare, and re-run past Chaos studies from the dated study store. For 'did we fix it?' questions, diffs the recorded findings between two comparable studies of the same scope, and prints the exact command to re-run a study as a new one."
 ---
 
-# chaos-study-history — did the fix actually work?
+# chaos-study-history — compare studies over time
 
-A single study is a snapshot. Reliability is a trend. This skill reads the dated
+A single study is a snapshot; comparing studies over time can add context. This skill reads the dated
 study store so a chat weeks later can pick up exactly where the last one left off.
 
 ## Principles

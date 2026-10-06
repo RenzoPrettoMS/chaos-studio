@@ -1,15 +1,15 @@
 ---
 name: chaos-study-scope
-description: "Frame a Chaos reliability study before anything runs: resolve or create a Chaos Studio V2 workspace, read the resources the service discovered inside its scopes, discover live which actions and scenarios are actually available for that region, express a falsifiable steady-state predicate, verify the action fits what is in scope, then freeze and hash an auditable study plan."
+description: "Frame a Chaos study before anything runs: resolve or create a Chaos Studio V2 workspace, read the resources the service discovered inside its scopes, discover live which actions and scenarios are available for that region, express a falsifiable steady-state predicate, verify the action fits what is in scope, then freeze and hash the study plan."
 ---
 
 # chaos-study-scope — decide what the study can test
 
-Most failed chaos studies fail here, not during execution. They run an action
+Chaos studies often go wrong here, not during execution. They run an action
 nothing was measuring, over a scope that could not receive it, to answer a
 question that could not have come back false.
 
-This skill's job is to catch that before production is touched.
+This skill's job is to catch that before any resource is touched.
 
 ## Principles
 

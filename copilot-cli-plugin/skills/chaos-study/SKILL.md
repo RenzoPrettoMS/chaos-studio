@@ -1,13 +1,14 @@
 ---
 name: chaos-study
-description: "Run a complete Chaos reliability study against an Azure workspace scope: frame a falsifiable steady-state question, discover the actions Chaos Studio actually offers for that region live, freeze a plan, execute a validated scenario configuration with explicit consent, collect the before/during/after signals you chose, and write a self-contained HTML report for your review. Start here for 'is my service actually resilient to X?' questions."
+description: "Guided help for running a Chaos Studio study against an Azure workspace scope: frame a steady-state question with you, discover live which actions Chaos Studio offers for that region, freeze a plan, run a validated scenario configuration only with your explicit consent, collect the before/during/after signals you chose, and write a self-contained HTML report for your review. Start here for questions like 'what happens to my service when X?' or 'is my service resilient to X?'."
 ---
 
-# chaos-study — reliability studies, end to end
+# chaos-study — guided Chaos studies, end to end
 
-Chaos engineering is an experiment in the scientific sense, not a stunt. This
-skill runs it: it asks a question that can be proven **wrong**, executes a real
-action against real resources, and reports what the evidence actually showed.
+Chaos engineering works best as an experiment. This skill helps structure one:
+it starts from a question the run could answer *no* to, runs one action against
+your resources only with your consent, and reports the signals it collected for
+you to review.
 
 > Does **`<steady state>`** hold when I execute **`<action>`** across
 > **`<workspace scope>`**?
