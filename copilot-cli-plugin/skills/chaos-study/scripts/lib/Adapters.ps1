@@ -408,8 +408,10 @@ function Get-ChaosOperationRegistry {
                 # Deliberately NOT -AllowFailure. Cancelling is how a study
                 # aborts an injected fault; a cancel the service rejected must
                 # never look like one it accepted, or the operator would believe
-                # the blast radius had been closed when it had not.
-                Invoke-ChaosStudyAzChaos -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'run', 'cancel') -Composed (@(
+                # the blast radius had been closed when it had not. Unbounded
+                # for the same reason: it is issued from the poll loop, and a
+                # cancel killed mid-flight has an unknowable outcome.
+                Invoke-ChaosStudyAzChaos -Unbounded -ChaosArgs (Get-ChaosOperationCliArgs -Arguments $Arguments -Verb @('scenario', 'run', 'cancel') -Composed (@(
                     '-n', (Get-ChaosOperationArg -Arguments $Arguments -Name 'runId'),
                     '-g', (Get-ChaosOperationArg -Arguments $Arguments -Name 'resourceGroup'),
                     '--workspace-name', (Get-ChaosOperationArg -Arguments $Arguments -Name 'workspaceName'),
@@ -442,10 +444,12 @@ function Get-ChaosOperationRegistry {
                     $payload = if ($Body) { $Body } else { @{ query = (Get-ChaosOperationArg -Arguments $Arguments -Name 'query'); timespan = (Get-ChaosOperationArg -Arguments $Arguments -Name 'timespan') } }
                     $json = ConvertTo-Json -InputObject $payload -Depth 8 -Compress
                     [System.IO.File]::WriteAllText($bodyFile, $json, [System.Text.UTF8Encoding]::new($false))
-                    $raw = & az rest --method POST --uri $uri --resource $endpoint `
-                        --headers 'Content-Type=application/json' --body "@$bodyFile" --output json 2>&1
-                    if ($LASTEXITCODE -ne 0) { throw (($raw | Out-String).Trim()) }
-                    return ($raw | Out-String) | ConvertFrom-Json
+                    # Through the native-call helper so the poll-cadence bound
+                    # covers this query too.
+                    $raw = Invoke-ChaosStudyNativeAz -Arguments @('rest', '--method', 'POST', '--uri', $uri, '--resource', $endpoint,
+                        '--headers', 'Content-Type=application/json', '--body', "@$bodyFile", '--output', 'json')
+                    if ($raw.timedOut -or $raw.exitCode -ne 0) { throw (@($raw.stderr, $raw.stdout) -join "`n").Trim() }
+                    return $raw.stdout | ConvertFrom-Json
                 } finally {
                     Remove-Item -LiteralPath $bodyFile -Force -ErrorAction SilentlyContinue
                 }

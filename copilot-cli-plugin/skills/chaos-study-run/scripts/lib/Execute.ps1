@@ -2110,15 +2110,26 @@ function Wait-ChaosScenarioRunWindow {
     $last = $null
     $terminal = $false
 
-    while ([datetime]::UtcNow -lt $deadline) {
-        $last = Get-ChaosStudyScenarioRun -Plan $Plan -RunId $RunId -Adapter $Adapter -StudyPath $StudyPath
-        $status = Get-ChaosScenarioRunStatus -Run $last
-        if ($OnPoll) { & $OnPoll $status }
-        if (Test-ChaosScenarioRunTerminal -Status $status) { $terminal = $true; break }
+    # Every native read in the loop - this status read and the metric queries
+    # behind OnPoll - is bounded by the poll cadence. One read that never
+    # returns would otherwise hold the stop rule hostage for as long as it
+    # hangs (live run 8414503f: a 301.7s `run show`). An abandoned status read
+    # is an unknown status for that poll; an abandoned metric read is an
+    # unmeasured poll under the caller's existing tolerance. Cancel is exempt.
+    $priorBound = Set-ChaosStudyNativeCallBound -Seconds $PollSeconds
+    try {
+        while ([datetime]::UtcNow -lt $deadline) {
+            $last = Get-ChaosStudyScenarioRun -Plan $Plan -RunId $RunId -Adapter $Adapter -StudyPath $StudyPath
+            $status = Get-ChaosScenarioRunStatus -Run $last
+            if ($OnPoll) { & $OnPoll $status }
+            if (Test-ChaosScenarioRunTerminal -Status $status) { $terminal = $true; break }
 
-        $remaining = ($deadline - [datetime]::UtcNow).TotalSeconds
-        if ($remaining -le 0) { break }
-        Start-Sleep -Seconds ([Math]::Min($PollSeconds, [Math]::Ceiling($remaining)))
+            $remaining = ($deadline - [datetime]::UtcNow).TotalSeconds
+            if ($remaining -le 0) { break }
+            Start-Sleep -Seconds ([Math]::Min($PollSeconds, [Math]::Ceiling($remaining)))
+        }
+    } finally {
+        $null = Set-ChaosStudyNativeCallBound -Seconds $priorBound
     }
 
     if (-not $terminal -and $null -eq $last) {

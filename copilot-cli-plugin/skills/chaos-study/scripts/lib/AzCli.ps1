@@ -36,6 +36,125 @@ Set-StrictMode -Version Latest
 # Process-scoped guard so the extension check runs at most once per session.
 $script:ChaosStudyExtensionEnsured = $false
 
+# Seconds a single native `az` call may take before it is abandoned. 0 means
+# unbounded, which is the default everywhere except the run-phase poll loop:
+# that loop sets it to its own poll cadence so one hung call cannot blind the
+# stop rule (live run 8414503f: one `run show` blocked for 301.7s).
+$script:ChaosStudyNativeCallBoundSeconds = 0
+
+function Set-ChaosStudyNativeCallBound {
+    <#
+    .SYNOPSIS
+        Set the per-call bound for native `az` calls and return the prior value
+        so the caller can restore it in a finally block.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][int]$Seconds)
+
+    $prior = $script:ChaosStudyNativeCallBoundSeconds
+    $script:ChaosStudyNativeCallBoundSeconds = [Math]::Max(0, $Seconds)
+    return $prior
+}
+
+function ConvertTo-ChaosStudyLegacyCommandLine {
+    <#
+    .SYNOPSIS
+        Join arguments the way PowerShell passes them to a Windows .cmd shim.
+
+    .DESCRIPTION
+        On Windows `az` is az.cmd. PowerShell uses legacy argument passing for
+        batch files, which wraps an argument in quotes only when it contains
+        whitespace and passes an already-quoted argument through unchanged.
+        Callers rely on that, for example by pre-quoting URIs that contain `&`,
+        so the bounded path builds the same command line.
+    #>
+    param([AllowEmptyCollection()][string[]]$Arguments)
+
+    return (@($Arguments) | ForEach-Object {
+            if ($_ -eq '') { '""' }
+            elseif ($_ -match '\s' -and -not ($_.StartsWith('"') -and $_.EndsWith('"'))) { '"' + $_ + '"' }
+            else { $_ }
+        }) -join ' '
+}
+
+function Invoke-ChaosStudyNativeAz {
+    <#
+    .SYNOPSIS
+        Run `az` once and return stdout, stderr, the exit code, and whether the
+        call was abandoned at the native-call bound.
+
+    .DESCRIPTION
+        Unbounded calls, and any `az` that is not an executable (a PowerShell
+        function stand-in, for example), run in process exactly as before.
+
+        A bounded call starts `az` as a child process and waits up to the bound.
+        A call that has not returned by then is abandoned. Its whole process
+        tree is killed with Process.Kill($true), which .NET implements on
+        Windows, Linux and macOS, so neither the az shim nor the Python process
+        under it outlives the poll. Nothing is left outstanding to reap later,
+        and nothing can race a later cancel.
+
+    .PARAMETER Unbounded
+        Ignore the bound. Mutations use this: killing a cancel mid-flight would
+        leave its outcome unknowable.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Arguments,
+        [Parameter()][switch]$Unbounded
+    )
+
+    $bound = if ($Unbounded) { 0 } else { [int]$script:ChaosStudyNativeCallBoundSeconds }
+    $command = Get-Command az -ErrorAction SilentlyContinue | Select-Object -First 1
+
+    if ($bound -le 0 -or $null -eq $command -or $command.CommandType -ne 'Application') {
+        $rawOutput = & az @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+        $split = Split-ChaosStudyAzOutput -Output $rawOutput
+        return [pscustomobject]@{ stdout = $split.stdout; stderr = $split.stderr; exitCode = $exitCode; timedOut = $false }
+    }
+
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new($command.Source)
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+    $startInfo.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+    if ($IsWindows) {
+        $startInfo.Arguments = ConvertTo-ChaosStudyLegacyCommandLine -Arguments $Arguments
+    } else {
+        foreach ($argument in @($Arguments)) { $startInfo.ArgumentList.Add($argument) }
+    }
+
+    $process = [System.Diagnostics.Process]::Start($startInfo)
+    try {
+        $process.StandardInput.Close()
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+
+        if (-not $process.WaitForExit($bound * 1000)) {
+            try { $process.Kill($true) } catch { $null = $_ }
+            # Reaping is bounded by the same cadence: a descendant that escaped
+            # the tree must not reintroduce the hang this exists to remove.
+            $null = $process.WaitForExit($bound * 1000)
+            [Console]::Error.WriteLine("[chaos-study] az did not return within the ${bound}s poll cadence; abandoned and terminated it (pid $($process.Id)).")
+            return [pscustomobject]@{ stdout = ''; stderr = "az did not return within the ${bound}s poll cadence and was terminated"; exitCode = $null; timedOut = $true }
+        }
+
+        # The parameterless wait also drains the redirected streams.
+        $process.WaitForExit()
+        return [pscustomobject]@{
+            stdout   = $stdoutTask.GetAwaiter().GetResult()
+            stderr   = $stderrTask.GetAwaiter().GetResult().Trim()
+            exitCode = $process.ExitCode
+            timedOut = $false
+        }
+    } finally {
+        $process.Dispose()
+    }
+}
+
 function Initialize-ChaosStudyAzExtension {
     <#
     .SYNOPSIS
@@ -134,6 +253,10 @@ function Invoke-ChaosStudyAzChaos {
         Return $null on a non-zero exit instead of throwing. Used for
         best-effort reads, never to hide a failed mutation.
 
+    .PARAMETER Unbounded
+        Exempt this call from the poll-cadence bound. For mutations, whose
+        outcome would be unknowable if the process were killed mid-flight.
+
     .OUTPUTS
         The parsed JSON result, the raw text when the output is not JSON, or
         $null when there was no output or the command failed under
@@ -143,7 +266,8 @@ function Invoke-ChaosStudyAzChaos {
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string[]]$ChaosArgs,
         [Parameter()][AllowNull()][hashtable]$JsonArg,
-        [Parameter()][switch]$AllowFailure
+        [Parameter()][switch]$AllowFailure,
+        [Parameter()][switch]$Unbounded
     )
 
     Initialize-ChaosStudyAzExtension
@@ -177,10 +301,15 @@ function Invoke-ChaosStudyAzChaos {
 
         [Console]::Error.WriteLine("[chaos-study] az $((@($azArgs) | Where-Object { $_ -notmatch '^@' }) -join ' ')")
 
-        $rawOutput = & az @azArgs 2>&1
-        $exitCode = $LASTEXITCODE
-        $split = Split-ChaosStudyAzOutput -Output $rawOutput
+        $split = Invoke-ChaosStudyNativeAz -Arguments $azArgs -Unbounded:$Unbounded
+        $exitCode = $split.exitCode
         $stdoutText = $split.stdout.Trim()
+
+        if ($split.timedOut) {
+            # An abandoned read is "no answer this poll", never a result.
+            if ($AllowFailure) { return $null }
+            throw "az chaos $(@($ChaosArgs) -join ' ') failed: $($split.stderr)"
+        }
 
         if ($exitCode -ne 0) {
             if ($AllowFailure) { return $null }
@@ -293,11 +422,10 @@ function Invoke-ChaosStudyAzRest {
 
         [Console]::Error.WriteLine("[chaos-study] $Method $fullUri")
 
-        $rawOutput = & az @azArgs 2>&1
-        $exitCode = $LASTEXITCODE
-        $split = Split-ChaosStudyAzOutput -Output $rawOutput
+        $split = Invoke-ChaosStudyNativeAz -Arguments $azArgs
+        $exitCode = $split.exitCode
 
-        if ($exitCode -ne 0) {
+        if ($split.timedOut -or $exitCode -ne 0) {
             $errorMsg = $split.stderr
             if (-not $errorMsg) { $errorMsg = "az rest exited with code $exitCode" }
             [Console]::Error.WriteLine("[chaos-study] ERROR: $errorMsg")

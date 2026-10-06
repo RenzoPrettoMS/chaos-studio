@@ -602,7 +602,10 @@ and you will be asked again.
             -Adapter $Adapter -StudyPath $studyPath `
             -OnPoll {
                 param($status)
-                Write-ChaosStudyNote -Message "Scenario run $runId is $status. Abort if: $abortWatch"
+                # A status read that failed or did not return within the poll
+                # cadence is unknown; the stop rule is evaluated regardless.
+                $statusText = if ($status) { $status } else { 'status-unknown (no answer this poll)' }
+                Write-ChaosStudyNote -Message "Scenario run $runId is $statusText. Abort if: $abortWatch"
 
                 $pollEnd = [datetime]::UtcNow
                 $pollWindow = New-ChaosWindow -Name 'abort' -Start $pollEnd.AddMinutes(-$abortLookbackMinutes) -End $pollEnd
