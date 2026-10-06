@@ -150,7 +150,12 @@ def chaos_create_workspace(
     try:
         resp = az.arm_put(path, body)
         az.wait_for_lro(resp)
-        workspace = az.arm_get(path)
+        # Belt-and-suspenders: the LRO poll returning is not proof the resource
+        # itself settled, so confirm the workspace reached a terminal Succeeded
+        # provisioningState before touching it. A non-Succeeded terminal state
+        # (or a timeout) raises AzureError and is surfaced as _err below rather
+        # than proceeding to RBAC on a half-provisioned workspace.
+        workspace = az.wait_until_provisioned(path)
     except az.AzureError as e:
         return _err(e)
 
@@ -189,7 +194,14 @@ def chaos_refresh_recommendations(
     try:
         resp = az.arm_post(f"{base}/refreshRecommendations")
         az.wait_for_lro(resp)
-        evaluation = az.arm_get(f"{base}/evaluations/latest")
+        # Confirm the evaluation is genuinely terminal before returning success.
+        # Evaluations report progress under properties.status (terminal states
+        # Succeeded / PartiallySucceeded); a terminal Failed raises and surfaces
+        # as _err rather than a stale "in progress" evaluation.
+        evaluation = az.wait_until_provisioned(
+            f"{base}/evaluations/latest",
+            success_states=("succeeded", "partiallysucceeded"),
+        )
     except az.AzureError as e:
         return _err(e)
     return _ok(evaluation)
@@ -337,6 +349,91 @@ def chaos_execute_scenario(
 
 
 @mcp.tool()
+def chaos_list_scenario_runs(
+    subscription_id: str,
+    resource_group: str,
+    workspace_name: str,
+    scenario_name: str,
+    configuration_name: str | None = None,
+    status: str | None = None,
+    target_resource_id: str | None = None,
+) -> dict[str, Any]:
+    """Discover durable Scenario runs from prior agent or user sessions.
+
+    Returns compact summaries from every service page, ordered newest first, so
+    discovery does not fill the agent context with every resolved run plan and
+    action detail. Optional filters match a configuration name, run status, or
+    targeted Azure resource ID. Follow with `chaos_get_scenario_run` to retrieve
+    the full execution report for a selected run.
+    """
+    base = _ws_path(subscription_id, resource_group, workspace_name)
+    try:
+        runs = az.arm_list(f"{base}/scenarios/{scenario_name}/runs")
+    except az.AzureError as e:
+        return _err(e)
+
+    config_filter = configuration_name.casefold() if configuration_name else None
+    status_filter = status.casefold() if status else None
+    resource_filter = target_resource_id.casefold() if target_resource_id else None
+
+    def matches(run: dict[str, Any]) -> bool:
+        properties = run.get("properties") or {}
+        if config_filter and (
+            str(properties.get("scenarioConfigurationName") or "").casefold()
+            != config_filter
+        ):
+            return False
+        if status_filter and str(properties.get("status") or "").casefold() != status_filter:
+            return False
+        if resource_filter:
+            resource_ids = {
+                str(resource.get("id") or "").casefold()
+                for resource in properties.get("resources") or []
+                if isinstance(resource, dict)
+            }
+            if resource_filter not in resource_ids:
+                return False
+        return True
+
+    filtered = [run for run in runs if matches(run)]
+    filtered.sort(
+        key=lambda run: (
+            (run.get("properties") or {}).get("startTime")
+            or (run.get("systemData") or {}).get("createdAt")
+            or ""
+        ),
+        reverse=True,
+    )
+
+    summaries = []
+    for run in filtered:
+        properties = run.get("properties") or {}
+        system_data = run.get("systemData") or {}
+        summaries.append(
+            {
+                "scenarioRunId": run.get("name"),
+                "resourceId": run.get("id"),
+                "workspaceName": properties.get("workspaceName"),
+                "scenarioName": properties.get("scenarioName"),
+                "configurationName": properties.get("scenarioConfigurationName"),
+                "status": properties.get("status"),
+                "startTime": properties.get("startTime"),
+                "endTime": properties.get("endTime"),
+                "managedIdentityPrincipalId": properties.get(
+                    "managedIdentityPrincipalId"
+                ),
+                "targetResourceIds": [
+                    resource.get("id")
+                    for resource in properties.get("resources") or []
+                    if isinstance(resource, dict) and resource.get("id")
+                ],
+                "createdAt": system_data.get("createdAt"),
+            }
+        )
+    return _ok(summaries)
+
+
+@mcp.tool()
 def chaos_get_scenario_run(
     subscription_id: str,
     resource_group: str,
@@ -344,7 +441,13 @@ def chaos_get_scenario_run(
     scenario_name: str,
     scenario_run_id: str,
 ) -> dict[str, Any]:
-    """Fetch a single status snapshot of a Scenario run."""
+    """Fetch the current state and available report details for a Scenario run.
+
+    The durable resource includes status, timing, targeted resources, action
+    summaries, execution errors, and the resolved run definition. After the run
+    completes, it remains retrievable as the full execution report even after
+    the agent session that started it has ended.
+    """
     base = _ws_path(subscription_id, resource_group, workspace_name)
     try:
         return _ok(az.arm_get(f"{base}/scenarios/{scenario_name}/runs/{scenario_run_id}"))
