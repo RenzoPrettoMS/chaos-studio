@@ -269,35 +269,43 @@ Describe 'F38: the front door carries -AbortCriteria to scope' {
 }
 
 Describe '7h: run times keep their instant on a non-UTC host' {
-    It 'Get-ChaosScenarioRunObservation reports the service instants in UTC under America/Los_Angeles' {
-        $pwsh = (Get-Process -Id $PID).Path
-        $libs = @(
-            (Join-Path $script:SkillsRoot 'chaos-study' 'scripts' 'lib' 'Common.ps1'),
-            (Join-Path $script:SkillsRoot 'chaos-study' 'scripts' 'lib' 'Study.ps1'),
-            (Join-Path $script:SkillsRoot 'chaos-study-run' 'scripts' 'lib' 'Execute.ps1')
-        )
-        $probe = Join-Path $TestDrive 'tz-probe.ps1'
-        Set-Content -LiteralPath $probe -Value (@(
-                '$ErrorActionPreference = ''Stop'''
-                ($libs | ForEach-Object { ". '$_'" })
-                '$run = ''{"properties":{"startTime":"2026-09-15T17:00:00Z","endTime":"2026-09-15T17:10:00Z","scenarioRunSummary":[{"actionUrn":"a","state":"Completed","startedAt":"2026-09-15T17:00:05Z","completedAt":"2026-09-15T17:09:55Z"}]}}'' | ConvertFrom-Json'
-                '$o = Get-ChaosScenarioRunObservation -Run $run'
-                '$leg = @($o.actions)[0]'
-                '(@([TimeZoneInfo]::Local.Id, [string]$o.startedAt, [string]$o.completedAt, [string]$leg.startedAt, [string]$leg.completedAt) -join ''|'')'
-            ) -join [Environment]::NewLine)
-        $previous = $env:TZ
-        try {
-            $env:TZ = 'America/Los_Angeles'
-            $json = & $pwsh -NoProfile -File $probe
+    # Independent of the host zone, so it proves the fix on Windows too, which
+    # ignores $env:TZ. Each instant reaches the converter with a non-zero
+    # offset: as a DateTimeOffset at -07:00 (wall clock 10:00, instant 17:00Z),
+    # as the local-kind [datetime] ConvertFrom-Json produces, and as raw JSON.
+    # Stringifying any of them, then re-reading the text as UTC, either loses
+    # the ISO form or moves the instant by the offset.
+    It 'Get-ChaosScenarioRunObservation reports <Name> instants as the same UTC instant' -ForEach @(
+        @{ Name = 'DateTimeOffset (-07:00)'; Make = { param([datetime]$utc) [datetimeoffset]::new($utc.AddHours(-7).Ticks, [timespan]::FromHours(-7)) } }
+        @{ Name = 'local-kind [datetime]'; Make = { param([datetime]$utc) [datetimeoffset]::new($utc.AddHours(-7).Ticks, [timespan]::FromHours(-7)).LocalDateTime } }
+        @{ Name = 'ConvertFrom-Json'; Make = $null }
+    ) {
+        $expected = [ordered]@{
+            startTime = '2026-09-15T17:00:00Z'; endTime = '2026-09-15T17:10:00Z'
+            legStart  = '2026-09-15T17:00:05Z'; legEnd = '2026-09-15T17:09:55Z'
         }
-        finally { $env:TZ = $previous }
-        $LASTEXITCODE | Should -Be 0
-        $tz, $startedAt, $completedAt, $legStart, $legEnd = ([string]($json | Select-Object -Last 1)).Split('|')
-        $tz | Should -Match 'Los_Angeles|Pacific'
-        $startedAt | Should -Be '2026-09-15T17:00:00Z'
-        $completedAt | Should -Be '2026-09-15T17:10:00Z'
-        $legStart | Should -Be '2026-09-15T17:00:05Z'
-        $legEnd | Should -Be '2026-09-15T17:09:55Z'
+        if ($null -eq $Make) {
+            $run = ('{"properties":{"startTime":"' + $expected.startTime + '","endTime":"' + $expected.endTime +
+                '","scenarioRunSummary":[{"actionUrn":"a","state":"Completed","startedAt":"' + $expected.legStart +
+                '","completedAt":"' + $expected.legEnd + '"}]}}') | ConvertFrom-Json
+        } else {
+            $v = @{}
+            foreach ($key in $expected.Keys) { $v[$key] = & $Make (ConvertFrom-ChaosUtcIso -Text $expected[$key]) }
+            if ($Name -like 'local-kind*') { $v.startTime.Kind | Should -Be ([System.DateTimeKind]::Local) }
+            $run = [pscustomobject]@{ properties = [pscustomobject]@{
+                    startTime = $v.startTime; endTime = $v.endTime
+                    scenarioRunSummary = @([pscustomobject]@{ actionUrn = 'a'; state = 'Completed'; startedAt = $v.legStart; completedAt = $v.legEnd })
+                } }
+        }
+
+        $o = Get-ChaosScenarioRunObservation -Run $run
+        $leg = @($o.actions)[0]
+        $actual = [ordered]@{ startTime = $o.startedAt; endTime = $o.completedAt; legStart = $leg.startedAt; legEnd = $leg.completedAt }
+        foreach ($key in $expected.Keys) {
+            [string]$actual[$key] | Should -Be $expected[$key]
+            # The consumer re-reads these as UTC; the instant must survive that.
+            (ConvertFrom-ChaosUtcIso -Text ([string]$actual[$key])) | Should -Be (ConvertFrom-ChaosUtcIso -Text $expected[$key])
+        }
     }
 }
 
