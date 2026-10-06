@@ -5,10 +5,12 @@ A GitHub Copilot CLI plugin that guides Azure customers through the end-to-end
 scenarios, and execute chaos experiments — all from a single conversation.
 
 It also ships the **chaos-study** skill suite: a way to make chaos more
-accessible. It gives guided, conversational help for planning and running
-targeted Chaos Studio experiments without hand-authoring them — it frames the
-question with you, previews the plan, runs it only with your typed consent,
-collects the signals you chose, and writes a report you can review.
+accessible — accessible to your SRE, accessible to your engineers, and maybe
+most importantly, accessible to your agent. It gives guided, conversational
+help for planning and running targeted Chaos Studio experiments without
+hand-authoring them — it frames the question with you, previews the plan, runs
+it only with your typed consent, collects the signals you chose, and writes a
+report you can review.
 
 > Outputs (plans, verdict labels, findings, reports) are aids for your own
 > review and judgment.
