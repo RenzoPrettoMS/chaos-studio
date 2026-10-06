@@ -9,6 +9,8 @@
     F2   empty {} cancel body crashed envelope normalisation under StrictMode
     F38  front door could not carry -AbortCriteria; remediation omitted `source`
     7h   run times shifted by the host UTC offset
+    SCN  live run list names the configuration properties.scenarioConfigurationName,
+         which was unread, so the started run resolved as ambiguous (live run 02e10afe)
     F4   unused study-owned preflight configuration leaked after a run
 
     No Azure calls: `az` is replaced by a global function for the adapter tests.
@@ -171,6 +173,41 @@ Describe 'B2a: the study-owned preflight configuration is exclusive' {
                 [pscustomobject]@{ id = 'i2'; name = 'r2'; configurationName = 'preflight-study1' }) }
         $result = Resolve-ChaosStartedScenarioRun -Before $before -After $after -ConfigurationName 'preflight-study1' -ConfigurationExclusive $true
         $result.tracked | Should -BeFalse
+    }
+}
+
+Describe 'SCN: the live run-list configuration field identifies the started run' {
+    BeforeAll {
+        $script:Live = Get-Content -Raw (Join-Path $PSScriptRoot 'fixtures' 'live-run-list-35f214c.json') | ConvertFrom-Json
+    }
+
+    It 'reads properties.scenarioConfigurationName from a captured live run' {
+        $raw = @($script:Live.after | Where-Object { $_.name -eq $script:Live.startedRun })[0]
+        (ConvertTo-ChaosScenarioRunSummary -Run $raw).configurationName | Should -Be $script:Live.configurationName
+    }
+
+    It 'reads a top-level scenarioConfigurationName' {
+        $raw = [pscustomobject]@{ name = 'r1'; scenarioConfigurationName = 'c1' }
+        (ConvertTo-ChaosScenarioRunSummary -Run $raw).configurationName | Should -Be 'c1'
+    }
+
+    It 'resolves the captured live start (02e10afe) as tracked' {
+        $before = [pscustomobject]@{ available = $true; runs = @($script:Live.before | ForEach-Object { ConvertTo-ChaosScenarioRunSummary -Run $_ }) }
+        $after = [pscustomobject]@{ available = $true; runs = @($script:Live.after | ForEach-Object { ConvertTo-ChaosScenarioRunSummary -Run $_ }) }
+        $result = Resolve-ChaosStartedScenarioRun -Before $before -After $after -ConfigurationName $script:Live.configurationName -ConfigurationExclusive $true
+        $result.tracked | Should -BeTrue
+        $result.runId | Should -Be $script:Live.startedRun
+    }
+
+    It 'resolves the captured live start through the inventory reader' {
+        $global:FakeAzCalls = @(); $global:FakeAzExit = 0
+        $global:FakeAzStdout = $script:Live.before | ConvertTo-Json -Depth 20 -AsArray
+        $before = Get-ChaosScenarioRunInventory -Plan (New-TestPlan) -StudyPath (New-TestStudyPath)
+        $global:FakeAzStdout = $script:Live.after | ConvertTo-Json -Depth 20 -AsArray
+        $after = Get-ChaosScenarioRunInventory -Plan (New-TestPlan) -StudyPath (New-TestStudyPath)
+        $result = Resolve-ChaosStartedScenarioRun -Before $before -After $after -ConfigurationName $script:Live.configurationName -ConfigurationExclusive $true
+        $result.tracked | Should -BeTrue
+        $result.runId | Should -Be $script:Live.startedRun
     }
 }
 

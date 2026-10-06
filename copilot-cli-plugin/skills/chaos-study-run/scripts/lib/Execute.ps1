@@ -1443,8 +1443,10 @@ function ConvertTo-ChaosScenarioRunSummary {
     $properties = if ($names -contains 'properties') { $Run.properties } else { $null }
     $propertyNames = if ($null -ne $properties) { @($properties.PSObject.Properties.Name) } else { @() }
 
+    # The service reports the configuration as properties.scenarioConfigurationName
+    # (observed live on run list); the other names are kept for older shapes.
     $configurationName = $null
-    foreach ($candidate in @('configurationName', 'configName', 'experimentConfigurationName')) {
+    foreach ($candidate in @('scenarioConfigurationName', 'configurationName', 'configName', 'experimentConfigurationName')) {
         if ($names -contains $candidate -and -not [string]::IsNullOrWhiteSpace([string]$Run.$candidate)) {
             $configurationName = [string]$Run.$candidate
             break
